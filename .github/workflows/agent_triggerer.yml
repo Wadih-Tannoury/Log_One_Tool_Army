@@ -42,7 +42,7 @@ jobs:
             google-auth \
             google-cloud-bigquery \
             google-cloud-bigquery-storage \
-            google-generativeai
+            google-genai
 
       - name: Verify Environment
         run: |
