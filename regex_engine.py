@@ -45,14 +45,14 @@ class RegexEngine:
 
     def _load_regexes(self):
 
-    query = f"""
-    SELECT request_type, regex_pattern
-    FROM `{REGEX_CONFIG_TABLE}`
-    """
+        query = f"""
+        SELECT request_type, regex_pattern
+        FROM `{REGEX_CONFIG_TABLE}`
+        """
 
-    rows = self.bq.query(query).result()
+        rows = self.bq.query(query).result()
 
-    regex_map = defaultdict(list)
+        regex_map = defaultdict(list)
 
     for row in rows:
 
