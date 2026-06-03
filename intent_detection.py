@@ -40,6 +40,27 @@ Examples:
 - proof of export
 """
 
+def process_tickets(self, tickets):
+
+    results = []
+
+    for ticket in tickets:
+
+        request_text = ticket["request_body"] or ""
+
+        llm_result = self.detect(request_text)
+
+        results.append({
+            "zendesk_ticket_id": ticket["zendesk_ticket_id"],
+            "requester_email": ticket["requester_email"],
+            "subject": ticket["subject"],
+            "request_body": request_text,
+            "engine": "llm",
+            **llm_result
+        })
+
+    return results
+
 class IntentDetector:
 
     def __init__(self, model="gemini-2.5-pro"):
