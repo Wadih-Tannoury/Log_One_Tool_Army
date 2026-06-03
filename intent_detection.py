@@ -55,3 +55,26 @@ class IntentDetector:
 
         return json.loads(response.text)
 
+if __name__ == "__main__":
+
+    from utils.output_writer import save_results_to_excel
+
+    detector = IntentDetector()
+
+    sample_requests = [
+        "The consignee refused the COD shipment."
+    ]
+
+    results = []
+
+    for request in sample_requests:
+
+        result = detector.detect(request)
+
+        results.append({
+            "request_text": request,
+            **result
+        })
+
+    save_results_to_excel(results)
+
