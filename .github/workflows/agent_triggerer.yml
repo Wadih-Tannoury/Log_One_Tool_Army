@@ -37,6 +37,7 @@ jobs:
             pandas \
             numpy \
             requests \
+            db-dtypes \
             pyarrow \
             google-auth \
             google-cloud-bigquery \
