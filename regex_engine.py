@@ -82,3 +82,27 @@ class RegexEngine:
             "expected_data": expected_data
         }
 
+if __name__ == "__main__":
+
+    from utils.output_writer import save_results_to_excel
+
+    engine = RegexEngine()
+
+    sample_requests = [
+        "Please provide the commercial invoice.",
+        "Can you share the UPS account number?"
+    ]
+
+    results = []
+
+    for request in sample_requests:
+
+        result = engine.detect(request)
+
+        results.append({
+            "request_text": request,
+            **result
+        })
+
+    save_results_to_excel(results)
+
