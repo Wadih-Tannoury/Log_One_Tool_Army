@@ -64,7 +64,7 @@ def process_tickets(self, tickets):
 class IntentDetector:
 
     def __init__(self, model="gemini-2.5-pro"):
-        self.client = genai.Client()
+        self.client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
         self.model = model
 
     def detect(self, request_text: str):
