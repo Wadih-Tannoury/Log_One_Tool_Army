@@ -44,32 +44,26 @@ class RegexEngine:
         self.regex_map = self._load_regexes()
 
     def _load_regexes(self):
-        query = f"""
-        SELECT request_type, regex_pattern
-        FROM `{REGEX_CONFIG_TABLE}`
-        """
-        rows = self.bq.query(query).result()
 
-regex_map = defaultdict(list)
+    query = f"""
+    SELECT request_type, regex_pattern
+    FROM `{REGEX_CONFIG_TABLE}`
+    """
 
-for row in rows:
-    regex_map[row["request_type"]].append(
-        re.compile(
-            str(row["regex_pattern"]),
-            re.IGNORECASE
-        )
-    )
+    rows = self.bq.query(query).result()
 
-return dict(regex_map)
+    regex_map = defaultdict(list)
 
-        regex_map = defaultdict(list)
+    for row in rows:
 
-        for _, row in df.iterrows():
-            regex_map[row["request_type"]].append(
-                re.compile(str(row["regex_pattern"]), re.IGNORECASE)
+        regex_map[row["request_type"]].append(
+            re.compile(
+                str(row["regex_pattern"]),
+                re.IGNORECASE
             )
+        )
 
-        return dict(regex_map)
+    return dict(regex_map)
 
     def detect(self, request_text: str):
 
