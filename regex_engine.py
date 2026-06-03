@@ -65,6 +65,54 @@ class RegexEngine:
 
     return dict(regex_map)
 
+    def load_active_tickets(self):
+
+    query = """
+    SELECT
+        zendesk_ticket_id,
+        requester_email,
+        subject,
+        request_body,
+        request_number,
+        ticket_category,
+        extracted_tracking_number,
+        shipment_order_number,
+        shipment_tracking_number,
+        return_tracking_number
+    FROM `tlg-business-intelligence-prd.til.log_one_tool_army_active_tickets`
+    """
+
+    return list(self.bq.query(query).result())
+
+
+    def process_tickets(self):
+
+    tickets = self.load_active_tickets()
+
+    matched_results = []
+    unmatched_tickets = []
+
+    for ticket in tickets:
+
+        request_text = ticket["request_body"] or ""
+
+        result = self.detect(request_text)
+
+        output_row = {
+            "zendesk_ticket_id": ticket["zendesk_ticket_id"],
+            "requester_email": ticket["requester_email"],
+            "subject": ticket["subject"],
+            "request_body": request_text,
+            **result
+        }
+
+        if result["matched"]:
+            matched_results.append(output_row)
+        else:
+            unmatched_tickets.append(ticket)
+
+    return matched_results, unmatched_tickets
+
     def detect(self, request_text: str):
 
         matches = []
