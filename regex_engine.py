@@ -1,4 +1,3 @@
-
 """
 regex_engine.py
 
@@ -14,7 +13,9 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 
 PROJECT_ID = "tlg-business-intelligence-prd"
-REGEX_CONFIG_TABLE = "tlg-business-intelligence-prd.til.log_one_tool_army_request_regex_config"
+REGEX_CONFIG_TABLE = (
+    "tlg-business-intelligence-prd.til.log_one_tool_army_request_regex_config"
+)
 
 REQUEST_TYPE_TO_EXPECTED_DATA = {
     "invoice": ["commercial invoice", "invoice number", "invoice attachment"],
@@ -30,11 +31,14 @@ REQUEST_TYPE_TO_EXPECTED_DATA = {
     "reminder_ticket": ["previously requested documentation"],
 }
 
+
 class RegexEngine:
 
     def __init__(self):
         creds = json.loads(os.environ["BI_BIGQUERY_CREDS"])
-        credentials = service_account.Credentials.from_service_account_info(creds)
+        credentials = service_account.Credentials.from_service_account_info(
+            creds
+        )
 
         self.bq = bigquery.Client(
             project=PROJECT_ID,
@@ -54,64 +58,62 @@ class RegexEngine:
 
         regex_map = defaultdict(list)
 
-    for row in rows:
-
-        regex_map[row["request_type"]].append(
-            re.compile(
-                str(row["regex_pattern"]),
-                re.IGNORECASE
+        for row in rows:
+            regex_map[row["request_type"]].append(
+                re.compile(
+                    str(row["regex_pattern"]),
+                    re.IGNORECASE
+                )
             )
-        )
 
-    return dict(regex_map)
+        return dict(regex_map)
 
     def load_active_tickets(self):
 
-    query = """
-    SELECT
-        zendesk_ticket_id,
-        requester_email,
-        subject,
-        request_body,
-        request_number,
-        ticket_category,
-        extracted_tracking_number,
-        shipment_order_number,
-        shipment_tracking_number,
-        return_tracking_number
-    FROM `tlg-business-intelligence-prd.til.log_one_tool_army_active_tickets`
-    """
+        query = """
+        SELECT
+            zendesk_ticket_id,
+            requester_email,
+            subject,
+            request_body,
+            request_number,
+            ticket_category,
+            extracted_tracking_number,
+            shipment_order_number,
+            shipment_tracking_number,
+            return_tracking_number
+        FROM `tlg-business-intelligence-prd.til.log_one_tool_army_active_tickets`
+        """
 
-    return list(self.bq.query(query).result())
-
+        return list(self.bq.query(query).result())
 
     def process_tickets(self):
 
-    tickets = self.load_active_tickets()
+        tickets = self.load_active_tickets()
 
-    matched_results = []
-    unmatched_tickets = []
+        matched_results = []
+        unmatched_tickets = []
 
-    for ticket in tickets:
+        for ticket in tickets:
 
-        request_text = ticket["request_body"] or ""
+            request_text = ticket["request_body"] or ""
 
-        result = self.detect(request_text)
+            result = self.detect(request_text)
 
-        output_row = {
-            "zendesk_ticket_id": ticket["zendesk_ticket_id"],
-            "requester_email": ticket["requester_email"],
-            "subject": ticket["subject"],
-            "request_body": request_text,
-            **result
-        }
+            output_row = {
+                "zendesk_ticket_id": ticket["zendesk_ticket_id"],
+                "requester_email": ticket["requester_email"],
+                "subject": ticket["subject"],
+                "request_body": request_text,
+                **result
+            }
 
-        if result["matched"]:
-            matched_results.append(output_row)
-        else:
-            unmatched_tickets.append(ticket)
+            if result["matched"]:
+                matched_results.append(output_row)
+            else:
+                unmatched_tickets.append(ticket)
 
-    return matched_results, unmatched_tickets
+        return matched_results, unmatched_tickets
 
     def detect(self, request_text: str):
 
@@ -125,7 +127,10 @@ class RegexEngine:
             {
                 item
                 for request_type in matches
-                for item in REQUEST_TYPE_TO_EXPECTED_DATA.get(request_type, [])
+                for item in REQUEST_TYPE_TO_EXPECTED_DATA.get(
+                    request_type,
+                    []
+                )
             }
         )
 
@@ -135,6 +140,7 @@ class RegexEngine:
             "request_types": matches,
             "expected_data": expected_data
         }
+
 
 if __name__ == "__main__":
 
@@ -159,4 +165,3 @@ if __name__ == "__main__":
         })
 
     save_results_to_excel(results)
-
