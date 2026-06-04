@@ -164,94 +164,142 @@ class IntentDetector:
 
 if __name__ == "__main__":
 
+    from math import ceil
+    import pandas as pd
+
+    BATCH_SIZE = 20
+
     detector = IntentDetector()
 
-    regex_matches_path = (
+    regex_df = pd.read_excel(
         "output/regex_matches.xlsx"
     )
 
-    unmatched_path = (
-        "output/unmatched_tickets.xlsx"
-    )
-
-    regex_df = pd.read_excel(
-        regex_matches_path
-    )
-
     unmatched_df = pd.read_excel(
-        unmatched_path
+        "output/unmatched_tickets.xlsx"
     )
 
     llm_results = []
 
-    print(
-        f"Processing "
-        f"{len(unmatched_df)} "
-        f"unmatched tickets..."
+    total_batches = ceil(
+        len(unmatched_df) / BATCH_SIZE
     )
 
-    for _, row in (
-        unmatched_df.iterrows()
-    ):
+    print(
+        f"Processing {len(unmatched_df)} unmatched tickets "
+        f"in {total_batches} Gemini calls"
+    )
 
-        request_text = (
-            row.get(
-                "request_body",
-                ""
+    for batch_number in range(total_batches):
+
+        start_idx = batch_number * BATCH_SIZE
+        end_idx = start_idx + BATCH_SIZE
+
+        batch_df = unmatched_df.iloc[
+            start_idx:end_idx
+        ]
+
+        batch_payload = []
+
+        for _, row in batch_df.iterrows():
+
+            batch_payload.append(
+                {
+                    "zendesk_ticket_id": str(
+                        row["zendesk_ticket_id"]
+                    ),
+                    "request_body": row.get(
+                        "request_body",
+                        ""
+                    )
+                }
             )
-            or ""
+
+        prompt = f"""
+{SYSTEM_PROMPT}
+
+Classify all requests below.
+
+Return JSON ONLY.
+
+Format:
+
+[
+  {{
+    "zendesk_ticket_id": "...",
+    "intent_name": "...",
+    "expected_data": [],
+    "confidence": 0.0
+  }}
+]
+
+REQUESTS:
+
+{json.dumps(batch_payload, ensure_ascii=False)}
+"""
+
+        response = detector.client.models.generate_content(
+            model=detector.model,
+            contents=prompt
         )
 
-        try:
+        response_text = (
+            response.text
+            .replace("```json", "")
+            .replace("```", "")
+            .strip()
+        )
 
-            llm_result = (
-                detector.detect(
-                    request_text
+        batch_results = json.loads(
+            response_text
+        )
+
+        lookup = {
+            str(row["zendesk_ticket_id"]): row
+            for _, row in batch_df.iterrows()
+        }
+
+        for result in batch_results:
+
+            source_row = lookup.get(
+                str(
+                    result[
+                        "zendesk_ticket_id"
+                    ]
                 )
             )
 
-        except Exception as e:
+            if source_row is None:
+                continue
 
-            llm_result = {
-                "intent_name":
-                    "ERROR",
+            llm_results.append(
+                {
+                    "zendesk_ticket_id":
+                        source_row[
+                            "zendesk_ticket_id"
+                        ],
 
-                "expected_data":
-                    [],
+                    "requester_email":
+                        source_row.get(
+                            "requester_email"
+                        ),
 
-                "confidence":
-                    0,
+                    "subject":
+                        source_row.get(
+                            "subject"
+                        ),
 
-                "error":
-                    str(e)
-            }
+                    "request_body":
+                        source_row.get(
+                            "request_body"
+                        ),
 
-        llm_results.append(
-            {
-                "zendesk_ticket_id":
-                    row.get(
-                        "zendesk_ticket_id"
-                    ),
+                    "engine":
+                        "llm",
 
-                "requester_email":
-                    row.get(
-                        "requester_email"
-                    ),
-
-                "subject":
-                    row.get(
-                        "subject"
-                    ),
-
-                "request_body":
-                    request_text,
-
-                "engine":
-                    "llm",
-
-                **llm_result
-            }
-        )
+                    **result
+                }
+            )
 
     llm_df = pd.DataFrame(
         llm_results
@@ -276,10 +324,6 @@ if __name__ == "__main__":
     )
 
     print(
-        f"Final file saved with "
-        f"{len(final_df)} rows:"
-    )
-
-    print(
-        "output/request_intent_results.xlsx"
+        f"Saved {len(final_df)} rows to "
+        f"output/request_intent_results.xlsx"
     )
