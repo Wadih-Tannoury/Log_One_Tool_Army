@@ -144,24 +144,55 @@ class RegexEngine:
 
 if __name__ == "__main__":
 
-    from utils.output_writer import save_results_to_excel
+    import pandas as pd
+
+    REGEX_MATCH_TABLE = (
+        "tlg-business-intelligence-prd.til.log_one_tool_army_regex_matches"
+    )
+
+    REGEX_UNMATCHED_TABLE = (
+        "tlg-business-intelligence-prd.til.log_one_tool_army_regex_unmatched"
+    )
 
     engine = RegexEngine()
 
-    sample_requests = [
-        "Please provide the commercial invoice.",
-        "Can you share the UPS account number?"
-    ]
+    matched_results, unmatched_tickets = (
+        engine.process_tickets()
+    )
 
-    results = []
+    print(f"Matched tickets: {len(matched_results)}")
+    print(f"Unmatched tickets: {len(unmatched_tickets)}")
 
-    for request in sample_requests:
+    if matched_results:
 
-        result = engine.detect(request)
+        matched_df = pd.DataFrame(matched_results)
 
-        results.append({
-            "request_text": request,
-            **result
-        })
+        engine.bq.load_table_from_dataframe(
+            matched_df,
+            REGEX_MATCH_TABLE,
+            job_config=bigquery.LoadJobConfig(
+                write_disposition="WRITE_TRUNCATE"
+            )
+        ).result()
 
-    save_results_to_excel(results)
+        print(
+            f"Loaded {len(matched_df)} rows "
+            f"into regex_matches"
+        )
+
+    if unmatched_tickets:
+
+        unmatched_df = pd.DataFrame(unmatched_tickets)
+
+        engine.bq.load_table_from_dataframe(
+            unmatched_df,
+            REGEX_UNMATCHED_TABLE,
+            job_config=bigquery.LoadJobConfig(
+                write_disposition="WRITE_TRUNCATE"
+            )
+        ).result()
+
+        print(
+            f"Loaded {len(unmatched_df)} rows "
+            f"into regex_unmatched"
+        )
