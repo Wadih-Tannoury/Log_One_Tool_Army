@@ -115,25 +115,24 @@ class RegexEngine:
                 **result
             }
 
-if result.get("excluded"):
+            if result.get("excluded"):
 
-    print(
-        f"Excluded ticket "
-        f"{ticket['zendesk_ticket_id']}"
-    )
+                print(
+                    f"Excluded ticket "
+                    f"{ticket['zendesk_ticket_id']}"
+                )
 
-elif result["matched"]:
+            elif result["matched"]:
 
-    matched_results.append(
-        output_row
-    )
+                matched_results.append(
+                    output_row
+                )
 
-else:
+            else:
 
-    unmatched_tickets.append(
-        output_row
-    )
-
+                unmatched_tickets.append(
+                    output_row
+                )
 
         return matched_results, unmatched_tickets
 
@@ -145,30 +144,33 @@ else:
             if any(p.search(request_text) for p in patterns):
                 matches.append(request_type)
 
-exclude_match = (
-    "exclude_from_processing"
-    in matches
-)
-
-real_request_match = any(
-    request_type != "exclude_from_processing"
-    for request_type in matches
-)
-
-if exclude_match and not real_request_match:
-
-    return {
-        "engine": "regex",
-        "matched": True,
-        "excluded": True,
-        "request_types": [
+        exclude_match = (
             "exclude_from_processing"
-        ],
-        "expected_data": []
-    }
+            in matches
+        )
 
+        real_request_match = any(
+            request_type != "exclude_from_processing"
+            for request_type in matches
+        )
+
+        if (
+            exclude_match
+            and not real_request_match
+        ):
+
+            return {
+                "engine": "regex",
+                "matched": True,
+                "excluded": True,
+                "request_types": [
+                    "exclude_from_processing"
+                ],
+                "expected_data": []
+            }
 
         expected_data = sorted(
+
             {
                 item
                 for request_type in matches
