@@ -103,74 +103,70 @@ class IntentDetector:
         )
 
 
-if __name__ == "__main__":
+if name == "main":
 
-    detector = IntentDetector()
 
-    query = f"""
-    SELECT *
-    FROM `{INPUT_TABLE}`
-    """
+import pandas as pd
+import os
 
-    tickets = list(
-        detector.bq.query(query).result()
+detector = IntentDetector()
+
+unmatched_df = pd.read_excel(
+    "output/unmatched_tickets.xlsx"
+)
+
+results = []
+
+for _, row in unmatched_df.iterrows():
+
+    request_text = row.get(
+        "request_body",
+        ""
     )
 
-    print(
-        f"Processing {len(tickets)} "
-        f"unmatched tickets"
-    )
+    try:
 
-    results = []
-
-    for ticket in tickets:
-
-        try:
-
-            llm_result = detector.detect(
-                ticket["request_body"]
-            )
-
-            results.append({
-                "zendesk_ticket_id":
-                    ticket["zendesk_ticket_id"],
-
-                "requester_email":
-                    ticket["requester_email"],
-
-                "subject":
-                    ticket["subject"],
-
-                "request_body":
-                    ticket["request_body"],
-
-                "engine":
-                    "llm",
-
-                **llm_result
-            })
-
-        except Exception as e:
-
-            print(
-                f"Error on ticket "
-                f"{ticket['zendesk_ticket_id']}: "
-                f"{str(e)}"
-            )
-
-    if results:
-
-        df = pd.DataFrame(results)
-
-        detector.bq.load_table_from_dataframe(
-            df,
-            OUTPUT_TABLE,
-            job_config=bigquery.LoadJobConfig(
-                write_disposition="WRITE_TRUNCATE"
-            )
-        ).result()
-
-        print(
-            f"Loaded {len(df)} rows "
-            f"to final_results"
+        llm_result = detector.detect(
+            request_text
         )
+
+    except Exception as e:
+
+        llm_result = {
+            "intent_name": "ERROR",
+            "expected_data": [],
+            "confidence": 0,
+            "error": str(e)
+        }
+
+    results.append({
+        "zendesk_ticket_id":
+            row.get("zendesk_ticket_id"),
+
+        "requester_email":
+            row.get("requester_email"),
+
+        "subject":
+            row.get("subject"),
+
+        "request_body":
+            request_text,
+
+        **llm_result
+    })
+
+os.makedirs(
+    "output",
+    exist_ok=True
+)
+
+pd.DataFrame(results).to_excel(
+    "output/request_intent_results.xlsx",
+    index=False
+)
+
+print(
+    f"Saved {len(results)} rows to "
+    f"output/request_intent_results.xlsx"
+)
+
