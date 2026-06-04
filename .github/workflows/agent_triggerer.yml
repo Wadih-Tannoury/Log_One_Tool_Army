@@ -3,11 +3,8 @@ name: Log One Tool Army
 on:
   workflow_dispatch:
 
-
-
 jobs:
   process_requests:
-
     runs-on: ubuntu-latest
 
     permissions:
@@ -18,9 +15,9 @@ jobs:
       BI_BIGQUERY_CREDS: ${{ secrets.BI_BIGQUERY_CREDS }}
       ZENDESK_API_CREDENTIALS: ${{ secrets.ZENDESK_API_CREDENTIALS }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: gemini-2.5-flash
 
     steps:
-
       - name: Checkout Repository
         uses: actions/checkout@v4
 
@@ -51,20 +48,29 @@ jobs:
           echo "Project: $PROJECT_ID"
 
       - name: Fetch Tickets
-        run: |
-          python ticket_fetcher.py
+        run: python ticket_fetcher.py
 
       - name: Run Regex Engine
+        run: python regex_engine.py
+
+      - name: Verify Regex Outputs
         run: |
-          python regex_engine.py
+          ls -lah output
 
       - name: Run Intent Detection
-        run: |
-          python intent_detection.py
+        run: python intent_detection.py
 
-      - name: Run Intent Detection
+      - name: Verify Final Output
         run: |
-          python output_writer.py
+          ls -lah output
+          test -f output/request_intent_results.xlsx
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: request-intent-results
+          path: output/request_intent_results.xlsx
+          if-no-files-found: error
 
       - name: Workflow Complete
         run: |
