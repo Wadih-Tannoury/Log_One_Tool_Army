@@ -197,20 +197,25 @@ if __name__ == "__main__":
 
         batch_df = unmatched_df.iloc[
             start_idx:end_idx
-        ]
+        ].copy()
 
         batch_payload = []
 
         for _, row in batch_df.iterrows():
 
+            source_id = (
+                f"{row['zendesk_ticket_id']}_"
+                f"{row.get('request_number', 1)}"
+            )
+
             batch_payload.append(
                 {
-                    "zendesk_ticket_id": str(
-                        row["zendesk_ticket_id"]
-                    ),
-                    "request_body": row.get(
-                        "request_body",
-                        ""
+                    "source_id": source_id,
+                    "request_body": str(
+                        row.get(
+                            "request_body",
+                            ""
+                        )
                     )
                 }
             )
@@ -218,15 +223,15 @@ if __name__ == "__main__":
         prompt = f"""
 {SYSTEM_PROMPT}
 
-Classify all requests below.
+Classify ALL requests.
 
 Return JSON ONLY.
 
-Format:
+Return EXACTLY this structure:
 
 [
   {{
-    "zendesk_ticket_id": "...",
+    "source_id": "...",
     "intent_name": "...",
     "expected_data": [],
     "confidence": 0.0
@@ -238,46 +243,106 @@ REQUESTS:
 {json.dumps(batch_payload, ensure_ascii=False)}
 """
 
-        response = detector.client.models.generate_content(
-            model=detector.model,
-            contents=prompt
-        )
+        last_error = None
 
-        response_text = (
-            response.text
-            .replace("```json", "")
-            .replace("```", "")
-            .strip()
-        )
+        for attempt in range(3):
 
-        batch_results = json.loads(
-            response_text
-        )
+            try:
 
-        lookup = {
-            str(row["zendesk_ticket_id"]): row
-            for _, row in batch_df.iterrows()
-        }
+                response = (
+                    detector.client
+                    .models
+                    .generate_content(
+                        model=detector.model,
+                        contents=prompt
+                    )
+                )
+
+                response_text = (
+                    response.text
+                    .replace("```json", "")
+                    .replace("```", "")
+                    .strip()
+                )
+
+                batch_results = json.loads(
+                    response_text
+                )
+
+                break
+
+            except Exception as e:
+
+                last_error = e
+
+                if (
+                    "429" in str(e)
+                    or
+                    "RESOURCE_EXHAUSTED"
+                    in str(e)
+                ):
+
+                    wait_seconds = (
+                        30
+                        * (attempt + 1)
+                    )
+
+                    print(
+                        f"Rate limit reached. "
+                        f"Waiting {wait_seconds}s"
+                    )
+
+                    time.sleep(
+                        wait_seconds
+                    )
+
+                else:
+                    raise
+
+        else:
+            raise last_error
+
+        lookup = {}
+
+        for _, row in batch_df.iterrows():
+
+            source_id = (
+                f"{row['zendesk_ticket_id']}_"
+                f"{row.get('request_number', 1)}"
+            )
+
+            lookup[source_id] = row
 
         for result in batch_results:
 
+            source_id = result.get(
+                "source_id"
+            )
+
             source_row = lookup.get(
-                str(
-                    result[
-                        "zendesk_ticket_id"
-                    ]
-                )
+                source_id
             )
 
             if source_row is None:
+
+                print(
+                    f"WARNING: source_id "
+                    f"{source_id} not found"
+                )
+
                 continue
 
             llm_results.append(
                 {
                     "zendesk_ticket_id":
-                        source_row[
+                        source_row.get(
                             "zendesk_ticket_id"
-                        ],
+                        ),
+
+                    "request_number":
+                        source_row.get(
+                            "request_number"
+                        ),
 
                     "requester_email":
                         source_row.get(
@@ -292,6 +357,31 @@ REQUESTS:
                     "request_body":
                         source_row.get(
                             "request_body"
+                        ),
+
+                    "ticket_category":
+                        source_row.get(
+                            "ticket_category"
+                        ),
+
+                    "extracted_tracking_number":
+                        source_row.get(
+                            "extracted_tracking_number"
+                        ),
+
+                    "shipment_order_number":
+                        source_row.get(
+                            "shipment_order_number"
+                        ),
+
+                    "shipment_tracking_number":
+                        source_row.get(
+                            "shipment_tracking_number"
+                        ),
+
+                    "return_tracking_number":
+                        source_row.get(
+                            "return_tracking_number"
                         ),
 
                     "engine":
