@@ -184,9 +184,11 @@ class RegexEngine:
         return {
             "engine": "regex",
             "matched": len(matches) > 0,
+            "excluded": False,
             "request_types": matches,
             "expected_data": expected_data
         }
+
 
 
 if __name__ == "__main__":
