@@ -29,6 +29,7 @@ REQUEST_TYPE_TO_EXPECTED_DATA = {
     "eori": ["EORI number"],
     "poa": ["power of attorney document"],
     "reminder_ticket": ["previously requested documentation"],
+    "exclude_from_processing": [],
 }
 
 
@@ -114,10 +115,25 @@ class RegexEngine:
                 **result
             }
 
-            if result["matched"]:
-                matched_results.append(output_row)
-            else:
-                unmatched_tickets.append(output_row)
+if result.get("excluded"):
+
+    print(
+        f"Excluded ticket "
+        f"{ticket['zendesk_ticket_id']}"
+    )
+
+elif result["matched"]:
+
+    matched_results.append(
+        output_row
+    )
+
+else:
+
+    unmatched_tickets.append(
+        output_row
+    )
+
 
         return matched_results, unmatched_tickets
 
@@ -128,6 +144,29 @@ class RegexEngine:
         for request_type, patterns in self.regex_map.items():
             if any(p.search(request_text) for p in patterns):
                 matches.append(request_type)
+
+exclude_match = (
+    "exclude_from_processing"
+    in matches
+)
+
+real_request_match = any(
+    request_type != "exclude_from_processing"
+    for request_type in matches
+)
+
+if exclude_match and not real_request_match:
+
+    return {
+        "engine": "regex",
+        "matched": True,
+        "excluded": True,
+        "request_types": [
+            "exclude_from_processing"
+        ],
+        "expected_data": []
+    }
+
 
         expected_data = sorted(
             {
