@@ -105,13 +105,19 @@ class RegexEngine:
                 "requester_email": ticket["requester_email"],
                 "subject": ticket["subject"],
                 "request_body": request_text,
+                "request_number": ticket["request_number"],
+                "ticket_category": ticket["ticket_category"],
+                "extracted_tracking_number": ticket["extracted_tracking_number"],
+                "shipment_order_number": ticket["shipment_order_number"],
+                "shipment_tracking_number": ticket["shipment_tracking_number"],
+                "return_tracking_number": ticket["return_tracking_number"],
                 **result
             }
 
             if result["matched"]:
                 matched_results.append(output_row)
             else:
-                unmatched_tickets.append(ticket)
+                unmatched_tickets.append(output_row)
 
         return matched_results, unmatched_tickets
 
