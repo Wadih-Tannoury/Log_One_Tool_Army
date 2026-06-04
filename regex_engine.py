@@ -144,15 +144,8 @@ class RegexEngine:
 
 if __name__ == "__main__":
 
+    import os
     import pandas as pd
-
-    REGEX_MATCH_TABLE = (
-        "tlg-business-intelligence-prd.til.log_one_tool_army_regex_matches"
-    )
-
-    REGEX_UNMATCHED_TABLE = (
-        "tlg-business-intelligence-prd.til.log_one_tool_army_regex_unmatched"
-    )
 
     engine = RegexEngine()
 
@@ -160,39 +153,41 @@ if __name__ == "__main__":
         engine.process_tickets()
     )
 
-    print(f"Matched tickets: {len(matched_results)}")
-    print(f"Unmatched tickets: {len(unmatched_tickets)}")
+    os.makedirs(
+        "output",
+        exist_ok=True
+    )
 
-    if matched_results:
+    pd.DataFrame(
+        matched_results
+    ).to_excel(
+        "output/regex_matches.xlsx",
+        index=False
+    )
 
-        matched_df = pd.DataFrame(matched_results)
+    pd.DataFrame(
+        unmatched_tickets
+    ).to_excel(
+        "output/unmatched_tickets.xlsx",
+        index=False
+    )
 
-        engine.bq.load_table_from_dataframe(
-            matched_df,
-            REGEX_MATCH_TABLE,
-            job_config=bigquery.LoadJobConfig(
-                write_disposition="WRITE_TRUNCATE"
-            )
-        ).result()
+    print(
+        f"Regex matched: {len(matched_results)}"
+    )
 
-        print(
-            f"Loaded {len(matched_df)} rows "
-            f"into regex_matches"
-        )
+    print(
+        f"Regex unmatched: {len(unmatched_tickets)}"
+    )
 
-    if unmatched_tickets:
+    print(
+        "Files written:"
+    )
 
-        unmatched_df = pd.DataFrame(unmatched_tickets)
+    print(
+        "output/regex_matches.xlsx"
+    )
 
-        engine.bq.load_table_from_dataframe(
-            unmatched_df,
-            REGEX_UNMATCHED_TABLE,
-            job_config=bigquery.LoadJobConfig(
-                write_disposition="WRITE_TRUNCATE"
-            )
-        ).result()
-
-        print(
-            f"Loaded {len(unmatched_df)} rows "
-            f"into regex_unmatched"
-        )
+    print(
+        "output/unmatched_tickets.xlsx"
+    )
