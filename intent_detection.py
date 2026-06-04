@@ -8,6 +8,7 @@ gemini-2.5-pro (best reasoning for long customs/carrier emails).
 """
 
 import json
+import os
 from google import genai
 
 SYSTEM_PROMPT = """
