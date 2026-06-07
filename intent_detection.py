@@ -1,229 +1,108 @@
 """
 intent_detection.py
 
-Processes only tickets that were not classified
-by regex_engine.py.
+LLM fallback for tickets not matched by regex_engine.py.
+The LLM extracts requested_data, not a single intent.
 
 Creates:
-output/request_intent_results.xlsx
+- output/request_intent_results.xlsx
 """
 
 import json
 import os
 import time
+from math import ceil
 
 import pandas as pd
 from google import genai
 
-SYSTEM_PROMPT = """
-You are an intent classifier for logistics,
-customs clearance, carrier requests and returns.
+PROMPT_PATH = "prompts/requested_data_extractor.md"
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "20"))
 
-Your job is NOT to answer the request.
+ALLOWED_REQUESTED_DATA = [
+    "commercial_invoice",
+    "return_proforma_invoice",
+    "corrected_invoice",
+    "export_tracking_number",
+    "ups_account_number",
+    "value_confirmation",
+    "returned_items_confirmation",
+    "customs_description",
+    "declaration_of_intent",
+    "eori_number",
+    "power_of_attorney",
+    "tax_information",
+    "country_of_origin",
+    "importer_details",
+    "address_translation",
+    "exporter_ein",
+    "customer_phone",
+    "customer_email",
+    "customer_name",
+    "shipping_address",
+    "authorization_letter",
+    "shipment_instructions",
+    "address_correction",
+    "product_description",
+    "previously_requested_documentation",
+    "unknown_request",
+]
 
-Return JSON only:
 
-{
-  "intent_name": "...",
-  "expected_data": [
-      "..."
-  ],
-  "confidence": 0.0
-}
+class RequestedDataDetector:
 
-The expected_data field must describe
-the information that should be retrieved
-from internal systems and included
-in a future response.
-"""
-
-DEFAULT_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-2.5-flash"
-)
-
-
-class IntentDetector:
-
-    def __init__(
-        self,
-        model=DEFAULT_MODEL
-    ):
-
-        api_key = os.getenv(
-            "GEMINI_API_KEY"
-        )
+    def __init__(self, model=DEFAULT_MODEL):
+        api_key = os.getenv("GEMINI_API_KEY")
 
         if not api_key:
+            raise ValueError("Missing GEMINI_API_KEY")
 
-            raise ValueError(
-                "Missing GEMINI_API_KEY"
-            )
-
-        self.client = genai.Client(
-            api_key=api_key
-        )
-
+        self.client = genai.Client(api_key=api_key)
         self.model = model
+        self.system_prompt = self._load_prompt()
 
-    def detect(
-        self,
-        request_text: str
-    ):
+    def _load_prompt(self):
+        with open(PROMPT_PATH, "r", encoding="utf-8") as file:
+            return file.read()
 
-        prompt = (
-            f"{SYSTEM_PROMPT}\n\n"
-            f"REQUEST:\n{request_text}"
-        )
+    @staticmethod
+    def _clean_json_response(text: str):
+        text = text.strip()
 
-        last_error = None
+        if text.startswith("```json"):
+            text = text.replace("```json", "", 1).strip()
 
-        for attempt in range(3):
+        if text.startswith("```"):
+            text = text.replace("```", "", 1).strip()
 
-            try:
+        if text.endswith("```"):
+            text = text[:-3].strip()
 
-                response = (
-                    self.client
-                    .models
-                    .generate_content(
-                        model=self.model,
-                        contents=prompt
-                    )
-                )
+        return text
 
-                text = (
-                    response.text
-                    .strip()
-                )
+    @staticmethod
+    def _normalize_requested_data(values):
+        if not isinstance(values, list):
+            return ["unknown_request"]
 
-                if text.startswith(
-                    "```json"
-                ):
+        cleaned = []
 
-                    text = (
-                        text
-                        .replace(
-                            "```json",
-                            ""
-                        )
-                        .replace(
-                            "```",
-                            ""
-                        )
-                        .strip()
-                    )
+        for value in values:
+            value = str(value).strip()
+            if value in ALLOWED_REQUESTED_DATA and value not in cleaned:
+                cleaned.append(value)
 
-                elif text.startswith(
-                    "```"
-                ):
+        return cleaned or ["unknown_request"]
 
-                    text = (
-                        text
-                        .replace(
-                            "```",
-                            ""
-                        )
-                        .strip()
-                    )
-
-                return json.loads(
-                    text
-                )
-
-            except Exception as e:
-
-                last_error = e
-
-                if (
-                    "429" in str(e)
-                    or
-                    "RESOURCE_EXHAUSTED"
-                    in str(e)
-                ):
-
-                    wait_seconds = (
-                        30
-                        * (attempt + 1)
-                    )
-
-                    print(
-                        f"Rate limit hit. "
-                        f"Retrying in "
-                        f"{wait_seconds}s"
-                    )
-
-                    time.sleep(
-                        wait_seconds
-                    )
-
-                else:
-                    raise
-
-        raise last_error
-
-
-if __name__ == "__main__":
-
-    from math import ceil
-    import pandas as pd
-
-    BATCH_SIZE = 20
-
-    detector = IntentDetector()
-
-    regex_df = pd.read_excel(
-        "output/regex_matches.xlsx"
-    )
-
-    unmatched_df = pd.read_excel(
-        "output/unmatched_tickets.xlsx"
-    )
-
-    llm_results = []
-
-    total_batches = ceil(
-        len(unmatched_df) / BATCH_SIZE
-    )
-
-    print(
-        f"Processing {len(unmatched_df)} unmatched tickets "
-        f"in {total_batches} Gemini calls"
-    )
-
-    for batch_number in range(total_batches):
-
-        start_idx = batch_number * BATCH_SIZE
-        end_idx = start_idx + BATCH_SIZE
-
-        batch_df = unmatched_df.iloc[
-            start_idx:end_idx
-        ].copy()
-
-        batch_payload = []
-
-        for _, row in batch_df.iterrows():
-
-            source_id = (
-                f"{row['zendesk_ticket_id']}_"
-                f"{row.get('request_number', 1)}"
-            )
-
-            batch_payload.append(
-                {
-                    "source_id": source_id,
-                    "request_body": str(
-                        row.get(
-                            "request_body",
-                            ""
-                        )
-                    )
-                }
-            )
-
+    def detect_batch(self, batch_payload):
         prompt = f"""
-{SYSTEM_PROMPT}
+{self.system_prompt}
 
-Classify ALL requests.
+Allowed requested_data values:
+{json.dumps(ALLOWED_REQUESTED_DATA, ensure_ascii=False, indent=2)}
+
+Classify ALL requests below.
 
 Return JSON ONLY.
 
@@ -232,188 +111,159 @@ Return EXACTLY this structure:
 [
   {{
     "source_id": "...",
-    "intent_name": "...",
-    "expected_data": [],
-    "confidence": 0.0
+    "requested_data": ["..."],
+    "confidence": 0.0,
+    "notes": "short reason"
   }}
 ]
 
 REQUESTS:
-
-{json.dumps(batch_payload, ensure_ascii=False)}
+{json.dumps(batch_payload, ensure_ascii=False, indent=2)}
 """
 
         last_error = None
 
         for attempt in range(3):
-
             try:
-
-                response = (
-                    detector.client
-                    .models
-                    .generate_content(
-                        model=detector.model,
-                        contents=prompt
-                    )
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
                 )
 
-                response_text = (
-                    response.text
-                    .replace("```json", "")
-                    .replace("```", "")
-                    .strip()
-                )
+                response_text = self._clean_json_response(response.text)
+                results = json.loads(response_text)
 
-                batch_results = json.loads(
-                    response_text
-                )
+                if not isinstance(results, list):
+                    raise ValueError("LLM response was not a JSON list")
 
-                break
-
-            except Exception as e:
-
-                last_error = e
-
-                if (
-                    "429" in str(e)
-                    or
-                    "RESOURCE_EXHAUSTED"
-                    in str(e)
-                ):
-
-                    wait_seconds = (
-                        30
-                        * (attempt + 1)
+                for result in results:
+                    result["requested_data"] = self._normalize_requested_data(
+                        result.get("requested_data", [])
                     )
 
-                    print(
-                        f"Rate limit reached. "
-                        f"Waiting {wait_seconds}s"
-                    )
+                    if "confidence" not in result:
+                        result["confidence"] = 0.0
 
-                    time.sleep(
-                        wait_seconds
-                    )
+                    if "notes" not in result:
+                        result["notes"] = ""
 
+                return results
+
+            except Exception as exc:
+                last_error = exc
+
+                if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
+                    wait_seconds = 30 * (attempt + 1)
+                    print(f"Rate limit reached. Waiting {wait_seconds}s")
+                    time.sleep(wait_seconds)
                 else:
                     raise
 
-        else:
-            raise last_error
+        raise last_error
 
+
+def build_source_id(row):
+    return f"{row['zendesk_ticket_id']}_{row.get('request_number', 1)}"
+
+
+def main():
+    detector = RequestedDataDetector()
+
+    regex_df = pd.read_excel("output/regex_matches.xlsx")
+    unmatched_df = pd.read_excel("output/unmatched_tickets.xlsx")
+
+    llm_results = []
+    total_batches = ceil(len(unmatched_df) / BATCH_SIZE) if len(unmatched_df) else 0
+
+    print(
+        f"Processing {len(unmatched_df)} unmatched tickets "
+        f"in {total_batches} Gemini calls"
+    )
+
+    for batch_number in range(total_batches):
+        start_idx = batch_number * BATCH_SIZE
+        end_idx = start_idx + BATCH_SIZE
+        batch_df = unmatched_df.iloc[start_idx:end_idx].copy()
+
+        batch_payload = []
         lookup = {}
 
         for _, row in batch_df.iterrows():
-
-            source_id = (
-                f"{row['zendesk_ticket_id']}_"
-                f"{row.get('request_number', 1)}"
-            )
-
+            source_id = build_source_id(row)
             lookup[source_id] = row
 
+            batch_payload.append(
+                {
+                    "source_id": source_id,
+                    "subject": str(row.get("subject", "") or ""),
+                    "request_body": str(row.get("request_body", "") or ""),
+                    "ticket_category": str(row.get("ticket_category", "") or ""),
+                }
+            )
+
+        try:
+            batch_results = detector.detect_batch(batch_payload)
+        except Exception as exc:
+            print(f"Batch {batch_number + 1} failed: {exc}")
+
+            batch_results = [
+                {
+                    "source_id": payload["source_id"],
+                    "requested_data": ["unknown_request"],
+                    "confidence": 0.0,
+                    "notes": f"LLM batch failed: {exc}",
+                }
+                for payload in batch_payload
+            ]
+
         for result in batch_results:
-
-            source_id = result.get(
-                "source_id"
-            )
-
-            source_row = lookup.get(
-                source_id
-            )
+            source_id = result.get("source_id")
+            source_row = lookup.get(source_id)
 
             if source_row is None:
-
-                print(
-                    f"WARNING: source_id "
-                    f"{source_id} not found"
-                )
-
+                print(f"WARNING: source_id {source_id} not found")
                 continue
 
             llm_results.append(
                 {
-                    "zendesk_ticket_id":
-                        source_row.get(
-                            "zendesk_ticket_id"
-                        ),
-
-                    "request_number":
-                        source_row.get(
-                            "request_number"
-                        ),
-
-                    "requester_email":
-                        source_row.get(
-                            "requester_email"
-                        ),
-
-                    "subject":
-                        source_row.get(
-                            "subject"
-                        ),
-
-                    "request_body":
-                        source_row.get(
-                            "request_body"
-                        ),
-
-                    "ticket_category":
-                        source_row.get(
-                            "ticket_category"
-                        ),
-
-                    "extracted_tracking_number":
-                        source_row.get(
-                            "extracted_tracking_number"
-                        ),
-
-                    "shipment_order_number":
-                        source_row.get(
-                            "shipment_order_number"
-                        ),
-
-                    "shipment_tracking_number":
-                        source_row.get(
-                            "shipment_tracking_number"
-                        ),
-
-                    "return_tracking_number":
-                        source_row.get(
-                            "return_tracking_number"
-                        ),
-
-                    "engine":
-                        "llm",
-
-                    **result
+                    "zendesk_ticket_id": source_row.get("zendesk_ticket_id"),
+                    "request_number": source_row.get("request_number"),
+                    "requester_email": source_row.get("requester_email"),
+                    "subject": source_row.get("subject"),
+                    "request_body": source_row.get("request_body"),
+                    "ticket_category": source_row.get("ticket_category"),
+                    "extracted_tracking_number": source_row.get(
+                        "extracted_tracking_number"
+                    ),
+                    "shipment_order_number": source_row.get("shipment_order_number"),
+                    "shipment_tracking_number": source_row.get(
+                        "shipment_tracking_number"
+                    ),
+                    "return_tracking_number": source_row.get("return_tracking_number"),
+                    "engine": "llm",
+                    "matched": True,
+                    "excluded": False,
+                    "request_types": [],
+                    "requested_data": result.get("requested_data", ["unknown_request"]),
+                    "confidence": result.get("confidence", 0.0),
+                    "notes": result.get("notes", ""),
                 }
             )
 
-    llm_df = pd.DataFrame(
-        llm_results
-    )
+    llm_df = pd.DataFrame(llm_results)
 
     final_df = pd.concat(
-        [
-            regex_df,
-            llm_df
-        ],
-        ignore_index=True
+        [regex_df, llm_df],
+        ignore_index=True,
     )
 
-    os.makedirs(
-        "output",
-        exist_ok=True
-    )
-
-    final_df.to_excel(
-        "output/request_intent_results.xlsx",
-        index=False
-    )
+    os.makedirs("output", exist_ok=True)
+    final_df.to_excel("output/request_intent_results.xlsx", index=False)
 
     print(
-        f"Saved {len(final_df)} rows to "
-        f"output/request_intent_results.xlsx"
+        f"Saved {len(final_df)} rows to output/request_intent_results.xlsx"
     )
+
+
+if __name__ == "__main__":
+    main()
