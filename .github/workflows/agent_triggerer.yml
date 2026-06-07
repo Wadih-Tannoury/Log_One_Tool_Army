@@ -60,6 +60,9 @@ jobs:
       - name: Run Intent Detection
         run: python intent_detection.py
 
+      - name: Generate Draft Responses
+        run: python response_generator.py
+
       - name: Verify Final Output
         run: |
           ls -lah output
@@ -69,7 +72,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: request-intent-results
-          path: output/request_intent_results.xlsx
+          path: output/request_intent_results_with_drafts.xlsx
           if-no-files-found: error
 
       - name: Workflow Complete
