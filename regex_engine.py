@@ -4,25 +4,47 @@ regex_engine.py
 Rule-based requested-data detection using regexes stored in:
 `tlg-business-intelligence-prd.til.log_one_tool_army_request_regex_config`
 
+The regex layer is intentionally conservative:
+- detection runs on the latest requester message only, after quoted-history and
+  signature cleanup;
+- acknowledgement words are treated as exclusions only when the whole cleaned
+  message is an acknowledgement;
+- commercial-invoice boilerplate is suppressed so invoice templates do not
+  become false requests for phone, country of origin, product details, etc.;
+- uncertain matches are sent to the LLM/human-review stage instead of being
+  auto-answered.
+
 Creates:
-- output/regex_matches.xlsx
-- output/unmatched_tickets.xlsx
+- output/regex_matches.xlsx       high-confidence regex matches only
+- output/unmatched_tickets.xlsx   unmatched or review-needed rows
 """
 
 import json
 import os
 import re
 from collections import defaultdict
+from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
-from google.cloud import bigquery
-from google.oauth2 import service_account
+from customs_rules import (
+    HUMAN_INTERVENTION_REQUIRED,
+    UNKNOWN_REQUEST,
+    clean_latest_request_text,
+    contains_correction_or_discrepancy,
+    get_standard_reply_requested_data,
+    has_actionable_request_language,
+    is_acknowledgement_only,
+    is_special_followup_ticket,
+    looks_like_commercial_invoice_boilerplate,
+    requested_data_already_answered_by_first_reply,
+)
 
 PROJECT_ID = "tlg-business-intelligence-prd"
 REGEX_CONFIG_TABLE = (
     "tlg-business-intelligence-prd.til.log_one_tool_army_request_regex_config"
 )
 
+# Regex config still stores request_type.  Downstream components use requested_data.
 REQUEST_TYPE_TO_REQUESTED_DATA = {
     "invoice": ["commercial_invoice"],
     "return_proforma_invoice": ["return_proforma_invoice"],
@@ -53,10 +75,37 @@ REQUEST_TYPE_TO_REQUESTED_DATA = {
     "exclude_from_processing": [],
 }
 
+# These request types frequently appeared inside carrier commercial-invoice
+# templates.  When an invoice template is detected, keep the invoice request and
+# suppress these boilerplate-derived data elements unless a later LLM/human
+# review confirms them.
+INVOICE_BOILERPLATE_SUSCEPTIBLE_TYPES = {
+    "country_of_origin",
+    "customer_phone",
+    "customer_email",
+    "customer_name",
+    "shipping_address",
+    "product_description",
+    "customs_description",
+    "importer_details",
+    "value_confirmation",
+}
+
+# Regex should auto-answer only narrow, high-confidence cases.  Cases with many
+# inferred data elements are historically dominated by templates/quoted text.
+MAX_AUTO_REQUESTED_DATA = int(os.getenv("REGEX_MAX_AUTO_REQUESTED_DATA", "3"))
+HIGH_CONFIDENCE = float(os.getenv("REGEX_HIGH_CONFIDENCE", "0.95"))
+REVIEW_CONFIDENCE = float(os.getenv("REGEX_REVIEW_CONFIDENCE", "0.40"))
+
 
 class RegexEngine:
 
     def __init__(self):
+        # Import Google clients lazily so local guardrail tests can run without
+        # BigQuery dependencies installed.
+        from google.cloud import bigquery
+        from google.oauth2 import service_account
+
         creds = json.loads(os.environ["BI_BIGQUERY_CREDS"])
         credentials = service_account.Credentials.from_service_account_info(creds)
 
@@ -119,7 +168,11 @@ class RegexEngine:
 
         for ticket in tickets:
             request_text = ticket["request_body"] or ""
-            result = self.detect(request_text)
+            result = self.detect(
+                request_text,
+                requester_email=ticket["requester_email"],
+                request_number=ticket["request_number"],
+            )
 
             output_row = {
                 "zendesk_ticket_id": ticket["zendesk_ticket_id"],
@@ -127,6 +180,7 @@ class RegexEngine:
                 "requester_email": ticket["requester_email"],
                 "subject": ticket["subject"],
                 "request_body": request_text,
+                "cleaned_request_body": result.pop("cleaned_request_text", ""),
                 "ticket_category": ticket["ticket_category"],
                 "extracted_tracking_number": ticket["extracted_tracking_number"],
                 "shipment_order_number": ticket["shipment_order_number"],
@@ -147,43 +201,309 @@ class RegexEngine:
 
         return matched_results, unmatched_tickets, excluded_count
 
-    def detect(self, request_text: str):
-        matches = []
+    def _find_matches(self, request_text: str) -> Tuple[List[str], List[dict]]:
+        request_types: List[str] = []
+        matched_spans: List[dict] = []
 
         for request_type, patterns in self.regex_map.items():
-            if any(pattern.search(request_text) for pattern in patterns):
-                matches.append(request_type)
+            for pattern in patterns:
+                match = pattern.search(request_text)
+                if not match:
+                    continue
 
-        exclude_match = "exclude_from_processing" in matches
-        real_request_match = any(
-            request_type != "exclude_from_processing"
-            for request_type in matches
-        )
+                if request_type not in request_types:
+                    request_types.append(request_type)
 
-        if exclude_match and not real_request_match:
-            return {
-                "engine": "regex",
-                "matched": True,
-                "excluded": True,
-                "request_types": ["exclude_from_processing"],
-                "requested_data": [],
-            }
+                matched_spans.append(
+                    {
+                        "request_type": request_type,
+                        "span": match.group(0)[:160],
+                        "start": match.start(),
+                        "end": match.end(),
+                    }
+                )
+                break
 
-        requested_data = sorted(
+        return request_types, matched_spans
+
+    @staticmethod
+    def _requested_data_from_types(request_types: Iterable[str]) -> List[str]:
+        return sorted(
             {
                 item
-                for request_type in matches
+                for request_type in request_types
                 for item in REQUEST_TYPE_TO_REQUESTED_DATA.get(request_type, [])
             }
         )
 
+    @staticmethod
+    def _as_output(
+        *,
+        matched: bool,
+        excluded: bool,
+        request_types: List[str],
+        requested_data: List[str],
+        cleaned_request_text: str,
+        matched_spans: List[dict],
+        confidence: float,
+        notes: str,
+        needs_llm_confirmation: bool = False,
+        force_human_intervention: bool = False,
+        human_intervention_required: bool = False,
+        standard_reply_requested_data: List[str] = None,
+        regex_request_types: List[str] = None,
+        regex_requested_data: List[str] = None,
+        quoted_history_removed: bool = False,
+        signature_removed: bool = False,
+    ) -> Dict[str, object]:
         return {
             "engine": "regex",
-            "matched": len(requested_data) > 0,
-            "excluded": False,
-            "request_types": matches,
+            "matched": matched,
+            "excluded": excluded,
+            "request_types": request_types,
             "requested_data": requested_data,
+            "confidence": confidence,
+            "notes": notes,
+            "needs_llm_confirmation": needs_llm_confirmation,
+            "force_human_intervention": force_human_intervention,
+            "human_intervention_required": human_intervention_required,
+            "standard_reply_requested_data": standard_reply_requested_data or [],
+            "needs_standard_reply_confirmation": False,
+            "regex_request_types": regex_request_types or request_types,
+            "regex_requested_data": regex_requested_data or requested_data,
+            "matched_spans": matched_spans,
+            "cleaned_request_text": cleaned_request_text,
+            "quoted_history_removed": quoted_history_removed,
+            "signature_removed": signature_removed,
         }
+
+    def detect(
+        self,
+        request_text: str,
+        requester_email: object = "",
+        request_number: object = 1,
+    ):
+        text_details = clean_latest_request_text(request_text)
+        cleaned_text = str(text_details["cleaned_request_text"] or "")
+        raw_text = str(text_details["raw_request_text"] or "")
+        quoted_history_removed = bool(text_details["quoted_history_removed"])
+        signature_removed = bool(text_details["signature_removed"])
+
+        request_types, matched_spans = self._find_matches(cleaned_text)
+        raw_request_types, raw_matched_spans = self._find_matches(raw_text)
+
+        real_request_types = [
+            request_type
+            for request_type in request_types
+            if request_type != "exclude_from_processing"
+        ]
+        raw_real_request_types = [
+            request_type
+            for request_type in raw_request_types
+            if request_type != "exclude_from_processing"
+        ]
+
+        exclude_match = "exclude_from_processing" in request_types
+        has_real_match = bool(real_request_types)
+
+        # A pure acknowledgement can be safely excluded.  A message containing
+        # both "grazie/thanks" and actionable language must never be suppressed.
+        if exclude_match and not has_real_match:
+            if is_acknowledgement_only(cleaned_text):
+                return self._as_output(
+                    matched=True,
+                    excluded=True,
+                    request_types=["exclude_from_processing"],
+                    requested_data=[],
+                    cleaned_request_text=cleaned_text,
+                    matched_spans=matched_spans,
+                    confidence=HIGH_CONFIDENCE,
+                    notes="Cleaned message is acknowledgement-only.",
+                    quoted_history_removed=quoted_history_removed,
+                    signature_removed=signature_removed,
+                )
+
+            return self._as_output(
+                matched=False,
+                excluded=False,
+                request_types=[],
+                requested_data=[],
+                cleaned_request_text=cleaned_text,
+                matched_spans=matched_spans,
+                confidence=REVIEW_CONFIDENCE,
+                notes=(
+                    "Acknowledgement pattern matched, but the cleaned message is "
+                    "not acknowledgement-only. Send to LLM/human review instead "
+                    "of excluding."
+                ),
+                needs_llm_confirmation=True,
+                regex_request_types=["exclude_from_processing"],
+                regex_requested_data=[],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        # If the old/full thread matched but the latest cleaned message did not,
+        # the regex likely found stale quoted history.  This should not be used
+        # to prepare a customer-facing answer.
+        if not has_real_match and raw_real_request_types:
+            return self._as_output(
+                matched=False,
+                excluded=False,
+                request_types=[],
+                requested_data=[],
+                cleaned_request_text=cleaned_text,
+                matched_spans=raw_matched_spans,
+                confidence=0.0,
+                notes=(
+                    "Regex matched only text removed during quoted-history/signature "
+                    "cleanup. Human intervention required to inspect the thread."
+                ),
+                force_human_intervention=True,
+                human_intervention_required=True,
+                regex_request_types=raw_real_request_types,
+                regex_requested_data=self._requested_data_from_types(raw_real_request_types),
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        if not has_real_match:
+            notes = "No high-confidence regex requested_data match."
+            if has_actionable_request_language(cleaned_text):
+                notes += " Actionable language exists, so LLM extraction is required."
+            return self._as_output(
+                matched=False,
+                excluded=False,
+                request_types=[],
+                requested_data=[],
+                cleaned_request_text=cleaned_text,
+                matched_spans=matched_spans,
+                confidence=0.0,
+                notes=notes,
+                needs_llm_confirmation=True,
+                regex_request_types=[],
+                regex_requested_data=[],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        suppressed_types: List[str] = []
+        effective_request_types = list(real_request_types)
+
+        if "invoice" in effective_request_types and looks_like_commercial_invoice_boilerplate(cleaned_text):
+            effective_request_types = [
+                request_type
+                for request_type in effective_request_types
+                if request_type not in INVOICE_BOILERPLATE_SUSCEPTIBLE_TYPES
+            ]
+            suppressed_types = sorted(
+                set(real_request_types) - set(effective_request_types)
+            )
+
+        requested_data = self._requested_data_from_types(effective_request_types)
+        regex_requested_data = self._requested_data_from_types(real_request_types)
+
+        audit_notes: List[str] = []
+        review_reasons: List[str] = []
+        force_human = False
+
+        if suppressed_types:
+            audit_notes.append(
+                "Suppressed commercial-invoice boilerplate fields: "
+                + ", ".join(suppressed_types)
+            )
+
+        if len(requested_data) > MAX_AUTO_REQUESTED_DATA:
+            review_reasons.append(
+                f"Regex detected {len(requested_data)} requested_data values, "
+                "which exceeds the auto-answer limit."
+            )
+            force_human = True
+
+        if contains_correction_or_discrepancy(cleaned_text) and (
+            "invoice_correction" in real_request_types
+            or "value_confirmation" in real_request_types
+        ):
+            review_reasons.append(
+                "Correction/discrepancy language detected. Manual verification is required."
+            )
+            force_human = True
+
+        if "product_description" in real_request_types:
+            review_reasons.append(
+                "Detailed product/material request detected. Route to review unless data retrieval is verified."
+            )
+            force_human = True
+
+        if not requested_data:
+            review_reasons.append(
+                "Regex candidates were removed by safety filters."
+            )
+            force_human = True
+
+        standard_reply_requested_data = []
+        needs_standard_reply_confirmation = False
+        if is_special_followup_ticket(requester_email, request_number):
+            standard_reply_requested_data = get_standard_reply_requested_data(requester_email)
+            if requested_data_already_answered_by_first_reply(requested_data, requester_email):
+                needs_standard_reply_confirmation = True
+                review_reasons.append(
+                    "Special-carrier follow-up appears to request only data already "
+                    "covered by the first standard reply."
+                )
+
+        if review_reasons:
+            notes = " ".join(review_reasons)
+            requested_for_output = (
+                [HUMAN_INTERVENTION_REQUIRED] if force_human else []
+            )
+            output = self._as_output(
+                matched=False,
+                excluded=False,
+                request_types=(
+                    ["human_guardrail"] if force_human else []
+                ),
+                requested_data=requested_for_output,
+                cleaned_request_text=cleaned_text,
+                matched_spans=matched_spans,
+                confidence=REVIEW_CONFIDENCE if not force_human else 0.0,
+                notes=notes,
+                needs_llm_confirmation=not force_human,
+                force_human_intervention=force_human,
+                human_intervention_required=force_human,
+                standard_reply_requested_data=standard_reply_requested_data,
+                regex_request_types=real_request_types,
+                regex_requested_data=regex_requested_data,
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+            output["needs_standard_reply_confirmation"] = needs_standard_reply_confirmation
+            return output
+
+        high_confidence_notes = "High-confidence regex match after safety cleanup."
+        if audit_notes:
+            high_confidence_notes += " " + " ".join(audit_notes)
+
+        output = self._as_output(
+            matched=True,
+            excluded=False,
+            request_types=effective_request_types,
+            requested_data=requested_data,
+            cleaned_request_text=cleaned_text,
+            matched_spans=matched_spans,
+            confidence=HIGH_CONFIDENCE,
+            notes=high_confidence_notes,
+            needs_llm_confirmation=False,
+            force_human_intervention=False,
+            human_intervention_required=False,
+            standard_reply_requested_data=standard_reply_requested_data,
+            regex_request_types=real_request_types,
+            regex_requested_data=regex_requested_data,
+            quoted_history_removed=quoted_history_removed,
+            signature_removed=signature_removed,
+        )
+        output["needs_standard_reply_confirmation"] = needs_standard_reply_confirmation
+        return output
 
 
 if __name__ == "__main__":
@@ -203,9 +523,9 @@ if __name__ == "__main__":
         index=False,
     )
 
-    print(f"Regex matched: {len(matched_results)}")
-    print(f"Regex unmatched: {len(unmatched_tickets)}")
-    print(f"Regex excluded: {excluded_count}")
+    print(f"Regex high-confidence matched: {len(matched_results)}")
+    print(f"Regex unmatched/review-needed: {len(unmatched_tickets)}")
+    print(f"Regex excluded acknowledgement-only: {excluded_count}")
     print("Files written:")
     print("output/regex_matches.xlsx")
     print("output/unmatched_tickets.xlsx")
