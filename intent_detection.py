@@ -1,12 +1,15 @@
 """
 intent_detection.py
 
-LLM fallback for tickets not matched by regex_engine.py.
+LLM fallback for tickets not matched by high-confidence regex_engine.py.
 The LLM extracts requested_data, not a single intent.
 
-Language detection is deterministic and local: it uses the weighted historical
-Zendesk-ticket dictionary in customs_rules.py for all rows, including rows
-classified by regex.
+The pipeline is conservative:
+- regex hard guardrails are converted directly to human intervention;
+- LLM output is auto-usable only when confidence is above the configured
+  threshold;
+- when regex candidates and LLM extraction disagree, the row is routed to
+  human review instead of risking a wrong answer.
 
 Creates:
 - output/request_intent_results.xlsx
@@ -16,6 +19,7 @@ import json
 import os
 import time
 from math import ceil
+from typing import Dict, List
 
 import pandas as pd
 from google import genai
@@ -31,6 +35,7 @@ from customs_rules import (
 PROMPT_PATH = "prompts/requested_data_extractor.md"
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "20"))
+LLM_CONFIDENCE_MIN = float(os.getenv("LLM_CONFIDENCE_MIN", "0.85"))
 
 ALLOWED_REQUESTED_DATA = [
     "commercial_invoice",
@@ -208,8 +213,78 @@ def as_bool(value):
     return str(value).strip().lower() in {"true", "1", "yes", "y"}
 
 
+def safe_float(value, default=0.0):
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def list_or_empty(value):
     return normalize_requested_data(value)
+
+
+def requested_data_set(value):
+    return {
+        item
+        for item in normalize_requested_data(value)
+        if item not in {UNKNOWN_REQUEST, HUMAN_INTERVENTION_REQUIRED}
+    }
+
+
+def source_text_for_llm(row) -> str:
+    cleaned = str(row.get("cleaned_request_body", "") or "").strip()
+    return cleaned or str(row.get("request_body", "") or "")
+
+
+def base_output_row(source_row) -> Dict[str, object]:
+    return {
+        "zendesk_ticket_id": source_row.get("zendesk_ticket_id"),
+        "request_number": source_row.get("request_number"),
+        "requester_email": source_row.get("requester_email"),
+        "subject": source_row.get("subject"),
+        "request_body": source_row.get("request_body"),
+        "cleaned_request_body": source_row.get("cleaned_request_body"),
+        "ticket_category": source_row.get("ticket_category"),
+        "extracted_tracking_number": source_row.get("extracted_tracking_number"),
+        "shipment_order_number": source_row.get("shipment_order_number"),
+        "shipment_tracking_number": source_row.get("shipment_tracking_number"),
+        "return_tracking_number": source_row.get("return_tracking_number"),
+        "needs_standard_reply_confirmation": as_bool(
+            source_row.get("needs_standard_reply_confirmation")
+        ),
+        "standard_reply_requested_data": list_or_empty(
+            source_row.get("standard_reply_requested_data")
+        ),
+        "regex_request_types": list_or_empty(source_row.get("regex_request_types")),
+        "regex_requested_data": list_or_empty(source_row.get("regex_requested_data")),
+        "matched_spans": source_row.get("matched_spans", ""),
+        "quoted_history_removed": as_bool(source_row.get("quoted_history_removed")),
+        "signature_removed": as_bool(source_row.get("signature_removed")),
+    }
+
+
+def build_human_output_row(source_row, reason, engine="human_guardrail"):
+    output = base_output_row(source_row)
+    output.update(
+        {
+            "engine": engine,
+            "matched": True,
+            "excluded": False,
+            "request_types": ["human_intervention_required"],
+            "requested_data": [HUMAN_INTERVENTION_REQUIRED],
+            "confidence": 0.0,
+            "notes": reason,
+            "human_intervention_required": True,
+        }
+    )
+    return output
 
 
 def build_llm_output_row(source_row, result):
@@ -217,11 +292,49 @@ def build_llm_output_row(source_row, result):
     requested_data = normalize_requested_data(requested_data) or [UNKNOWN_REQUEST]
 
     engine = "llm"
-    request_types = []
+    request_types: List[str] = []
     human_intervention_required = False
+    confidence = safe_float(result.get("confidence", 0.0))
     notes = result.get("notes", "")
 
-    if (
+    regex_candidates = requested_data_set(source_row.get("regex_requested_data"))
+    llm_candidates = requested_data_set(requested_data)
+
+    if requested_data == [UNKNOWN_REQUEST]:
+        engine = "llm_unknown_request_guard"
+        request_types = ["unknown_request_guard"]
+        requested_data = [HUMAN_INTERVENTION_REQUIRED]
+        human_intervention_required = True
+        notes = (
+            "LLM could not identify actionable requested_data. "
+            "Human intervention is required. "
+            f"LLM notes: {notes}"
+        )
+
+    elif confidence < LLM_CONFIDENCE_MIN:
+        engine = "llm_low_confidence_guard"
+        request_types = ["low_confidence_guard"]
+        requested_data = [HUMAN_INTERVENTION_REQUIRED]
+        human_intervention_required = True
+        notes = (
+            f"LLM confidence {confidence:.2f} is below threshold "
+            f"{LLM_CONFIDENCE_MIN:.2f}. Human intervention is required. "
+            f"LLM notes: {notes}"
+        )
+
+    elif regex_candidates and llm_candidates and regex_candidates != llm_candidates:
+        engine = "regex_llm_disagreement_guard"
+        request_types = ["regex_llm_disagreement_guard"]
+        requested_data = [HUMAN_INTERVENTION_REQUIRED]
+        human_intervention_required = True
+        notes = (
+            "Regex candidates and LLM requested_data disagree. "
+            f"regex={sorted(regex_candidates)}; llm={sorted(llm_candidates)}. "
+            "Human intervention is required. "
+            f"LLM notes: {notes}"
+        )
+
+    elif (
         as_bool(source_row.get("needs_standard_reply_confirmation"))
         and requested_data_already_answered_by_first_reply(
             requested_data,
@@ -239,34 +352,20 @@ def build_llm_output_row(source_row, result):
             f"LLM notes: {notes}"
         )
 
-    return {
-        "zendesk_ticket_id": source_row.get("zendesk_ticket_id"),
-        "request_number": source_row.get("request_number"),
-        "requester_email": source_row.get("requester_email"),
-        "subject": source_row.get("subject"),
-        "request_body": source_row.get("request_body"),
-        "ticket_category": source_row.get("ticket_category"),
-        "extracted_tracking_number": source_row.get("extracted_tracking_number"),
-        "shipment_order_number": source_row.get("shipment_order_number"),
-        "shipment_tracking_number": source_row.get("shipment_tracking_number"),
-        "return_tracking_number": source_row.get("return_tracking_number"),
-        "engine": engine,
-        "matched": True,
-        "excluded": False,
-        "request_types": request_types,
-        "requested_data": requested_data,
-        "confidence": result.get("confidence", 0.0),
-        "notes": notes,
-        "needs_standard_reply_confirmation": as_bool(
-            source_row.get("needs_standard_reply_confirmation")
-        ),
-        "standard_reply_requested_data": list_or_empty(
-            source_row.get("standard_reply_requested_data")
-        ),
-        "regex_request_types": list_or_empty(source_row.get("regex_request_types")),
-        "regex_requested_data": list_or_empty(source_row.get("regex_requested_data")),
-        "human_intervention_required": human_intervention_required,
-    }
+    output = base_output_row(source_row)
+    output.update(
+        {
+            "engine": engine,
+            "matched": True,
+            "excluded": False,
+            "request_types": request_types,
+            "requested_data": requested_data,
+            "confidence": confidence,
+            "notes": notes,
+            "human_intervention_required": human_intervention_required,
+        }
+    )
+    return output
 
 
 def add_language_detection(final_df):
@@ -279,7 +378,7 @@ def add_language_detection(final_df):
     language_details = final_df.apply(
         lambda row: detect_language_with_dictionary(
             row.get("subject", ""),
-            row.get("request_body", ""),
+            row.get("cleaned_request_body", "") or row.get("request_body", ""),
             return_details=True,
         ),
         axis=1,
@@ -305,22 +404,34 @@ def main():
     unmatched_df = pd.read_excel("output/unmatched_tickets.xlsx")
 
     llm_results = []
-    total_batches = ceil(len(unmatched_df) / BATCH_SIZE) if len(unmatched_df) else 0
+    rows_for_llm = []
+
+    for _, row in unmatched_df.iterrows():
+        if as_bool(row.get("force_human_intervention")) or as_bool(
+            row.get("human_intervention_required")
+        ):
+            reason = row.get("notes") or "Regex safety guard required human review."
+            llm_results.append(build_human_output_row(row, reason))
+        else:
+            rows_for_llm.append(row)
+
+    total_batches = ceil(len(rows_for_llm) / BATCH_SIZE) if rows_for_llm else 0
 
     print(
-        f"Processing {len(unmatched_df)} unmatched tickets "
-        f"in {total_batches} Gemini calls"
+        f"Processing {len(rows_for_llm)} LLM-review tickets "
+        f"in {total_batches} Gemini calls; "
+        f"{len(llm_results)} tickets sent directly to human review"
     )
 
     for batch_number in range(total_batches):
         start_idx = batch_number * BATCH_SIZE
         end_idx = start_idx + BATCH_SIZE
-        batch_df = unmatched_df.iloc[start_idx:end_idx].copy()
+        batch_rows = rows_for_llm[start_idx:end_idx]
 
         batch_payload = []
         lookup = {}
 
-        for _, row in batch_df.iterrows():
+        for row in batch_rows:
             source_id = build_source_id(row)
             lookup[source_id] = row
 
@@ -328,8 +439,10 @@ def main():
                 {
                     "source_id": source_id,
                     "subject": str(row.get("subject", "") or ""),
-                    "request_body": str(row.get("request_body", "") or ""),
+                    "request_body": source_text_for_llm(row),
                     "ticket_category": str(row.get("ticket_category", "") or ""),
+                    "regex_candidates": list_or_empty(row.get("regex_requested_data")),
+                    "regex_notes": str(row.get("notes", "") or ""),
                 }
             )
 
