@@ -31,6 +31,7 @@ from customs_rules import (
 
 INPUT_PATH = "output/request_intent_results.xlsx"
 OUTPUT_PATH = "output/request_intent_results_with_drafts.xlsx"
+AUTO_ADD_UPS_MIN_CONFIDENCE = float(os.getenv("AUTO_ADD_UPS_MIN_CONFIDENCE", "0.90"))
 
 DATA_LABELS = {
     "en": {
@@ -108,6 +109,28 @@ def as_bool(value):
     return str(value).strip().lower() in {"true", "1", "yes", "y"}
 
 
+def safe_float(value, default=0.0):
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def row_confidence(row):
+    return safe_float(row.get("confidence", 0.0))
+
+
+def human_reason(row, default):
+    notes = str(row.get("notes", "") or "").strip()
+    return notes or default
+
+
 def row_language(row):
     raw_language = row.get("request_language", "")
     if not is_blank(raw_language):
@@ -148,9 +171,13 @@ def data_value(row, data_key):
 def requested_data_for_response(row):
     requested_data = normalize_requested_data(row.get("requested_data"))
 
+    # Historical false positives showed that auto-adding UPS account to every
+    # Returns Customs Clearance row can amplify weak/incorrect intent matches.
+    # Add it only after high-confidence classification.
     if (
         is_returns_customs_clearance(row.get("ticket_category"))
         and requested_data
+        and row_confidence(row) >= AUTO_ADD_UPS_MIN_CONFIDENCE
         and HUMAN_INTERVENTION_REQUIRED not in requested_data
         and UNKNOWN_REQUEST not in requested_data
         and "ups_account_number" not in requested_data
@@ -267,7 +294,10 @@ def build_response(row):
     if as_bool(row.get("human_intervention_required")) or HUMAN_INTERVENTION_REQUIRED in requested_data:
         return build_human_intervention_note(
             row,
-            "The follow-up appears to request only data already answered in the first standard reply.",
+            human_reason(
+                row,
+                "The requested data could not be identified with enough certainty.",
+            ),
         )
 
     if not requested_data:
@@ -276,7 +306,10 @@ def build_response(row):
     if requested_data == [UNKNOWN_REQUEST]:
         return build_human_intervention_note(
             row,
-            "The requested data could not be identified with enough certainty.",
+            human_reason(
+                row,
+                "The requested data could not be identified with enough certainty.",
+            ),
         )
 
     language = row_language(row)
