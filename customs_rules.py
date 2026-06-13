@@ -41,6 +41,181 @@ STANDARD_REPLY_REQUESTED_DATA = {
 
 UPS_TRACKING_PATTERN = re.compile(r"\b1Z([0-9A-Z]{6})[0-9A-Z]{10}\b", re.IGNORECASE)
 
+
+# ---------------------------------------------------------------------------
+# Request text safety helpers
+# ---------------------------------------------------------------------------
+# Regex classification must run on the latest requester message only.  Zendesk
+# email bodies often contain quoted threads and carrier boilerplate, which were
+# the main sources of false positives in the historical-ticket review.
+QUOTE_HISTORY_MARKER_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"-----\s*original\s+message\s*-----|"
+    r"---------------\s*original\s+message\s*---------------|"
+    r"from:|sent:|subject:|to:|cc:|"
+    r"da:|inviato:|oggetto:|a:|"
+    r"on\s+.+?\s+wrote:|"
+    r"il\s+.+?\s+ha\s+scritto:"
+    r")"
+)
+
+SIGNATURE_MARKER_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"best\s+regards|kind\s+regards|regards|"
+    r"cordiali\s+saluti|distinti\s+saluti|saluti"
+    r")\s*[,.-]*\s*$"
+)
+
+ACKNOWLEDGEMENT_ONLY_RE = re.compile(
+    r"^\s*(?:"
+    r"well\s+noted|understood|noted|duly\s+noted|"
+    r"thanks(?:\s+(?:a\s+lot|for\s+(?:the\s+update|the\s+information|confirming)))?|"
+    r"thank\s+you(?:\s+(?:very\s+much|for\s+(?:your\s+(?:support|help)|the\s+update|confirming)))?|"
+    r"received\s+(?:with\s+thanks|thank\s+you)|"
+    r"many\s+thanks|much\s+appreciated|greatly\s+appreciated|"
+    r"grazie(?:\s+mille)?|"
+    r"problem\s+resolved|issue\s+resolved|please\s+close\s+the\s+ticket|"
+    r"no\s+further\s+(?:assistance|action)\s+required|"
+    r"for\s+(?:your\s+information|reference\s+only)|"
+    r"everything\s+is\s+clear|clear\s+thank\s+you|case\s+closed|can\s+be\s+closed|"
+    r"all\s+set|all\s+good|looks\s+good|perfect|okay|ok"
+    r")[\s.!?,;:-]*$",
+    re.IGNORECASE,
+)
+
+REQUEST_LANGUAGE_RE = re.compile(
+    r"\b(?:"
+    r"please|kindly|could\s+you|can\s+you|we\s+(?:need|require)|"
+    r"provide|send|forward|confirm|specify|advise|"
+    r"prego|si\s+prega|vi\s+preghiamo|la\s+preghiamo|"
+    r"chiediamo|richiediamo|necessitiamo|abbiamo\s+bisogno|"
+    r"fornire|fornirci|inviare|inviarci|inoltrare|inoltrarci|"
+    r"confermare|specificare|indicare"
+    r")\b",
+    re.IGNORECASE,
+)
+
+CUSTOMS_KEYWORD_RE = re.compile(
+    r"\b(?:"
+    r"invoice|commercial\s+invoice|proforma|rpi|pri|fattura|"
+    r"tracking|trk|awb|lettera\s+di\s+vettura|"
+    r"customs|dogana|sdoganamento|merce|goods|return|reso|rientr|"
+    r"country\s+of\s+origin|paese\s+di\s+origine|"
+    r"phone\s+number|numero\s+di\s+telefono|email\s+address|indirizzo\s+email|"
+    r"partita\s+iva|codice\s+fiscale|eori|poa|procura|delega|"
+    r"value|valore|discrepancy|discrepanza"
+    r")\b",
+    re.IGNORECASE,
+)
+
+COMMERCIAL_INVOICE_BOILERPLATE_MARKERS = [
+    re.compile(r"commercial\s+invoice\s+(?:must|should)\s+include", re.IGNORECASE),
+    re.compile(r"commercial\s+invoice\s+requirements", re.IGNORECASE),
+    re.compile(r"invoice\s+must\s+include\s+the\s+following", re.IGNORECASE),
+    re.compile(r"copy\s+of\s+commercial/proforma\s+invoice", re.IGNORECASE),
+    re.compile(r"description\s+of\s+the\s+goods", re.IGNORECASE),
+]
+
+COMMERCIAL_INVOICE_BOILERPLATE_FIELDS = [
+    re.compile(r"country\s+of\s+origin", re.IGNORECASE),
+    re.compile(r"phone\s+number|telephone\s+number", re.IGNORECASE),
+    re.compile(r"description\s+of\s+the\s+goods|description\s+of\s+goods", re.IGNORECASE),
+    re.compile(r"itemized\s+value", re.IGNORECASE),
+    re.compile(r"full\s+name|email\s+address", re.IGNORECASE),
+]
+
+CORRECTION_OR_DISCREPANCY_RE = re.compile(
+    r"\b(?:"
+    r"discrepancy|mismatch|wrong|incorrect|corrected|correction|revised|updated|"
+    r"discrepanza|non\s+corrispond|non\s+coincid|errat[oa]|corrett[oa]|rettificat[oa]"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_whitespace(text: object) -> str:
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def strip_quoted_history(text: object) -> Tuple[str, bool]:
+    """Return text before forwarded/quoted email markers."""
+    normalized = normalize_whitespace(text)
+    if not normalized:
+        return "", False
+
+    marker_match = QUOTE_HISTORY_MARKER_RE.search(normalized)
+    if marker_match:
+        return normalized[: marker_match.start()].strip(), True
+
+    return normalized, False
+
+
+def strip_signature(text: object) -> Tuple[str, bool]:
+    """Conservatively remove common email signatures after the request text."""
+    normalized = normalize_whitespace(text)
+    if not normalized:
+        return "", False
+
+    marker_match = SIGNATURE_MARKER_RE.search(normalized)
+    if marker_match and marker_match.start() > 0:
+        return normalized[: marker_match.start()].strip(), True
+
+    return normalized, False
+
+
+def clean_latest_request_text(text: object) -> Dict[str, object]:
+    """
+    Clean an email body for intent detection.
+
+    Returns a dictionary so callers can keep audit metadata in output files.
+    """
+    raw_text = normalize_whitespace(text)
+    without_history, quoted_history_removed = strip_quoted_history(raw_text)
+    without_signature, signature_removed = strip_signature(without_history)
+    cleaned_text = normalize_whitespace(without_signature)
+
+    return {
+        "raw_request_text": raw_text,
+        "cleaned_request_text": cleaned_text,
+        "quoted_history_removed": quoted_history_removed,
+        "signature_removed": signature_removed,
+    }
+
+
+def has_actionable_request_language(text: object) -> bool:
+    cleaned = normalize_whitespace(text)
+    return bool(REQUEST_LANGUAGE_RE.search(cleaned) or CUSTOMS_KEYWORD_RE.search(cleaned))
+
+
+def is_acknowledgement_only(text: object) -> bool:
+    cleaned = normalize_whitespace(text)
+    if not cleaned:
+        return False
+
+    # Prevent a trailing "thanks/grazie" from suppressing a real request.
+    if has_actionable_request_language(cleaned) and not ACKNOWLEDGEMENT_ONLY_RE.fullmatch(cleaned):
+        return False
+
+    return bool(ACKNOWLEDGEMENT_ONLY_RE.fullmatch(cleaned))
+
+
+def looks_like_commercial_invoice_boilerplate(text: object) -> bool:
+    cleaned = normalize_whitespace(text)
+    if not cleaned:
+        return False
+
+    marker_hits = sum(1 for pattern in COMMERCIAL_INVOICE_BOILERPLATE_MARKERS if pattern.search(cleaned))
+    field_hits = sum(1 for pattern in COMMERCIAL_INVOICE_BOILERPLATE_FIELDS if pattern.search(cleaned))
+
+    return marker_hits >= 1 and field_hits >= 2
+
+
+def contains_correction_or_discrepancy(text: object) -> bool:
+    return bool(CORRECTION_OR_DISCREPANCY_RE.search(normalize_whitespace(text)))
+
 # Deterministic language dictionaries built from recurrent wording in the
 # historical Zendesk tickets.  High-signal phrases receive higher weights;
 # generic carrier/customs words receive lower weights to avoid overreacting to
