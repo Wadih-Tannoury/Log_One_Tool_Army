@@ -19,11 +19,18 @@ from customs_rules import (
     PLACEHOLDER,
     UNKNOWN_REQUEST,
     UPS_BROKERAGE_EMAIL,
+    collapse_document_embedded_requested_data,
     detect_language_with_dictionary,
     extract_ups_code,
     first_available_value,
+    is_dhl_requester_email,
+    is_fedex_requester_email,
+    is_first_returns_customs_request,
+    is_request_number_3_or_higher,
     is_returns_customs_clearance,
     is_special_first_reply_ticket,
+    is_unpaid_extra_charges_request,
+    is_ups_requester_email,
     normalize_email,
     normalize_language,
     normalize_requested_data,
@@ -43,11 +50,9 @@ DATA_LABELS = {
         "value_confirmation": "Value confirmation",
         "returned_items_confirmation": "Items returned",
         "customs_description": "Customs description",
-        "declaration_of_intent": "Declaration of intent",
+        "dichiarazione_di_libera_esportazione": "Dichiarazione di libera esportazione",
         "eori_number": "EORI number",
         "power_of_attorney": "Power of attorney",
-        "tax_information": "Tax information",
-        "country_of_origin": "Country of origin",
         "importer_details": "Importer details",
         "address_translation": "Address translation",
         "exporter_ein": "Exporter EIN",
@@ -58,7 +63,6 @@ DATA_LABELS = {
         "authorization_letter": "Authorization letter",
         "shipment_instructions": "Shipment instructions",
         "address_correction": "Address correction",
-        "product_description": "Product description",
         "previously_requested_documentation": "Previously requested documentation",
     },
     "it": {
@@ -70,11 +74,9 @@ DATA_LABELS = {
         "value_confirmation": "Conferma valore",
         "returned_items_confirmation": "Items returned",
         "customs_description": "Descrizione merce",
-        "declaration_of_intent": "Dichiarazione di intento",
+        "dichiarazione_di_libera_esportazione": "Dichiarazione di libera esportazione",
         "eori_number": "Numero EORI",
         "power_of_attorney": "Procura / delega",
-        "tax_information": "Dati fiscali",
-        "country_of_origin": "Paese di origine",
         "importer_details": "Dati importatore",
         "address_translation": "Traduzione indirizzo",
         "exporter_ein": "EIN esportatore",
@@ -85,7 +87,6 @@ DATA_LABELS = {
         "authorization_letter": "Lettera di autorizzazione",
         "shipment_instructions": "Istruzioni di spedizione",
         "address_correction": "Correzione indirizzo",
-        "product_description": "Descrizione prodotto",
         "previously_requested_documentation": "Documentazione precedentemente richiesta",
     },
 }
@@ -169,13 +170,23 @@ def data_value(row, data_key):
 
 
 def requested_data_for_response(row):
-    requested_data = normalize_requested_data(row.get("requested_data"))
+    request_text = str(row.get("cleaned_request_body", "") or row.get("request_body", "") or "")
+    requested_data = collapse_document_embedded_requested_data(
+        row.get("requested_data"),
+        ticket_category=row.get("ticket_category"),
+        request_number=row.get("request_number", 1),
+        requester_email=row.get("requester_email"),
+        request_text=request_text,
+    )
 
     # Historical false positives showed that auto-adding UPS account to every
     # Returns Customs Clearance row can amplify weak/incorrect intent matches.
-    # Add it only after high-confidence classification.
+    # Keep this fallback only for high-confidence UPS follow-ups, never for
+    # first requests where specific standard templates depend on exact matches.
     if (
         is_returns_customs_clearance(row.get("ticket_category"))
+        and not is_first_returns_customs_request(row.get("ticket_category"), row.get("request_number", 1))
+        and is_ups_requester_email(row.get("requester_email"))
         and requested_data
         and row_confidence(row) >= AUTO_ADD_UPS_MIN_CONFIDENCE
         and HUMAN_INTERVENTION_REQUIRED not in requested_data
@@ -188,19 +199,33 @@ def requested_data_for_response(row):
 
 
 def build_ups_first_standard_reply(row):
-    ups_code = extract_ups_code(
-        row.get("shipment_tracking_number"),
-        row.get("extracted_tracking_number"),
-        row.get("return_tracking_number"),
-    ) or PLACEHOLDER
+    """Backward-compatible UPS first-reply template."""
+    return build_ups_returns_first_rpi_account_response(row)
+
+
+def build_ups_returns_first_rpi_account_response(row):
+    export_tracking = data_value(row, "export_tracking_number")
+    ups_account = data_value(row, "ups_account_number")
+    rpi = data_value(row, "return_proforma_invoice")
 
     return (
+        "Answer 1:\n"
+        "Hi,\n\n"
+        "Please find below the information needed for Returns Customs Clearance:\n\n"
+        f"\u2022 Export TRK: {export_tracking}\n"
+        f"\u2022 UPS Account: {ups_account}\n"
+        f"\u2022 Return Proforma Invoice: {rpi}\n"
+        "All products have been returned\n\n"
+        "Thanks,\n\n"
+        "Piero T.\n\n"
+        "Answer 2:\n"
         "Buongiorno,\n\n"
         "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n"
         "TRK in export: non disponibile, avvenuto con altro vettore\n"
-        f"Cod UPS: {ups_code}\n\n"
-        "Tutti i prodotti sono stati resi\n\n"
-        "Cordiali saluti,\n"
+        f"Cod UPS: {ups_account}\n"
+        f"Items returned: {PLACEHOLDER}\n"
+        f"RPI: {rpi}\n"
+        "Cordiali saluti,\n\n"
         "Piero T."
     )
 
@@ -217,6 +242,109 @@ def build_fedex_first_standard_reply(row):
         f"RPI: {PLACEHOLDER}\n"
         "Cordiali saluti,"
     )
+
+
+def build_returns_first_rpi_documents_response(row):
+    awb_export = data_value(row, "export_tracking_number")
+    rpi = data_value(row, "return_proforma_invoice")
+
+    return (
+        "Buongiorno,\n\n"
+        "In allegato invio la documentazione richiesta.\n\n"
+        f"AWB in export: {awb_export}\n"
+        f"RPI: {rpi}\n"
+        "Cordiali saluti,\n\n"
+        "Piero T."
+    )
+
+
+def build_fedex_dhl_returns_first_rpi_contact_response(row):
+    awb_export = data_value(row, "export_tracking_number")
+    rpi = data_value(row, "return_proforma_invoice")
+
+    return (
+        "Answer 1:\n"
+        "Buongiorno,\n\n"
+        "In allegato invio la documentazione richiesta.\n\n"
+        f"AWB in export: {awb_export}\n"
+        f"RPI: {rpi}\n"
+        "Cordiali saluti,\n\n"
+        "Piero T.\n\n"
+        "Answer 2:\n"
+        "Buongiorno,\n\n"
+        "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n"
+        "AWB in export: non disponibile, avvenuto con altro vettore\n"
+        f"Items returned: {PLACEHOLDER}\n"
+        f"RPI: {rpi}\n"
+        "Cordiali saluti,\n\n"
+        "Piero T."
+    )
+
+
+def build_dhl_returns_first_rpi_response(row):
+    awb_export = data_value(row, "export_tracking_number")
+    rpi = data_value(row, "return_proforma_invoice")
+
+    return (
+        "Buongiorno,\n\n"
+        "In allegato la documentazione richiesta per la reintroduzione in franchigia.\n"
+        f"AWB in export: {awb_export}\n"
+        f"Items returned: {PLACEHOLDER}\n"
+        f"RPI: {rpi}\n\n"
+        "Cordiali saluti,\n\n"
+        "Piero T."
+    )
+
+
+def build_ups_account_unpaid_extra_charges_response(row):
+    ups_account = data_value(row, "ups_account_number")
+
+    return (
+        "Response 1:\n"
+        "Hello,\n\n"
+        f"Please, debit the outstanding charges to our UPS account {ups_account}, "
+        "authorized by Piero Trevisan and proceed with the delivery.\n\n"
+        "Best regards,\n\n"
+        "Piero T.\n\n"
+        "Response 2:\n"
+        "Hello,\n\n"
+        "I confirm you the return of shipment on topic.\n"
+        f"Debit all the relative costs to our UPS account {ups_account}, "
+        "authorized by Piero T.\n"
+        "You can find attached the LOA\n\n"
+        "Best regards\n\n"
+        "Piero T."
+    )
+
+
+def build_ups_account_standard_response(row):
+    ups_account = data_value(row, "ups_account_number")
+
+    return (
+        "Hello,\n\n"
+        "I confirm you the return of shipment on topic.\n"
+        f"Debit all the relative costs to our UPS account {ups_account}, "
+        "authorized by Piero T.\n"
+        "You can find attached the LOA\n\n"
+        "Best regards\n\n"
+        "Piero T."
+    )
+
+
+def has_embedded_rpi_contact_fields(row):
+    regex_types = set(normalize_requested_data(row.get("regex_request_types")))
+    regex_requested_data = set(normalize_requested_data(row.get("regex_requested_data")))
+    requested_data = set(normalize_requested_data(row.get("requested_data")))
+    embedded_contact_fields = {
+        "shipping_address",
+        "customer_email",
+        "customer_phone",
+    }
+    return bool((regex_types | regex_requested_data | requested_data) & embedded_contact_fields)
+
+
+def row_request_text(row):
+    return str(row.get("cleaned_request_body", "") or row.get("request_body", "") or "")
 
 
 def build_human_intervention_note(row, reason):
@@ -282,14 +410,13 @@ def build_generic_response(row, requested_data, language):
 def build_response(row):
     requester_email = normalize_email(row.get("requester_email"))
     request_number = row.get("request_number", 1)
-
-    if is_special_first_reply_ticket(requester_email, request_number):
-        if requester_email == UPS_BROKERAGE_EMAIL:
-            return build_ups_first_standard_reply(row)
-        if requester_email == FEDEX_BROKERAGE_EMAIL:
-            return build_fedex_first_standard_reply(row)
-
     requested_data = requested_data_for_response(row)
+
+    if is_request_number_3_or_higher(request_number):
+        return build_human_intervention_note(
+            row,
+            "Request number is 3 or higher. Human intervention is required by automation policy.",
+        )
 
     if as_bool(row.get("human_intervention_required")) or HUMAN_INTERVENTION_REQUIRED in requested_data:
         return build_human_intervention_note(
@@ -312,6 +439,41 @@ def build_response(row):
             ),
         )
 
+    first_returns_request = is_first_returns_customs_request(
+        row.get("ticket_category"),
+        request_number,
+    )
+
+    if first_returns_request and is_ups_requester_email(requester_email):
+        if {"ups_account_number", "return_proforma_invoice"}.issubset(set(requested_data)):
+            return build_ups_returns_first_rpi_account_response(row)
+
+    if first_returns_request and (
+        is_fedex_requester_email(requester_email) or is_dhl_requester_email(requester_email)
+    ):
+        if "return_proforma_invoice" in requested_data and has_embedded_rpi_contact_fields(row):
+            return build_fedex_dhl_returns_first_rpi_contact_response(row)
+
+    if first_returns_request and is_dhl_requester_email(requester_email):
+        if "return_proforma_invoice" in requested_data:
+            return build_dhl_returns_first_rpi_response(row)
+
+    if (
+        first_returns_request
+        and "return_proforma_invoice" in requested_data
+        and has_embedded_rpi_contact_fields(row)
+    ):
+        return build_returns_first_rpi_documents_response(row)
+
+    if requested_data == ["ups_account_number"]:
+        if is_unpaid_extra_charges_request(row_request_text(row)):
+            return build_ups_account_unpaid_extra_charges_response(row)
+        return build_ups_account_standard_response(row)
+
+    if is_special_first_reply_ticket(requester_email, request_number):
+        if is_fedex_requester_email(requester_email):
+            return build_fedex_first_standard_reply(row)
+
     language = row_language(row)
 
     if requested_data == ["power_of_attorney"]:
@@ -319,11 +481,11 @@ def build_response(row):
 
     return build_generic_response(row, requested_data, language)
 
-
 def requires_human_intervention(row):
     requested_data = normalize_requested_data(row.get("requested_data"))
     return (
-        as_bool(row.get("human_intervention_required"))
+        is_request_number_3_or_higher(row.get("request_number"))
+        or as_bool(row.get("human_intervention_required"))
         or HUMAN_INTERVENTION_REQUIRED in requested_data
         or requested_data == [UNKNOWN_REQUEST]
     )
