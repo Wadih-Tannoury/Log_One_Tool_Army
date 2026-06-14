@@ -56,6 +56,11 @@ DOCUMENT_EMBEDDED_REQUESTED_DATA = {
     "product_description",
 }
 
+RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA = {
+    "customs_description",
+    "importer_details",
+}
+
 RPI_EMBEDDED_CONTACT_REQUESTED_DATA = {
     "shipping_address",
     "customer_email",
@@ -343,6 +348,10 @@ def collapse_embedded_document_fields(row, requested_data):
     contact_fields_found = False
 
     for data_key in requested_data:
+        if data_key in RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA:
+            if "return_proforma_invoice" not in result:
+                result.append("return_proforma_invoice")
+            continue
         if data_key in DOCUMENT_EMBEDDED_REQUESTED_DATA:
             embedded_document_fields_found = True
             continue
