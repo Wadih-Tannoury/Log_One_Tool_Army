@@ -200,6 +200,15 @@ RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA = {
     "importer_details",
 }
 
+# On first requests, invoice correction and value confirmation are treated as
+# details required inside the return proforma invoice package for response
+# generation.  They should not produce separate customer-facing lines.
+FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA = {
+    "invoice_correction",
+    "corrected_invoice",
+    "value_confirmation",
+}
+
 DOCUMENT_FIELD_PHRASE_RE = re.compile(
     r"(?:"
     r"country\s+of\s+origin|paese\s+di\s+origine|"
@@ -375,6 +384,9 @@ def collapse_document_embedded_requested_data(
     customs_description and importer_details are also not customer-facing
     requested_data anymore.  They are fulfilled by the return proforma invoice
     package and are collapsed to return_proforma_invoice.
+
+    On request number 1, invoice correction and value confirmation are also
+    considered part of the return proforma invoice package for response data.
     """
     values = normalize_requested_data(requested_data)
     if not values:
@@ -383,10 +395,15 @@ def collapse_document_embedded_requested_data(
     result: List[str] = []
     embedded_fields_found = False
     rpi_document_fields_found = False
+    first_request_rpi_response_fields_found = False
+    first_request = normalize_request_number(request_number) == 1
 
     for value in values:
         if value in RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA:
             rpi_document_fields_found = True
+            continue
+        if first_request and value in FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA:
+            first_request_rpi_response_fields_found = True
             continue
         if value in DOCUMENT_EMBEDDED_REQUESTED_DATA:
             embedded_fields_found = True
@@ -428,7 +445,9 @@ def collapse_document_embedded_requested_data(
             if value not in RPI_EMBEDDED_CONTACT_REQUESTED_DATA
         ]
 
-    if rpi_document_fields_found and "return_proforma_invoice" not in result:
+    if (
+        rpi_document_fields_found or first_request_rpi_response_fields_found
+    ) and "return_proforma_invoice" not in result:
         result.append("return_proforma_invoice")
 
     if embedded_fields_found:
@@ -445,9 +464,16 @@ def collapse_document_embedded_requested_data(
     if (
         "commercial_invoice" in result
         and "return_proforma_invoice" in result
-        and (embedded_fields_found or rpi_document_fields_found or field_phrase_found)
+        and (
+            embedded_fields_found
+            or rpi_document_fields_found
+            or first_request_rpi_response_fields_found
+            or field_phrase_found
+        )
     ):
-        if first_returns or has_return_proforma_context(text):
+        if first_request_rpi_response_fields_found:
+            result = [value for value in result if value != "commercial_invoice"]
+        elif first_returns or has_return_proforma_context(text):
             result = [value for value in result if value != "commercial_invoice"]
         elif has_commercial_invoice_context(text):
             result = [value for value in result if value != "return_proforma_invoice"]
