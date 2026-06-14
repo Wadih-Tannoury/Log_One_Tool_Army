@@ -7,17 +7,15 @@ The system should classify requests into requested data elements, not a single i
 | Key | Meaning |
 |---|---|
 | `commercial_invoice` | Commercial invoice or invoice copy. Also covers tax information, country of origin, and product-description fields when those are requested in an invoice context. |
-| `return_proforma_invoice` | Return proforma invoice / RPI / PRI / reintroduction-in-franchigia documentation. Also covers tax information, country of origin, product-description fields, phone, email, and address when those are part of a first Returns Customs Clearance RPI package. |
+| `return_proforma_invoice` | Return proforma invoice / RPI / PRI / reintroduction-in-franchigia documentation. Also covers customs description, importer details, tax information, country of origin, product-description fields, phone, email, and address when those are part of a Returns Customs Clearance RPI package. |
 | `corrected_invoice` | Corrected or updated invoice |
 | `export_tracking_number` | Export tracking number / TRK export / AWB export |
 | `ups_account_number` | UPS account / abbonamento UPS |
 | `value_confirmation` | Declared value / value confirmation |
 | `returned_items_confirmation` | Which items are returning / partial or full return |
-| `customs_description` | Customs description of goods, customs commodity description, HS details if available |
 | `dichiarazione_di_libera_esportazione` | Dichiarazione di libera esportazione / dichiarazione di intento / declaration of intent |
 | `eori_number` | EORI number |
 | `power_of_attorney` | POA / power of attorney / authorization delegate |
-| `importer_details` | Importer company details, address, contacts |
 | `address_translation` | Address translation request |
 | `exporter_ein` | Exporter EIN |
 | `customer_phone` | Customer phone / telephone number when requested as a standalone item |
@@ -38,9 +36,11 @@ Do not output these as standalone requested_data values:
 - `tax_information`
 - `country_of_origin`
 - `product_description`
+- `customs_description`
+- `importer_details`
 - `declaration_of_intent`
 
-Map tax/country/product fields to `commercial_invoice` or `return_proforma_invoice` depending on context.
+Map tax/country/product fields to `commercial_invoice` or `return_proforma_invoice` depending on context. Map customs-description and importer-details fields to `return_proforma_invoice`.
 Map declaration wording to `dichiarazione_di_libera_esportazione`.
 
 ## Design Principle
