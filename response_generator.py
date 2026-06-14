@@ -47,6 +47,7 @@ REQUESTED_DATA_ALIASES = {
     "ups_code": "ups_account_number",
     "invoice": "commercial_invoice",
     "commercial_invoice_required": "commercial_invoice",
+    "invoice_correction": "corrected_invoice",
     "declaration_of_intent": "dichiarazione_di_libera_esportazione",
 }
 
@@ -59,6 +60,12 @@ DOCUMENT_EMBEDDED_REQUESTED_DATA = {
 RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA = {
     "customs_description",
     "importer_details",
+}
+
+FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA = {
+    "corrected_invoice",
+    "invoice_correction",
+    "value_confirmation",
 }
 
 RPI_EMBEDDED_CONTACT_REQUESTED_DATA = {
@@ -341,6 +348,7 @@ def collapse_embedded_document_fields(row, requested_data):
         row.get("ticket_category"),
         row.get("request_number", 1),
     )
+    first_request = normalize_request_number(row.get("request_number", 1)) == 1
     requester_email = row.get("requester_email")
 
     result = []
@@ -349,6 +357,10 @@ def collapse_embedded_document_fields(row, requested_data):
 
     for data_key in requested_data:
         if data_key in RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA:
+            if "return_proforma_invoice" not in result:
+                result.append("return_proforma_invoice")
+            continue
+        if first_request and data_key in FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA:
             if "return_proforma_invoice" not in result:
                 result.append("return_proforma_invoice")
             continue
