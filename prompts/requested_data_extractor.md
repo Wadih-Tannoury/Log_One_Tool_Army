@@ -47,7 +47,7 @@ Return:
 }
 ```
 
-Do not compress multiple requested data elements into one intent.
+Do not compress unrelated requested data elements into one intent.
 The system downstream uses each requested_data value to retrieve data and build the final response.
 
 ## Precision and Escalation Rules
@@ -58,7 +58,68 @@ Return low confidence when the request is ambiguous, appears to be boilerplate, 
 
 Use `unknown_request` with low confidence when you cannot identify the requested data precisely. The application will route low-confidence rows to human intervention.
 
-Do not guess between similar document types. For example, if the message could mean either `commercial_invoice` or `return_proforma_invoice`, return the best candidate only when the wording is explicit; otherwise return `unknown_request` with low confidence.
+Do not guess between similar document types. For example, if the message could mean either `commercial_invoice` or `return_proforma_invoice`, return the best candidate only when the wording is explicit or when the ticket context clearly indicates a return customs clearance flow; otherwise return `unknown_request` with low confidence.
+
+## Document-Embedded Fields
+
+The following are not standalone requested_data values anymore:
+
+- tax information / VAT / fiscal code / partita IVA / dati fiscali / codice fiscale
+- country of origin / paese di origine
+- product description / material composition / description of goods
+
+Assume these are included inside the invoice or the return proforma invoice.
+
+If these fields are requested in an order/import/commercial-invoice context, return `commercial_invoice`.
+
+If these fields are requested in a return, RPI, PRI, reintroduction, reintroduzione in franchigia, or Returns Customs Clearance context, return `return_proforma_invoice`.
+
+Do not return `tax_information`, `country_of_origin`, or `product_description`.
+
+## Returns Customs Clearance Rules
+
+For first Returns Customs Clearance requests, customer phone, customer email, and shipping address are often requested only because they must appear in the RPI package.
+
+For FedEx or DHL first Returns Customs Clearance requests, if the sender asks for customer phone, customer email, or shipping address, treat those fields as part of the RPI package and return only `return_proforma_invoice` unless the sender clearly asks for those contact/address details as a separate operational correction.
+
+If any first Returns Customs Clearance request asks for `return_proforma_invoice` together with customer phone, customer email, or shipping address, return only `return_proforma_invoice` unless the sender clearly asks for those contact/address details as a separate operational correction.
+
+If a UPS Returns Customs Clearance request asks for the UPS account and the return proforma invoice, return:
+
+```json
+{
+  "requested_data": ["ups_account_number", "return_proforma_invoice"],
+  "confidence": 0.95,
+  "notes": "UPS return clearance request for account and RPI"
+}
+```
+
+If a DHL Returns Customs Clearance request asks for documentation for reintroduzione in franchigia, return `return_proforma_invoice`.
+
+## UPS Extra Charges Rule
+
+If the request says the customer, consignee, receiver, destinatario, or cliente did not pay extra charges, outstanding charges, oneri, costi, spese, dazi, or diritti, return only:
+
+```json
+{
+  "requested_data": ["ups_account_number"],
+  "confidence": 0.95,
+  "notes": "Customer did not pay extra/outstanding charges; UPS account is needed"
+}
+```
+
+Do not add other requested_data values in this case.
+
+## Declaration Rule
+
+Use `dichiarazione_di_libera_esportazione` for requests that mention:
+
+- dichiarazione di libera esportazione
+- dichiarazione di intento
+- dichiarazione d'intento
+- declaration of intent
+
+Do not return `declaration_of_intent`.
 
 ## Boilerplate / Quoted History Logic
 
@@ -104,6 +165,8 @@ Example:
 
 This is a real request, not an acknowledgement.
 
+If the sender asks TLG to provide information or instructions through the FedEx Support Hub portal, classify the row as requiring human intervention. The deterministic regex layer should normally catch these before LLM fallback; if you see one, return `human_intervention_required` with high confidence.
+
 ## Multilingual Understanding
 
 Requests may be written in English or Italian.
@@ -113,14 +176,16 @@ Examples:
 - fattura mancante = commercial_invoice
 - fattura di reso = return_proforma_invoice
 - RPI / PRI = return_proforma_invoice
+- reintroduzione in franchigia = return_proforma_invoice
 - fattura corretta = corrected_invoice
 - numero di tracking export = export_tracking_number
 - AWB in export / lettera di vettura = export_tracking_number
 - codice abbonamento UPS = ups_account_number
-- paese di origine = country_of_origin
-- descrizione merce = customs_description
-- numero di telefono = customer_phone
-- indirizzo email = customer_email
-- nome completo = customer_name
+- dichiarazione di libera esportazione = dichiarazione_di_libera_esportazione
+- dichiarazione di intento / dichiarazione d'intento = dichiarazione_di_libera_esportazione
+- descrizione merce / tipo di merce / voce doganale = customs_description
+- numero di telefono = customer_phone unless it is part of an RPI package in a first Returns Customs Clearance request
+- indirizzo email = customer_email unless it is part of an RPI package in a first Returns Customs Clearance request
+- indirizzo di spedizione = shipping_address unless it is part of an RPI package in a first Returns Customs Clearance request
 - torna tutto / rientrano entrambi = returned_items_confirmation
-- conferma valore / unit price / itemized value = value_confirmation
+- conferma valore / unit price / itemized value = value_confirmation unless it is only invoice/RPI-required content
