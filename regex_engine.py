@@ -548,14 +548,28 @@ class RegexEngine:
             )
             force_human = True
 
+        first_request_invoice_or_value_as_rpi = (
+            normalize_request_number(request_number) == 1
+            and (
+                "invoice_correction" in real_request_types
+                or "value_confirmation" in real_request_types
+            )
+        )
+
         if contains_correction_or_discrepancy(cleaned_text) and (
             "invoice_correction" in real_request_types
             or "value_confirmation" in real_request_types
         ):
-            review_reasons.append(
-                "Correction/discrepancy language detected. Manual verification is required."
-            )
-            force_human = True
+            if first_request_invoice_or_value_as_rpi:
+                audit_notes.append(
+                    "Treated first-request invoice correction/value confirmation "
+                    "as part of the return proforma invoice package."
+                )
+            else:
+                review_reasons.append(
+                    "Correction/discrepancy language detected. Manual verification is required."
+                )
+                force_human = True
 
         if not requested_data:
             review_reasons.append(
