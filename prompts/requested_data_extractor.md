@@ -74,13 +74,15 @@ If these fields are requested in an order/import/commercial-invoice context, ret
 
 If these fields are requested in a return, RPI, PRI, reintroduction, reintroduzione in franchigia, or Returns Customs Clearance context, return `return_proforma_invoice`.
 
-Do not return `tax_information`, `country_of_origin`, or `product_description`.
+Do not return `tax_information`, `country_of_origin`, `product_description`, `customs_description`, or `importer_details`.
 
 ## Returns Customs Clearance Rules
 
 For first Returns Customs Clearance requests, customer phone, customer email, and shipping address are often requested only because they must appear in the RPI package.
 
 For FedEx or DHL first Returns Customs Clearance requests, if the sender asks for customer phone, customer email, or shipping address, treat those fields as part of the RPI package and return only `return_proforma_invoice` unless the sender clearly asks for those contact/address details as a separate operational correction.
+
+If the sender asks for customs description, goods description, commodity description, HS/customs details, importer details, importer company details, importer address, or importer contacts, treat those fields as part of the return proforma invoice package and return `return_proforma_invoice`, not standalone fields.
 
 If any first Returns Customs Clearance request asks for `return_proforma_invoice` together with customer phone, customer email, or shipping address, return only `return_proforma_invoice` unless the sender clearly asks for those contact/address details as a separate operational correction.
 
@@ -183,7 +185,8 @@ Examples:
 - codice abbonamento UPS = ups_account_number
 - dichiarazione di libera esportazione = dichiarazione_di_libera_esportazione
 - dichiarazione di intento / dichiarazione d'intento = dichiarazione_di_libera_esportazione
-- descrizione merce / tipo di merce / voce doganale = customs_description
+- descrizione merce / tipo di merce / voce doganale = return_proforma_invoice
+- importer details / dati importatore / ragione sociale / residenza e recapiti = return_proforma_invoice
 - numero di telefono = customer_phone unless it is part of an RPI package in a first Returns Customs Clearance request
 - indirizzo email = customer_email unless it is part of an RPI package in a first Returns Customs Clearance request
 - indirizzo di spedizione = shipping_address unless it is part of an RPI package in a first Returns Customs Clearance request
