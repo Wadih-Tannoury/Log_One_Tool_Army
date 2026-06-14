@@ -39,6 +39,7 @@ from customs_rules import (
     is_acknowledgement_only,
     is_platform_handoff_request,
     is_request_number_3_or_higher,
+    normalize_request_number,
     is_special_followup_ticket,
     is_unpaid_extra_charges_request,
     looks_like_commercial_invoice_boilerplate,
@@ -59,7 +60,7 @@ REQUEST_TYPE_TO_REQUESTED_DATA = {
     "ups_account": ["ups_account_number"],
     "value_confirmation": ["value_confirmation"],
     "returned_items": ["returned_items_confirmation"],
-    "customs_description": ["customs_description"],
+    "customs_description": ["return_proforma_invoice"],
     "declaration_of_intent": ["dichiarazione_di_libera_esportazione"],
     "dichiarazione_di_libera_esportazione": ["dichiarazione_di_libera_esportazione"],
     "eori": ["eori_number"],
@@ -67,7 +68,7 @@ REQUEST_TYPE_TO_REQUESTED_DATA = {
     "power_of_attorney": ["power_of_attorney"],
     "tax_information": ["tax_information"],
     "country_of_origin": ["country_of_origin"],
-    "importer_details": ["importer_details"],
+    "importer_details": ["return_proforma_invoice"],
     "address_translation": ["address_translation"],
     "exporter_ein": ["exporter_ein"],
     "customer_phone": ["customer_phone"],
@@ -534,7 +535,13 @@ class RegexEngine:
                 + ", ".join(suppressed_types)
             )
 
-        if len(requested_data) > MAX_AUTO_REQUESTED_DATA:
+        # Request number 1 often contains the complete first carrier checklist.
+        # Do not apply the multi-field auto-answer limit on first requests.
+        # Request number 3+ is already forced to human intervention above.
+        if (
+            normalize_request_number(request_number) != 1
+            and len(requested_data) > MAX_AUTO_REQUESTED_DATA
+        ):
             review_reasons.append(
                 f"Regex detected {len(requested_data)} requested_data values, "
                 "which exceeds the auto-answer limit."
