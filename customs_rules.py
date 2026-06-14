@@ -17,27 +17,47 @@ HUMAN_INTERVENTION_REQUIRED = "human_intervention_required"
 UNKNOWN_REQUEST = "unknown_request"
 
 UPS_BROKERAGE_EMAIL = "bgybrokerage@ups.com"
-FEDEX_BROKERAGE_EMAIL = "doganafedex@fedex.com"
-SPECIAL_FIRST_REPLY_EMAILS = {
+UPS_BROKERAGE_EMAILS = {
     UPS_BROKERAGE_EMAIL,
-    FEDEX_BROKERAGE_EMAIL,
+    "cpibrokerage@ups.com",
 }
+FEDEX_BROKERAGE_EMAIL = "doganafedex@fedex.com"
+DHL_BROKERAGE_EMAIL = "kamil.it@dhl.com"
 
-# Data elements covered by the first automatic reply for the two carrier inboxes.
+UPS_STANDARD_REPLY_REQUESTED_DATA = [
+    "export_tracking_number",
+    "ups_account_number",
+    "return_proforma_invoice",
+    "returned_items_confirmation",
+]
+FEDEX_STANDARD_REPLY_REQUESTED_DATA = [
+    "export_tracking_number",
+    "returned_items_confirmation",
+    "return_proforma_invoice",
+]
+DHL_STANDARD_REPLY_REQUESTED_DATA = [
+    "export_tracking_number",
+    "returned_items_confirmation",
+    "return_proforma_invoice",
+]
+
+SPECIAL_FIRST_REPLY_EMAILS = (
+    UPS_BROKERAGE_EMAILS
+    | {
+        FEDEX_BROKERAGE_EMAIL,
+        DHL_BROKERAGE_EMAIL,
+    }
+)
+
+# Data elements covered by the first automatic reply for carrier inboxes.
 # Follow-up requests asking only for these elements should not be answered again
 # without an LLM confirmation and, if confirmed, human intervention.
 STANDARD_REPLY_REQUESTED_DATA = {
-    UPS_BROKERAGE_EMAIL: [
-        "export_tracking_number",
-        "ups_account_number",
-        "returned_items_confirmation",
-    ],
-    FEDEX_BROKERAGE_EMAIL: [
-        "export_tracking_number",
-        "returned_items_confirmation",
-        "return_proforma_invoice",
-    ],
+    email: UPS_STANDARD_REPLY_REQUESTED_DATA
+    for email in UPS_BROKERAGE_EMAILS
 }
+STANDARD_REPLY_REQUESTED_DATA[FEDEX_BROKERAGE_EMAIL] = FEDEX_STANDARD_REPLY_REQUESTED_DATA
+STANDARD_REPLY_REQUESTED_DATA[DHL_BROKERAGE_EMAIL] = DHL_STANDARD_REPLY_REQUESTED_DATA
 
 UPS_TRACKING_PATTERN = re.compile(r"\b1Z([0-9A-Z]{6})[0-9A-Z]{10}\b", re.IGNORECASE)
 
@@ -103,6 +123,8 @@ CUSTOMS_KEYWORD_RE = re.compile(
     r"country\s+of\s+origin|paese\s+di\s+origine|"
     r"phone\s+number|numero\s+di\s+telefono|email\s+address|indirizzo\s+email|"
     r"partita\s+iva|codice\s+fiscale|eori|poa|procura|delega|"
+    r"dichiarazione\s+di\s+libera\s+esportazione|dichiarazione\s+di\s+intento|"
+    r"fedex\s+support\s+hub|extra\s+charges?|outstanding\s+charges?|"
     r"value|valore|discrepancy|discrepanza"
     r")\b",
     re.IGNORECASE,
@@ -129,6 +151,74 @@ CORRECTION_OR_DISCREPANCY_RE = re.compile(
     r"discrepancy|mismatch|wrong|incorrect|corrected|correction|revised|updated|"
     r"discrepanza|non\s+corrispond|non\s+coincid|errat[oa]|corrett[oa]|rettificat[oa]"
     r")\b",
+    re.IGNORECASE,
+)
+
+PLATFORM_HANDOFF_RE = re.compile(
+    r"(?:"
+    r"(?:siete\s+pregati|vi\s+preghiamo|la\s+preghiamo|please|kindly)"
+    r"[\s\S]{0,160}"
+    r"(?:inviar(?:ci|e)|fornir(?:ci|e)|inserire|caricare|upload|send|provide)"
+    r"[\s\S]{0,160}"
+    r"(?:informazioni|istruzioni|information|instructions)"
+    r"[\s\S]{0,160}"
+    r"(?:portale\s+)?fedex\s+support\s+hub|"
+    r"(?:portale\s+)?fedex\s+support\s+hub"
+    r")",
+    re.IGNORECASE,
+)
+
+UNPAID_EXTRA_CHARGES_RE = re.compile(
+    r"(?:"
+    r"(?:customer|consignee|receiver|destinatario|cliente)"
+    r"[\s\S]{0,120}"
+    r"(?:did\s+not\s+pay|didn['’]?t\s+pay|has\s+not\s+paid|not\s+paid|"
+    r"non\s+ha\s+pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r"[\s\S]{0,120}"
+    r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|charges?|"
+    r"oneri|costi|spese|supplementi|dazi|diritti)|"
+    r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|charges?|"
+    r"oneri|costi|spese|supplementi|dazi|diritti)"
+    r"[\s\S]{0,120}"
+    r"(?:did\s+not\s+pay|didn['’]?t\s+pay|has\s+not\s+paid|not\s+paid|"
+    r"non\s+ha\s+pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r")",
+    re.IGNORECASE,
+)
+
+DOCUMENT_EMBEDDED_REQUESTED_DATA = {
+    "tax_information",
+    "country_of_origin",
+    "product_description",
+}
+
+DOCUMENT_FIELD_PHRASE_RE = re.compile(
+    r"(?:"
+    r"country\s+of\s+origin|paese\s+di\s+origine|"
+    r"partita\s+iva|dati\s+fiscali|codice\s+fiscale|vat\s+number|"
+    r"fiscal\s+code|tax\s+(?:id|information)|"
+    r"description\s+of\s+the\s+goods|description\s+of\s+goods|"
+    r"detailed\s+product\s+description|descrizione\s+dettagliata\s+del\s+prodotto|"
+    r"material\s+composition|materiali\s+di\s+composizione|itemized\s+value"
+    r")",
+    re.IGNORECASE,
+)
+
+RPI_EMBEDDED_CONTACT_REQUESTED_DATA = {
+    "shipping_address",
+    "customer_email",
+    "customer_phone",
+}
+
+RETURN_PROFORMA_CONTEXT_RE = re.compile(
+    r"\b(?:rpi|pri|return\s+proforma|return\s+invoice|fattura\s+(?:di\s+)?reso|"
+    r"proforma\s+(?:di\s+)?reso|reintroduzione\s+in\s+franchigia|reso|rientr)\b",
+    re.IGNORECASE,
+)
+
+COMMERCIAL_INVOICE_CONTEXT_RE = re.compile(
+    r"\b(?:commercial\s+invoice|commercial/proforma\s+invoice|proforma\s+invoice|"
+    r"fattura\s+commerciale|fattura\s+export|invoice|fattura)\b",
     re.IGNORECASE,
 )
 
@@ -216,6 +306,140 @@ def looks_like_commercial_invoice_boilerplate(text: object) -> bool:
 def contains_correction_or_discrepancy(text: object) -> bool:
     return bool(CORRECTION_OR_DISCREPANCY_RE.search(normalize_whitespace(text)))
 
+
+def is_platform_handoff_request(text: object) -> bool:
+    """True when the sender explicitly asks TLG to reply in an external portal."""
+    return bool(PLATFORM_HANDOFF_RE.search(normalize_whitespace(text)))
+
+
+def is_unpaid_extra_charges_request(text: object) -> bool:
+    """True when the request says the customer did not pay extra/outstanding charges."""
+    return bool(UNPAID_EXTRA_CHARGES_RE.search(normalize_whitespace(text)))
+
+
+def is_ups_requester_email(email: object) -> bool:
+    normalized = normalize_email(email)
+    return normalized in UPS_BROKERAGE_EMAILS or normalized.endswith("@ups.com")
+
+
+def is_fedex_requester_email(email: object) -> bool:
+    normalized = normalize_email(email)
+    return normalized == FEDEX_BROKERAGE_EMAIL or "fedex" in normalized
+
+
+def is_dhl_requester_email(email: object) -> bool:
+    normalized = normalize_email(email)
+    return normalized == DHL_BROKERAGE_EMAIL or normalized.endswith("@dhl.com")
+
+
+def is_request_number_3_or_higher(request_number: object) -> bool:
+    return normalize_request_number(request_number) >= 3
+
+
+def is_first_returns_customs_request(ticket_category: object, request_number: object) -> bool:
+    return is_returns_customs_clearance(ticket_category) and normalize_request_number(request_number) == 1
+
+
+def has_return_proforma_context(text: object) -> bool:
+    return bool(RETURN_PROFORMA_CONTEXT_RE.search(normalize_whitespace(text)))
+
+
+def has_commercial_invoice_context(text: object) -> bool:
+    return bool(COMMERCIAL_INVOICE_CONTEXT_RE.search(normalize_whitespace(text)))
+
+
+def collapse_document_embedded_requested_data(
+    requested_data: object,
+    ticket_category: object = "",
+    request_number: object = 1,
+    requester_email: object = "",
+    request_text: object = "",
+) -> List[str]:
+    """
+    Remove deprecated standalone data elements that should be fulfilled by a
+    commercial invoice or by the return proforma invoice.
+
+    tax_information, country_of_origin and product_description are intentionally
+    not customer-facing requested_data anymore.  When they are detected by an
+    old table row or by an LLM fallback, collapse them into the appropriate
+    document request instead of answering them separately.
+    """
+    values = normalize_requested_data(requested_data)
+    if not values:
+        return []
+
+    result: List[str] = []
+    embedded_fields_found = False
+
+    for value in values:
+        if value in DOCUMENT_EMBEDDED_REQUESTED_DATA:
+            embedded_fields_found = True
+            continue
+        if value == "declaration_of_intent":
+            value = "dichiarazione_di_libera_esportazione"
+        if value not in result:
+            result.append(value)
+
+    first_returns = is_first_returns_customs_request(ticket_category, request_number)
+    text = normalize_whitespace(request_text)
+    field_phrase_found = bool(DOCUMENT_FIELD_PHRASE_RE.search(text))
+
+    # In first Returns Customs Clearance requests, customer phone/email/address
+    # are considered part of the RPI package instead of separate answers.
+    # For FedEx/DHL first requests, contact/address matches are enough to infer
+    # that the required document package is the return proforma invoice.
+    contact_fields_found = any(
+        value in RPI_EMBEDDED_CONTACT_REQUESTED_DATA
+        for value in result
+    )
+    fedex_or_dhl_first_return = first_returns and (
+        is_fedex_requester_email(requester_email)
+        or is_dhl_requester_email(requester_email)
+    )
+
+    if fedex_or_dhl_first_return and contact_fields_found:
+        result = [
+            value
+            for value in result
+            if value not in RPI_EMBEDDED_CONTACT_REQUESTED_DATA
+        ]
+        if "return_proforma_invoice" not in result:
+            result.append("return_proforma_invoice")
+    elif first_returns and "return_proforma_invoice" in result:
+        result = [
+            value
+            for value in result
+            if value not in RPI_EMBEDDED_CONTACT_REQUESTED_DATA
+        ]
+
+    if embedded_fields_found:
+        if first_returns or has_return_proforma_context(text):
+            target_document = "return_proforma_invoice"
+        else:
+            target_document = "commercial_invoice"
+
+        if target_document not in result:
+            result.append(target_document)
+
+    # If duplicated regex rows caused both document types to match for a generic
+    # embedded field, keep the document that fits the ticket context.
+    if (
+        "commercial_invoice" in result
+        and "return_proforma_invoice" in result
+        and (embedded_fields_found or field_phrase_found)
+    ):
+        if first_returns or has_return_proforma_context(text):
+            result = [value for value in result if value != "commercial_invoice"]
+        elif has_commercial_invoice_context(text):
+            result = [value for value in result if value != "return_proforma_invoice"]
+        elif is_returns_customs_clearance(ticket_category):
+            result = [value for value in result if value != "commercial_invoice"]
+        else:
+            result = [value for value in result if value != "return_proforma_invoice"]
+
+    return result
+
+
 # Deterministic language dictionaries built from recurrent wording in the
 # historical Zendesk tickets.  High-signal phrases receive higher weights;
 # generic carrier/customs words receive lower weights to avoid overreacting to
@@ -253,6 +477,7 @@ ITALIAN_LANGUAGE_MARKERS: Dict[str, int] = {
     "fattura di reso": 8,
     "fattura corretta": 7,
     "dichiarazione di intento": 8,
+    "dichiarazione di libera esportazione": 9,
     "sdoganamento": 8,
     "importazione": 5,
     "esportazione": 5,
@@ -343,6 +568,7 @@ ENGLISH_LANGUAGE_MARKERS: Dict[str, int] = {
     "shipping address": 8,
     "delivery address": 8,
     "tax information": 8,
+    "declaration of intent": 8,
     "power of attorney": 9,
     "letter of authorization": 8,
     "authorization letter": 8,
@@ -368,19 +594,35 @@ def normalize_request_number(value: object) -> int:
 
 def is_special_first_reply_ticket(requester_email: object, request_number: object) -> bool:
     return (
-        normalize_email(requester_email) in SPECIAL_FIRST_REPLY_EMAILS
+        (
+            is_ups_requester_email(requester_email)
+            or is_fedex_requester_email(requester_email)
+            or is_dhl_requester_email(requester_email)
+            or normalize_email(requester_email) in SPECIAL_FIRST_REPLY_EMAILS
+        )
         and normalize_request_number(request_number) == 1
     )
 
 
 def is_special_followup_ticket(requester_email: object, request_number: object) -> bool:
     return (
-        normalize_email(requester_email) in SPECIAL_FIRST_REPLY_EMAILS
+        (
+            is_ups_requester_email(requester_email)
+            or is_fedex_requester_email(requester_email)
+            or is_dhl_requester_email(requester_email)
+            or normalize_email(requester_email) in SPECIAL_FIRST_REPLY_EMAILS
+        )
         and normalize_request_number(request_number) > 1
     )
 
 
 def get_standard_reply_requested_data(requester_email: object) -> List[str]:
+    if is_ups_requester_email(requester_email):
+        return list(UPS_STANDARD_REPLY_REQUESTED_DATA)
+    if is_fedex_requester_email(requester_email):
+        return list(FEDEX_STANDARD_REPLY_REQUESTED_DATA)
+    if is_dhl_requester_email(requester_email):
+        return list(DHL_STANDARD_REPLY_REQUESTED_DATA)
     return list(STANDARD_REPLY_REQUESTED_DATA.get(normalize_email(requester_email), []))
 
 
