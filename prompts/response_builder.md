@@ -8,20 +8,18 @@ The response generator must not use an LLM. It uses:
 - the `request_language` column produced by the deterministic dictionary language-detection step;
 - ticket metadata such as requester email, request number, ticket category, and tracking numbers.
 
-## Language Rule
+## Safety Rules
 
-Replies must be written in the same language as the incoming request.
+If `request_number` is `3` or higher, do not draft a customer-facing answer. Create a human-intervention note.
 
-- Italian request -> Italian reply.
-- English request -> English reply.
-- If the language is unclear, default to English.
+If `requested_data` is `unknown_request` or `human_intervention_required`, do not draft a customer-facing email. Create a human-intervention note.
 
-This rule applies to requests classified by regex and requests classified by LLM fallback.
+FedEx Support Hub handoff requests are classified as human intervention because a human must handle the external portal. They must not produce a customer-facing email draft.
 
 ## Generic English Structure
 
 ```text
-Dear Team,
+Hi,
 
 Thank you for your message.
 
@@ -46,63 +44,144 @@ Di seguito le informazioni richieste:
 Cordiali saluti,
 ```
 
-## Returns Customs Clearance Rule
+## UPS Extra Charges Rule
 
-For Returns Customs Clearance replies, always include the UPS code (`ups_account_number`) in the draft response.
-
-The UPS code is extracted from the UPS shipment tracking number by taking the six characters after the `1Z` prefix.
-
-Example:
+When the request says the customer/receiver/destinatario did not pay extra or outstanding charges, classify only `ups_account_number` and draft two alternatives.
 
 ```text
-Tracking: 1ZCG3563D931731272
-UPS code: CG3563
-```
+Response 1:
+Hello,
 
-## Special First Replies
+Please, debit the outstanding charges to our UPS account <UPS account>, authorized by Piero Trevisan and proceed with the delivery.
 
-For `bgybrokerage@ups.com`, request number `1`, skip regex and LLM intent detection and use this automatic reply:
+Best regards,
 
-```text
-Buongiorno,
+Piero T.
 
-Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.
-TRK in export: non disponibile, avvenuto con altro vettore
-Cod UPS: <extracted UPS code>
+Response 2:
+Hello,
 
-Tutti i prodotti sono stati resi
+I confirm you the return of shipment on topic.
+Debit all the relative costs to our UPS account <UPS account>, authorized by Piero T.
+You can find attached the LOA
 
-Cordiali saluti,
+Best regards
+
 Piero T.
 ```
 
-For `doganafedex@fedex.com`, request number `1`, skip regex and LLM intent detection and use this automatic reply:
+For other cases where the only requested data is `ups_account_number`, draft:
 
 ```text
-Fedex:
+Hello,
+
+I confirm you the return of shipment on topic.
+Debit all the relative costs to our UPS account <UPS account>, authorized by Piero T.
+You can find attached the LOA
+
+Best regards
+
+Piero T.
+```
+
+## UPS Returns Customs Clearance First Request
+
+For UPS Returns Customs Clearance request number `1`, when the detected requested data includes both `ups_account_number` and `return_proforma_invoice`, draft two alternatives:
+
+```text
+Answer 1:
+Buongiorno,
+
+In allegato la documentazione per la reintroduzione in franchigia:
+
+- TRK in export: <retrieved value or placeholder>
+- Cod UPS: <retrieved value or placeholder>
+- Return Proforma Invoice: <retrieved value or placeholder>
+
+Tutti prodotti sono stati resi.
+
+Cordiali saluti,
+
+Piero T.
+
+Answer 2:
+Buongiorno,
+
+Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.
+
+- TRK in export: non disponibile, avvenuto con altro vettore
+- Cod UPS: <retrieved value or placeholder>
+- Return Proforma Invoice: <retrieved value or placeholder>
+
+Tutti prodotti sono stati resi.
+
+Cordiali saluti,
+
+Piero T.
+```
+
+## FedEx/DHL Returns Customs Clearance RPI Contact/Address Rule
+
+For FedEx or DHL Returns Customs Clearance request number `1`, if `shipping_address`, `customer_email`, or `customer_phone` are requested, treat those fields as part of the RPI package and draft two alternatives:
+
+```text
+Answer 1:
 Buongiorno,
 
 In allegato invio la documentazione richiesta.
+
+AWB in export: <retrieved value or placeholder>
+RPI: <retrieved value or placeholder>
+Cordiali saluti,
+
+Piero T.
+
+Answer 2:
+Buongiorno,
+
+Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.
+
+AWB in export: non disponibile, avvenuto con altro vettore
+RPI: <retrieved value or placeholder>
+
+Tutti prodotti sono stati resi.
+
+Cordiali saluti,
+
+Piero T.
+```
+
+## DHL Returns Customs Clearance First Request
+
+For DHL Returns Customs Clearance request number `1`, when the requested data includes `return_proforma_invoice`, draft two alternatives:
+
+```text
+Buongiorno,
+
+In allegato la documentazione richiesta per la reintroduzione in franchigia.
 AWB in export: <retrieved value or placeholder>
 Items returned: [TO BE RETRIEVED]
 RPI: [TO BE RETRIEVED]
+
 Cordiali saluti,
+
+Piero T.
+
+
+Answer 2:
+Buongiorno,
+
+Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.
+
+AWB in export: non disponibile, avvenuto con altro vettore
+RPI: <retrieved value or placeholder>
+
+Tutti prodotti sono stati resi.
+
+Cordiali saluti,
+
+Piero T.
 ```
-
-## Special Follow-Up Guard
-
-For request numbers higher than `1` from these two emails:
-
-- `bgybrokerage@ups.com`
-- `doganafedex@fedex.com`
-
-Apply regex first.
-
-If regex finds only data already covered by the first standard reply, send the row to LLM for confirmation.
-
-If the LLM also finds only data already covered by the first standard reply, do not prepare an automatic customer-facing reply. Mark the row for human intervention.
-
-If regex or LLM finds different requested data, prepare a response with the newly requested data.
 
 ## Power of Attorney Only
 
@@ -129,7 +208,3 @@ Procura / delega: [TO BE RETRIEVED]
 
 Cordiali saluti,
 ```
-
-## Human Intervention
-
-If `requested_data` is `unknown_request` or `human_intervention_required`, do not draft a customer-facing email. Create an internal note that a human must intervene.
