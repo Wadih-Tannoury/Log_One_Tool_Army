@@ -16,6 +16,10 @@ If `requested_data` is `unknown_request` or `human_intervention_required`, do no
 
 FedEx Support Hub handoff requests are classified as human intervention because a human must handle the external portal. They must not produce a customer-facing email draft.
 
+## First-Request RPI Embedded Correction/Value Rule
+
+When `request_number` is `1`, and upstream regex/LLM classification contains `invoice_correction`, `corrected_invoice`, or `value_confirmation`, treat those values as part of the `return_proforma_invoice` package for response data. Do not list corrected invoice or value confirmation as separate customer-facing lines in the draft.
+
 ## Generic English Structure
 
 ```text
