@@ -11,6 +11,8 @@ The regex layer is intentionally conservative:
   message is an acknowledgement;
 - commercial-invoice boilerplate is suppressed so invoice templates do not
   become false requests for phone, country of origin, product details, etc.;
+- deprecated standalone fields such as tax information, country of origin and
+  product description are collapsed into invoice/RPI document requests;
 - uncertain matches are sent to the LLM/human-review stage instead of being
   auto-answered.
 
@@ -30,11 +32,15 @@ from customs_rules import (
     HUMAN_INTERVENTION_REQUIRED,
     UNKNOWN_REQUEST,
     clean_latest_request_text,
+    collapse_document_embedded_requested_data,
     contains_correction_or_discrepancy,
     get_standard_reply_requested_data,
     has_actionable_request_language,
     is_acknowledgement_only,
+    is_platform_handoff_request,
+    is_request_number_3_or_higher,
     is_special_followup_ticket,
+    is_unpaid_extra_charges_request,
     looks_like_commercial_invoice_boilerplate,
     requested_data_already_answered_by_first_reply,
 )
@@ -54,7 +60,8 @@ REQUEST_TYPE_TO_REQUESTED_DATA = {
     "value_confirmation": ["value_confirmation"],
     "returned_items": ["returned_items_confirmation"],
     "customs_description": ["customs_description"],
-    "declaration_of_intent": ["declaration_of_intent"],
+    "declaration_of_intent": ["dichiarazione_di_libera_esportazione"],
+    "dichiarazione_di_libera_esportazione": ["dichiarazione_di_libera_esportazione"],
     "eori": ["eori_number"],
     "poa": ["power_of_attorney"],
     "power_of_attorney": ["power_of_attorney"],
@@ -73,6 +80,7 @@ REQUEST_TYPE_TO_REQUESTED_DATA = {
     "product_description": ["product_description"],
     "reminder_ticket": ["previously_requested_documentation"],
     "exclude_from_processing": [],
+    "human_intervention_required": [HUMAN_INTERVENTION_REQUIRED],
 }
 
 # These request types frequently appeared inside carrier commercial-invoice
@@ -172,6 +180,7 @@ class RegexEngine:
                 request_text,
                 requester_email=ticket["requester_email"],
                 request_number=ticket["request_number"],
+                ticket_category=ticket["ticket_category"],
             )
 
             output_row = {
@@ -282,6 +291,7 @@ class RegexEngine:
         request_text: str,
         requester_email: object = "",
         request_number: object = 1,
+        ticket_category: object = "",
     ):
         text_details = clean_latest_request_text(request_text)
         cleaned_text = str(text_details["cleaned_request_text"] or "")
@@ -289,8 +299,107 @@ class RegexEngine:
         quoted_history_removed = bool(text_details["quoted_history_removed"])
         signature_removed = bool(text_details["signature_removed"])
 
+        if is_request_number_3_or_higher(request_number):
+            return self._as_output(
+                matched=True,
+                excluded=False,
+                request_types=[HUMAN_INTERVENTION_REQUIRED],
+                requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[],
+                confidence=0.0,
+                notes=(
+                    "Request number is 3 or higher. Human intervention is required "
+                    "by automation policy."
+                ),
+                force_human_intervention=True,
+                human_intervention_required=True,
+                regex_request_types=[HUMAN_INTERVENTION_REQUIRED],
+                regex_requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        if is_platform_handoff_request(cleaned_text):
+            return self._as_output(
+                matched=True,
+                excluded=False,
+                request_types=[HUMAN_INTERVENTION_REQUIRED],
+                requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[
+                    {
+                        "request_type": HUMAN_INTERVENTION_REQUIRED,
+                        "span": "FedEx Support Hub platform handoff",
+                        "start": 0,
+                        "end": 0,
+                    }
+                ],
+                confidence=HIGH_CONFIDENCE,
+                notes=(
+                    "Sender asked to provide information/instructions through "
+                    "FedEx Support Hub. Human intervention is required because "
+                    "a human must handle the external platform."
+                ),
+                force_human_intervention=True,
+                human_intervention_required=True,
+                regex_request_types=[HUMAN_INTERVENTION_REQUIRED],
+                regex_requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        if is_unpaid_extra_charges_request(cleaned_text):
+            return self._as_output(
+                matched=True,
+                excluded=False,
+                request_types=["ups_account"],
+                requested_data=["ups_account_number"],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[
+                    {
+                        "request_type": "ups_account",
+                        "span": "customer did not pay extra/outstanding charges",
+                        "start": 0,
+                        "end": 0,
+                    }
+                ],
+                confidence=HIGH_CONFIDENCE,
+                notes=(
+                    "Customer did not pay extra/outstanding charges. "
+                    "Classified only as ups_account."
+                ),
+                needs_llm_confirmation=False,
+                regex_request_types=["ups_account"],
+                regex_requested_data=["ups_account_number"],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
         request_types, matched_spans = self._find_matches(cleaned_text)
         raw_request_types, raw_matched_spans = self._find_matches(raw_text)
+
+        if HUMAN_INTERVENTION_REQUIRED in request_types:
+            return self._as_output(
+                matched=True,
+                excluded=False,
+                request_types=[HUMAN_INTERVENTION_REQUIRED],
+                requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[
+                    span
+                    for span in matched_spans
+                    if span.get("request_type") == HUMAN_INTERVENTION_REQUIRED
+                ],
+                confidence=HIGH_CONFIDENCE,
+                notes="Regex table classified this request as human intervention required.",
+                force_human_intervention=True,
+                human_intervention_required=True,
+                regex_request_types=[HUMAN_INTERVENTION_REQUIRED],
+                regex_requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
 
         real_request_types = [
             request_type
@@ -400,8 +509,20 @@ class RegexEngine:
                 set(real_request_types) - set(effective_request_types)
             )
 
-        requested_data = self._requested_data_from_types(effective_request_types)
-        regex_requested_data = self._requested_data_from_types(real_request_types)
+        requested_data = collapse_document_embedded_requested_data(
+            self._requested_data_from_types(effective_request_types),
+            ticket_category=ticket_category,
+            request_number=request_number,
+            requester_email=requester_email,
+            request_text=cleaned_text,
+        )
+        regex_requested_data = collapse_document_embedded_requested_data(
+            self._requested_data_from_types(real_request_types),
+            ticket_category=ticket_category,
+            request_number=request_number,
+            requester_email=requester_email,
+            request_text=cleaned_text,
+        )
 
         audit_notes: List[str] = []
         review_reasons: List[str] = []
@@ -426,12 +547,6 @@ class RegexEngine:
         ):
             review_reasons.append(
                 "Correction/discrepancy language detected. Manual verification is required."
-            )
-            force_human = True
-
-        if "product_description" in real_request_types:
-            review_reasons.append(
-                "Detailed product/material request detected. Route to review unless data retrieval is verified."
             )
             force_human = True
 
