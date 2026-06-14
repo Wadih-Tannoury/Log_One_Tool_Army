@@ -192,6 +192,14 @@ DOCUMENT_EMBEDDED_REQUESTED_DATA = {
     "product_description",
 }
 
+# These are no longer standalone requested_data values. If they still appear
+# from an old BigQuery regex row or an LLM fallback, they are fulfilled by the
+# return proforma invoice package.
+RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA = {
+    "customs_description",
+    "importer_details",
+}
+
 DOCUMENT_FIELD_PHRASE_RE = re.compile(
     r"(?:"
     r"country\s+of\s+origin|paese\s+di\s+origine|"
@@ -363,6 +371,10 @@ def collapse_document_embedded_requested_data(
     not customer-facing requested_data anymore.  When they are detected by an
     old table row or by an LLM fallback, collapse them into the appropriate
     document request instead of answering them separately.
+
+    customs_description and importer_details are also not customer-facing
+    requested_data anymore.  They are fulfilled by the return proforma invoice
+    package and are collapsed to return_proforma_invoice.
     """
     values = normalize_requested_data(requested_data)
     if not values:
@@ -370,8 +382,12 @@ def collapse_document_embedded_requested_data(
 
     result: List[str] = []
     embedded_fields_found = False
+    rpi_document_fields_found = False
 
     for value in values:
+        if value in RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA:
+            rpi_document_fields_found = True
+            continue
         if value in DOCUMENT_EMBEDDED_REQUESTED_DATA:
             embedded_fields_found = True
             continue
@@ -412,6 +428,9 @@ def collapse_document_embedded_requested_data(
             if value not in RPI_EMBEDDED_CONTACT_REQUESTED_DATA
         ]
 
+    if rpi_document_fields_found and "return_proforma_invoice" not in result:
+        result.append("return_proforma_invoice")
+
     if embedded_fields_found:
         if first_returns or has_return_proforma_context(text):
             target_document = "return_proforma_invoice"
@@ -426,7 +445,7 @@ def collapse_document_embedded_requested_data(
     if (
         "commercial_invoice" in result
         and "return_proforma_invoice" in result
-        and (embedded_fields_found or field_phrase_found)
+        and (embedded_fields_found or rpi_document_fields_found or field_phrase_found)
     ):
         if first_returns or has_return_proforma_context(text):
             result = [value for value in result if value != "commercial_invoice"]
