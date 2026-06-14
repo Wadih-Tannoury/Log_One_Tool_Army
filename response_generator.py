@@ -7,9 +7,13 @@ Reads requested_data from output/request_intent_results.xlsx and creates:
 
 No LLM is used here. The dictionary-detected request_language column
 produced by intent_detection.py is used to choose the response language.
+
+The templates and safety branches are intentionally aligned with
+prompts/response_builder.md.
 """
 
 import os
+import re
 
 import pandas as pd
 
@@ -19,26 +23,82 @@ from customs_rules import (
     PLACEHOLDER,
     UNKNOWN_REQUEST,
     UPS_BROKERAGE_EMAIL,
-    collapse_document_embedded_requested_data,
     detect_language_with_dictionary,
     extract_ups_code,
     first_available_value,
-    is_dhl_requester_email,
-    is_fedex_requester_email,
-    is_first_returns_customs_request,
-    is_request_number_3_or_higher,
     is_returns_customs_clearance,
-    is_special_first_reply_ticket,
-    is_unpaid_extra_charges_request,
-    is_ups_requester_email,
     normalize_email,
     normalize_language,
+    normalize_request_number,
     normalize_requested_data,
 )
 
 INPUT_PATH = "output/request_intent_results.xlsx"
 OUTPUT_PATH = "output/request_intent_results_with_drafts.xlsx"
 AUTO_ADD_UPS_MIN_CONFIDENCE = float(os.getenv("AUTO_ADD_UPS_MIN_CONFIDENCE", "0.90"))
+
+DHL_BROKERAGE_EMAIL = os.getenv("DHL_BROKERAGE_EMAIL", "kamil.it@dhl.com")
+
+# Keep this local to response generation so the generator remains safe even if
+# upstream regex/LLM output still contains older aliases.
+REQUESTED_DATA_ALIASES = {
+    "ups_account": "ups_account_number",
+    "ups_account_code": "ups_account_number",
+    "ups_code": "ups_account_number",
+    "invoice": "commercial_invoice",
+    "commercial_invoice_required": "commercial_invoice",
+    "declaration_of_intent": "dichiarazione_di_libera_esportazione",
+}
+
+DOCUMENT_EMBEDDED_REQUESTED_DATA = {
+    "tax_information",
+    "country_of_origin",
+    "product_description",
+}
+
+RPI_EMBEDDED_CONTACT_REQUESTED_DATA = {
+    "shipping_address",
+    "customer_email",
+    "customer_phone",
+}
+
+RETURN_PROFORMA_CONTEXT_RE = re.compile(
+    r"\b(?:rpi|pri|return\s+proforma|return\s+invoice|fattura\s+(?:di\s+)?reso|"
+    r"proforma\s+(?:di\s+)?reso|reintroduzione\s+in\s+franchigia|reso|rientr)\b",
+    re.IGNORECASE,
+)
+
+PLATFORM_HANDOFF_RE = re.compile(
+    r"(?:"
+    r"(?:siete\s+pregati|vi\s+preghiamo|la\s+preghiamo|please|kindly)"
+    r"[\s\S]{0,160}"
+    r"(?:inviar(?:ci|e)|fornir(?:ci|e)|inserire|caricare|upload|send|provide)"
+    r"[\s\S]{0,160}"
+    r"(?:informazioni|istruzioni|information|instructions)"
+    r"[\s\S]{0,160}"
+    r"(?:portale\s+)?fedex\s+support\s+hub|"
+    r"(?:portale\s+)?fedex\s+support\s+hub"
+    r")",
+    re.IGNORECASE,
+)
+
+UNPAID_EXTRA_CHARGES_RE = re.compile(
+    r"(?:"
+    r"(?:customer|consignee|receiver|destinatario|cliente)"
+    r"[\s\S]{0,120}"
+    r"(?:did\s+not\s+pay|didn(?:'|’)?t\s+pay|has\s+not\s+paid|not\s+paid|"
+    r"non\s+ha\s+pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r"[\s\S]{0,120}"
+    r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|charges?|"
+    r"oneri|costi|spese|supplementi|dazi|diritti)|"
+    r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|charges?|"
+    r"oneri|costi|spese|supplementi|dazi|diritti)"
+    r"[\s\S]{0,120}"
+    r"(?:did\s+not\s+pay|didn(?:'|’)?t\s+pay|has\s+not\s+paid|not\s+paid|"
+    r"non\s+ha\s+pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r")",
+    re.IGNORECASE,
+)
 
 DATA_LABELS = {
     "en": {
@@ -123,6 +183,13 @@ def safe_float(value, default=0.0):
         return default
 
 
+def normalize_text(text):
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def row_confidence(row):
     return safe_float(row.get("confidence", 0.0))
 
@@ -141,6 +208,7 @@ def row_language(row):
 
     return detect_language_with_dictionary(
         row.get("subject", ""),
+        row.get("cleaned_request_body", ""),
         row.get("request_body", ""),
     )
 
@@ -169,23 +237,165 @@ def data_value(row, data_key):
     return PLACEHOLDER
 
 
-def requested_data_for_response(row):
-    request_text = str(row.get("cleaned_request_body", "") or row.get("request_body", "") or "")
-    requested_data = collapse_document_embedded_requested_data(
-        row.get("requested_data"),
-        ticket_category=row.get("ticket_category"),
-        request_number=row.get("request_number", 1),
-        requester_email=row.get("requester_email"),
-        request_text=request_text,
+def normalize_data_key(value):
+    value = str(value or "").strip()
+    return REQUESTED_DATA_ALIASES.get(value, value)
+
+
+def normalize_requested_data_with_aliases(value):
+    cleaned = []
+    for item in normalize_requested_data(value):
+        item = normalize_data_key(item)
+        if item and item not in cleaned:
+            cleaned.append(item)
+    return cleaned
+
+
+def row_request_text(row):
+    return normalize_text(
+        "\n".join(
+            str(value or "")
+            for value in [
+                row.get("subject", ""),
+                row.get("cleaned_request_body", ""),
+                row.get("request_body", ""),
+            ]
+            if not is_blank(value)
+        )
     )
+
+
+def is_platform_handoff_request(text):
+    return bool(PLATFORM_HANDOFF_RE.search(normalize_text(text)))
+
+
+def is_unpaid_extra_charges_request(text):
+    return bool(UNPAID_EXTRA_CHARGES_RE.search(normalize_text(text)))
+
+
+def email_domain(email):
+    normalized = normalize_email(email)
+    if "@" not in normalized:
+        return ""
+    return normalized.rsplit("@", 1)[-1]
+
+
+def is_ups_requester_email(email):
+    normalized = normalize_email(email)
+    domain = email_domain(email)
+    return normalized == UPS_BROKERAGE_EMAIL or domain == "ups.com" or domain.endswith(".ups.com")
+
+
+def is_fedex_requester_email(email):
+    normalized = normalize_email(email)
+    domain = email_domain(email)
+    return normalized == FEDEX_BROKERAGE_EMAIL or "fedex" in domain
+
+
+def is_dhl_requester_email(email):
+    normalized = normalize_email(email)
+    domain = email_domain(email)
+    return normalized == DHL_BROKERAGE_EMAIL or domain == "dhl.com" or domain.endswith(".dhl.com")
+
+
+def is_request_number_3_or_higher(request_number):
+    return normalize_request_number(request_number) >= 3
+
+
+def is_first_returns_customs_request(ticket_category, request_number):
+    return is_returns_customs_clearance(ticket_category) and normalize_request_number(request_number) == 1
+
+
+def has_return_proforma_context(text):
+    return bool(RETURN_PROFORMA_CONTEXT_RE.search(normalize_text(text)))
+
+
+def all_requested_data_sources(row):
+    values = []
+    for column in [
+        "requested_data",
+        "regex_requested_data",
+        "regex_request_types",
+        "request_types",
+        "standard_reply_requested_data",
+    ]:
+        for item in normalize_requested_data_with_aliases(row.get(column)):
+            if item not in values:
+                values.append(item)
+    return values
+
+
+def has_embedded_rpi_contact_fields(row):
+    return bool(set(all_requested_data_sources(row)) & RPI_EMBEDDED_CONTACT_REQUESTED_DATA)
+
+
+def collapse_embedded_document_fields(row, requested_data):
+    """Collapse old standalone fields into invoice/RPI document requests."""
+    text = row_request_text(row)
+    first_returns = is_first_returns_customs_request(
+        row.get("ticket_category"),
+        row.get("request_number", 1),
+    )
+    requester_email = row.get("requester_email")
+
+    result = []
+    embedded_document_fields_found = False
+    contact_fields_found = False
+
+    for data_key in requested_data:
+        if data_key in DOCUMENT_EMBEDDED_REQUESTED_DATA:
+            embedded_document_fields_found = True
+            continue
+        if data_key in RPI_EMBEDDED_CONTACT_REQUESTED_DATA:
+            contact_fields_found = True
+            # In first Returns Customs Clearance flows these fields are covered
+            # by the RPI package, not answered separately.
+            if first_returns:
+                continue
+        if data_key not in result:
+            result.append(data_key)
+
+    if embedded_document_fields_found:
+        target = (
+            "return_proforma_invoice"
+            if first_returns or has_return_proforma_context(text)
+            else "commercial_invoice"
+        )
+        if target not in result:
+            result.append(target)
+
+    if first_returns and contact_fields_found:
+        fedex_or_dhl = is_fedex_requester_email(requester_email) or is_dhl_requester_email(requester_email)
+        if fedex_or_dhl and "return_proforma_invoice" not in result:
+            result.append("return_proforma_invoice")
+
+    if first_returns and "return_proforma_invoice" in result:
+        result = [
+            data_key
+            for data_key in result
+            if data_key not in RPI_EMBEDDED_CONTACT_REQUESTED_DATA
+        ]
+
+    return result
+
+
+def requested_data_for_response(row):
+    request_text = row_request_text(row)
+
+    # Response-builder rule: unpaid extra/outstanding charges are answered only
+    # with the UPS account templates, even if upstream detected other fields.
+    if is_unpaid_extra_charges_request(request_text):
+        return ["ups_account_number"]
+
+    requested_data = normalize_requested_data_with_aliases(row.get("requested_data"))
+    requested_data = collapse_embedded_document_fields(row, requested_data)
 
     # Historical false positives showed that auto-adding UPS account to every
     # Returns Customs Clearance row can amplify weak/incorrect intent matches.
-    # Keep this fallback only for high-confidence UPS follow-ups, never for
-    # first requests where specific standard templates depend on exact matches.
+    # Keep this fallback only for high-confidence non-first UPS requests.
     if (
         is_returns_customs_clearance(row.get("ticket_category"))
-        and not is_first_returns_customs_request(row.get("ticket_category"), row.get("request_number", 1))
+        and normalize_request_number(row.get("request_number", 1)) != 1
         and is_ups_requester_email(row.get("requester_email"))
         and requested_data
         and row_confidence(row) >= AUTO_ADD_UPS_MIN_CONFIDENCE
@@ -196,155 +406,6 @@ def requested_data_for_response(row):
         requested_data.append("ups_account_number")
 
     return requested_data
-
-
-def build_ups_first_standard_reply(row):
-    """Backward-compatible UPS first-reply template."""
-    return build_ups_returns_first_rpi_account_response(row)
-
-
-def build_ups_returns_first_rpi_account_response(row):
-    export_tracking = data_value(row, "export_tracking_number")
-    ups_account = data_value(row, "ups_account_number")
-    rpi = data_value(row, "return_proforma_invoice")
-
-    return (
-        "Answer 1:\n"
-        "Hi,\n\n"
-        "Please find below the information needed for Returns Customs Clearance:\n\n"
-        f"\u2022 Export TRK: {export_tracking}\n"
-        f"\u2022 UPS Account: {ups_account}\n"
-        f"\u2022 Return Proforma Invoice: {rpi}\n"
-        "All products have been returned\n\n"
-        "Thanks,\n\n"
-        "Piero T.\n\n"
-        "Answer 2:\n"
-        "Buongiorno,\n\n"
-        "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n"
-        "TRK in export: non disponibile, avvenuto con altro vettore\n"
-        f"Cod UPS: {ups_account}\n"
-        f"Items returned: {PLACEHOLDER}\n"
-        f"RPI: {rpi}\n"
-        "Cordiali saluti,\n\n"
-        "Piero T."
-    )
-
-
-def build_fedex_first_standard_reply(row):
-    awb_export = data_value(row, "export_tracking_number")
-
-    return (
-        "Fedex:\n"
-        "Buongiorno,\n\n"
-        "In allegato invio la documentazione richiesta.\n"
-        f"AWB in export: {awb_export}\n"
-        f"Items returned: {PLACEHOLDER}\n"
-        f"RPI: {PLACEHOLDER}\n"
-        "Cordiali saluti,"
-    )
-
-
-def build_returns_first_rpi_documents_response(row):
-    awb_export = data_value(row, "export_tracking_number")
-    rpi = data_value(row, "return_proforma_invoice")
-
-    return (
-        "Buongiorno,\n\n"
-        "In allegato invio la documentazione richiesta.\n\n"
-        f"AWB in export: {awb_export}\n"
-        f"RPI: {rpi}\n"
-        "Cordiali saluti,\n\n"
-        "Piero T."
-    )
-
-
-def build_fedex_dhl_returns_first_rpi_contact_response(row):
-    awb_export = data_value(row, "export_tracking_number")
-    rpi = data_value(row, "return_proforma_invoice")
-
-    return (
-        "Answer 1:\n"
-        "Buongiorno,\n\n"
-        "In allegato invio la documentazione richiesta.\n\n"
-        f"AWB in export: {awb_export}\n"
-        f"RPI: {rpi}\n"
-        "Cordiali saluti,\n\n"
-        "Piero T.\n\n"
-        "Answer 2:\n"
-        "Buongiorno,\n\n"
-        "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n"
-        "AWB in export: non disponibile, avvenuto con altro vettore\n"
-        f"Items returned: {PLACEHOLDER}\n"
-        f"RPI: {rpi}\n"
-        "Cordiali saluti,\n\n"
-        "Piero T."
-    )
-
-
-def build_dhl_returns_first_rpi_response(row):
-    awb_export = data_value(row, "export_tracking_number")
-    rpi = data_value(row, "return_proforma_invoice")
-
-    return (
-        "Buongiorno,\n\n"
-        "In allegato la documentazione richiesta per la reintroduzione in franchigia.\n"
-        f"AWB in export: {awb_export}\n"
-        f"Items returned: {PLACEHOLDER}\n"
-        f"RPI: {rpi}\n\n"
-        "Cordiali saluti,\n\n"
-        "Piero T."
-    )
-
-
-def build_ups_account_unpaid_extra_charges_response(row):
-    ups_account = data_value(row, "ups_account_number")
-
-    return (
-        "Response 1:\n"
-        "Hello,\n\n"
-        f"Please, debit the outstanding charges to our UPS account {ups_account}, "
-        "authorized by Piero Trevisan and proceed with the delivery.\n\n"
-        "Best regards,\n\n"
-        "Piero T.\n\n"
-        "Response 2:\n"
-        "Hello,\n\n"
-        "I confirm you the return of shipment on topic.\n"
-        f"Debit all the relative costs to our UPS account {ups_account}, "
-        "authorized by Piero T.\n"
-        "You can find attached the LOA\n\n"
-        "Best regards\n\n"
-        "Piero T."
-    )
-
-
-def build_ups_account_standard_response(row):
-    ups_account = data_value(row, "ups_account_number")
-
-    return (
-        "Hello,\n\n"
-        "I confirm you the return of shipment on topic.\n"
-        f"Debit all the relative costs to our UPS account {ups_account}, "
-        "authorized by Piero T.\n"
-        "You can find attached the LOA\n\n"
-        "Best regards\n\n"
-        "Piero T."
-    )
-
-
-def has_embedded_rpi_contact_fields(row):
-    regex_types = set(normalize_requested_data(row.get("regex_request_types")))
-    regex_requested_data = set(normalize_requested_data(row.get("regex_requested_data")))
-    requested_data = set(normalize_requested_data(row.get("requested_data")))
-    embedded_contact_fields = {
-        "shipping_address",
-        "customer_email",
-        "customer_phone",
-    }
-    return bool((regex_types | regex_requested_data | requested_data) & embedded_contact_fields)
-
-
-def row_request_text(row):
-    return str(row.get("cleaned_request_body", "") or row.get("request_body", "") or "")
 
 
 def build_human_intervention_note(row, reason):
@@ -399,7 +460,7 @@ def build_generic_response(row, requested_data, language):
         )
 
     return (
-        "Dear Team,\n\n"
+        "Hi,\n\n"
         "Thank you for your message.\n\n"
         "Please find below the requested information:\n\n"
         f"{body}\n\n"
@@ -407,37 +468,154 @@ def build_generic_response(row, requested_data, language):
     )
 
 
+def build_ups_extra_charges_response(row):
+    ups_account = data_value(row, "ups_account_number")
+
+    return (
+        "Response 1:\n"
+        "Hello,\n\n"
+        f"Please, debit the outstanding charges to our UPS account {ups_account}, "
+        "authorized by Piero Trevisan and proceed with the delivery.\n\n"
+        "Best regards,\n\n"
+        "Piero T.\n\n"
+        "Response 2:\n"
+        "Hello,\n\n"
+        "I confirm you the return of shipment on topic.\n"
+        f"Debit all the relative costs to our UPS account {ups_account}, authorized by Piero T.\n"
+        "You can find attached the LOA\n\n"
+        "Best regards\n\n"
+        "Piero T."
+    )
+
+
+def build_ups_account_standard_response(row):
+    ups_account = data_value(row, "ups_account_number")
+
+    return (
+        "Hello,\n\n"
+        "I confirm you the return of shipment on topic.\n"
+        f"Debit all the relative costs to our UPS account {ups_account}, authorized by Piero T.\n"
+        "You can find attached the LOA\n\n"
+        "Best regards\n\n"
+        "Piero T."
+    )
+
+
+def build_ups_returns_first_rpi_account_response(row):
+    export_tracking = data_value(row, "export_tracking_number")
+    ups_account = data_value(row, "ups_account_number")
+    rpi = data_value(row, "return_proforma_invoice")
+
+    return (
+        "Answer 1:\n"
+        "Buongiorno,\n\n"
+        "In allegato la documentazione per la reintroduzione in franchigia:\n\n"
+        f"- TRK in export: {export_tracking}\n"
+        f"- Cod UPS: {ups_account}\n"
+        f"- Return Proforma Invoice: {rpi}\n\n"
+        "Tutti prodotti sono stati resi.\n\n"
+        "Cordiali saluti,\n\n"
+        "Piero T.\n\n"
+        "Answer 2:\n"
+        "Buongiorno,\n\n"
+        "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
+        "- TRK in export: non disponibile, avvenuto con altro vettore\n"
+        f"- Cod UPS: {ups_account}\n"
+        f"- Return Proforma Invoice: {rpi}\n\n"
+        "Tutti prodotti sono stati resi.\n\n"
+        "Cordiali saluti,\n\n"
+        "Piero T."
+    )
+
+
+def build_fedex_dhl_returns_first_rpi_contact_response(row):
+    awb_export = data_value(row, "export_tracking_number")
+    rpi = data_value(row, "return_proforma_invoice")
+
+    return (
+        "Answer 1:\n"
+        "Buongiorno,\n\n"
+        "In allegato invio la documentazione richiesta.\n\n"
+        f"AWB in export: {awb_export}\n"
+        f"RPI: {rpi}\n"
+        "Cordiali saluti,\n\n"
+        "Piero T.\n\n"
+        "Answer 2:\n"
+        "Buongiorno,\n\n"
+        "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
+        "AWB in export: non disponibile, avvenuto con altro vettore\n"
+        f"RPI: {rpi}\n\n"
+        "Tutti prodotti sono stati resi.\n\n"
+        "Cordiali saluti,\n\n"
+        "Piero T."
+    )
+
+
+def build_dhl_returns_first_rpi_response(row):
+    awb_export = data_value(row, "export_tracking_number")
+    rpi = data_value(row, "return_proforma_invoice")
+
+    return (
+        "Answer 1:\n"
+        "Buongiorno,\n\n"
+        "In allegato la documentazione richiesta per la reintroduzione in franchigia.\n"
+        f"AWB in export: {awb_export}\n"
+        f"Items returned: {PLACEHOLDER}\n"
+        f"RPI: {rpi}\n\n"
+        "Cordiali saluti,\n\n"
+        "Piero T.\n\n"
+        "Answer 2:\n"
+        "Buongiorno,\n\n"
+        "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
+        "AWB in export: non disponibile, avvenuto con altro vettore\n"
+        f"RPI: {rpi}\n\n"
+        "Tutti prodotti sono stati resi.\n\n"
+        "Cordiali saluti,\n\n"
+        "Piero T."
+    )
+
+
+def should_force_human_intervention(row, requested_data):
+    request_text = row_request_text(row)
+    raw_requested_data = normalize_requested_data_with_aliases(row.get("requested_data"))
+
+    if is_request_number_3_or_higher(row.get("request_number")):
+        return True, "Request number is 3 or higher. Human intervention is required by automation policy."
+
+    if is_platform_handoff_request(request_text):
+        return True, "FedEx Support Hub handoff request. A human must handle the external portal."
+
+    if (
+        as_bool(row.get("human_intervention_required"))
+        or HUMAN_INTERVENTION_REQUIRED in raw_requested_data
+        or HUMAN_INTERVENTION_REQUIRED in requested_data
+    ):
+        return True, human_reason(
+            row,
+            "The requested data could not be identified with enough certainty.",
+        )
+
+    if raw_requested_data == [UNKNOWN_REQUEST] or requested_data == [UNKNOWN_REQUEST]:
+        return True, human_reason(
+            row,
+            "The requested data could not be identified with enough certainty.",
+        )
+
+    return False, ""
+
+
 def build_response(row):
     requester_email = normalize_email(row.get("requester_email"))
     request_number = row.get("request_number", 1)
+    request_text = row_request_text(row)
     requested_data = requested_data_for_response(row)
 
-    if is_request_number_3_or_higher(request_number):
-        return build_human_intervention_note(
-            row,
-            "Request number is 3 or higher. Human intervention is required by automation policy.",
-        )
-
-    if as_bool(row.get("human_intervention_required")) or HUMAN_INTERVENTION_REQUIRED in requested_data:
-        return build_human_intervention_note(
-            row,
-            human_reason(
-                row,
-                "The requested data could not be identified with enough certainty.",
-            ),
-        )
+    force_human, reason = should_force_human_intervention(row, requested_data)
+    if force_human:
+        return build_human_intervention_note(row, reason)
 
     if not requested_data:
         return ""
-
-    if requested_data == [UNKNOWN_REQUEST]:
-        return build_human_intervention_note(
-            row,
-            human_reason(
-                row,
-                "The requested data could not be identified with enough certainty.",
-            ),
-        )
 
     first_returns_request = is_first_returns_customs_request(
         row.get("ticket_category"),
@@ -458,21 +636,10 @@ def build_response(row):
         if "return_proforma_invoice" in requested_data:
             return build_dhl_returns_first_rpi_response(row)
 
-    if (
-        first_returns_request
-        and "return_proforma_invoice" in requested_data
-        and has_embedded_rpi_contact_fields(row)
-    ):
-        return build_returns_first_rpi_documents_response(row)
-
     if requested_data == ["ups_account_number"]:
-        if is_unpaid_extra_charges_request(row_request_text(row)):
-            return build_ups_account_unpaid_extra_charges_response(row)
+        if is_unpaid_extra_charges_request(request_text):
+            return build_ups_extra_charges_response(row)
         return build_ups_account_standard_response(row)
-
-    if is_special_first_reply_ticket(requester_email, request_number):
-        if is_fedex_requester_email(requester_email):
-            return build_fedex_first_standard_reply(row)
 
     language = row_language(row)
 
@@ -481,14 +648,11 @@ def build_response(row):
 
     return build_generic_response(row, requested_data, language)
 
+
 def requires_human_intervention(row):
-    requested_data = normalize_requested_data(row.get("requested_data"))
-    return (
-        is_request_number_3_or_higher(row.get("request_number"))
-        or as_bool(row.get("human_intervention_required"))
-        or HUMAN_INTERVENTION_REQUIRED in requested_data
-        or requested_data == [UNKNOWN_REQUEST]
-    )
+    requested_data = requested_data_for_response(row)
+    force_human, _ = should_force_human_intervention(row, requested_data)
+    return force_human
 
 
 def main():
