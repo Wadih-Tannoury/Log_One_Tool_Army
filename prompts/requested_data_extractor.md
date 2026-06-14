@@ -86,6 +86,8 @@ If the sender asks for customs description, goods description, commodity descrip
 
 If any first Returns Customs Clearance request asks for `return_proforma_invoice` together with customer phone, customer email, or shipping address, return only `return_proforma_invoice` unless the sender clearly asks for those contact/address details as a separate operational correction.
 
+For request number `1`, if invoice correction, corrected invoice, value confirmation, unit price, itemized value, or value discrepancy wording appears together with an RPI, PRI, return proforma, return invoice, reintroduction, reintroduzione in franchigia, or Returns Customs Clearance context, treat it as information covered by `return_proforma_invoice`. Do not return `corrected_invoice` or `value_confirmation` as separate response data in that case.
+
 If a UPS Returns Customs Clearance request asks for the UPS account and the return proforma invoice, return:
 
 ```json
@@ -179,7 +181,7 @@ Examples:
 - fattura di reso = return_proforma_invoice
 - RPI / PRI = return_proforma_invoice
 - reintroduzione in franchigia = return_proforma_invoice
-- fattura corretta = corrected_invoice
+- fattura corretta = corrected_invoice unless it is part of a first-request RPI/Returns Customs Clearance package
 - numero di tracking export = export_tracking_number
 - AWB in export / lettera di vettura = export_tracking_number
 - codice abbonamento UPS = ups_account_number
@@ -191,4 +193,4 @@ Examples:
 - indirizzo email = customer_email unless it is part of an RPI package in a first Returns Customs Clearance request
 - indirizzo di spedizione = shipping_address unless it is part of an RPI package in a first Returns Customs Clearance request
 - torna tutto / rientrano entrambi = returned_items_confirmation
-- conferma valore / unit price / itemized value = value_confirmation unless it is only invoice/RPI-required content
+- conferma valore / unit price / itemized value = value_confirmation unless it is part of a first-request RPI/Returns Customs Clearance package
