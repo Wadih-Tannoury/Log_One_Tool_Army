@@ -47,11 +47,9 @@ ALLOWED_REQUESTED_DATA = [
     "ups_account_number",
     "value_confirmation",
     "returned_items_confirmation",
-    "customs_description",
     "dichiarazione_di_libera_esportazione",
     "eori_number",
     "power_of_attorney",
-    "importer_details",
     "address_translation",
     "exporter_ein",
     "customer_phone",
@@ -70,12 +68,16 @@ LEGACY_REQUESTED_DATA_ALIASES = {
     "declaration_of_intent": "dichiarazione_di_libera_esportazione",
 }
 
-# Kept as internal aliases only. They are collapsed later into
-# commercial_invoice or return_proforma_invoice using the ticket context.
+# Kept as internal aliases only. They are collapsed later by customs_rules.
+# tax/country/product collapse to commercial_invoice or return_proforma_invoice
+# depending on context. customs_description/importer_details always collapse to
+# return_proforma_invoice.
 DEPRECATED_DOCUMENT_FIELD_KEYS = {
     "tax_information",
     "country_of_origin",
     "product_description",
+    "customs_description",
+    "importer_details",
 }
 
 
