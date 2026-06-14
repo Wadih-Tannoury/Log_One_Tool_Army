@@ -27,7 +27,9 @@ from google import genai
 from customs_rules import (
     HUMAN_INTERVENTION_REQUIRED,
     UNKNOWN_REQUEST,
+    collapse_document_embedded_requested_data,
     detect_language_with_dictionary,
+    is_request_number_3_or_higher,
     normalize_requested_data,
     requested_data_already_answered_by_first_reply,
 )
@@ -46,11 +48,9 @@ ALLOWED_REQUESTED_DATA = [
     "value_confirmation",
     "returned_items_confirmation",
     "customs_description",
-    "declaration_of_intent",
+    "dichiarazione_di_libera_esportazione",
     "eori_number",
     "power_of_attorney",
-    "tax_information",
-    "country_of_origin",
     "importer_details",
     "address_translation",
     "exporter_ein",
@@ -61,10 +61,22 @@ ALLOWED_REQUESTED_DATA = [
     "authorization_letter",
     "shipment_instructions",
     "address_correction",
-    "product_description",
     "previously_requested_documentation",
+    "human_intervention_required",
     "unknown_request",
 ]
+
+LEGACY_REQUESTED_DATA_ALIASES = {
+    "declaration_of_intent": "dichiarazione_di_libera_esportazione",
+}
+
+# Kept as internal aliases only. They are collapsed later into
+# commercial_invoice or return_proforma_invoice using the ticket context.
+DEPRECATED_DOCUMENT_FIELD_KEYS = {
+    "tax_information",
+    "country_of_origin",
+    "product_description",
+}
 
 
 class GeminiJsonHelper:
@@ -126,7 +138,12 @@ class RequestedDataDetector:
 
         for value in values:
             value = str(value).strip()
-            if value in ALLOWED_REQUESTED_DATA and value not in cleaned:
+            value = LEGACY_REQUESTED_DATA_ALIASES.get(value, value)
+
+            if (
+                value in ALLOWED_REQUESTED_DATA
+                or value in DEPRECATED_DOCUMENT_FIELD_KEYS
+            ) and value not in cleaned:
                 cleaned.append(value)
 
         return cleaned or [UNKNOWN_REQUEST]
@@ -290,6 +307,13 @@ def build_human_output_row(source_row, reason, engine="human_guardrail"):
 def build_llm_output_row(source_row, result):
     requested_data = result.get("requested_data", [UNKNOWN_REQUEST])
     requested_data = normalize_requested_data(requested_data) or [UNKNOWN_REQUEST]
+    requested_data = collapse_document_embedded_requested_data(
+        requested_data,
+        ticket_category=source_row.get("ticket_category"),
+        request_number=source_row.get("request_number", 1),
+        requester_email=source_row.get("requester_email"),
+        request_text=source_text_for_llm(source_row),
+    ) or [UNKNOWN_REQUEST]
 
     engine = "llm"
     request_types: List[str] = []
@@ -297,10 +321,26 @@ def build_llm_output_row(source_row, result):
     confidence = safe_float(result.get("confidence", 0.0))
     notes = result.get("notes", "")
 
-    regex_candidates = requested_data_set(source_row.get("regex_requested_data"))
+    collapsed_regex_requested_data = collapse_document_embedded_requested_data(
+        source_row.get("regex_requested_data"),
+        ticket_category=source_row.get("ticket_category"),
+        request_number=source_row.get("request_number", 1),
+        requester_email=source_row.get("requester_email"),
+        request_text=source_text_for_llm(source_row),
+    )
+    regex_candidates = requested_data_set(collapsed_regex_requested_data)
     llm_candidates = requested_data_set(requested_data)
 
-    if requested_data == [UNKNOWN_REQUEST]:
+    if requested_data == [HUMAN_INTERVENTION_REQUIRED]:
+        engine = "llm_human_intervention_guard"
+        request_types = [HUMAN_INTERVENTION_REQUIRED]
+        human_intervention_required = True
+        notes = (
+            "LLM classified this request as requiring human intervention. "
+            f"LLM notes: {notes}"
+        )
+
+    elif requested_data == [UNKNOWN_REQUEST]:
         engine = "llm_unknown_request_guard"
         request_types = ["unknown_request_guard"]
         requested_data = [HUMAN_INTERVENTION_REQUIRED]
@@ -407,7 +447,14 @@ def main():
     rows_for_llm = []
 
     for _, row in unmatched_df.iterrows():
-        if as_bool(row.get("force_human_intervention")) or as_bool(
+        if is_request_number_3_or_higher(row.get("request_number")):
+            llm_results.append(
+                build_human_output_row(
+                    row,
+                    "Request number is 3 or higher. Human intervention is required by automation policy.",
+                )
+            )
+        elif as_bool(row.get("force_human_intervention")) or as_bool(
             row.get("human_intervention_required")
         ):
             reason = row.get("notes") or "Regex safety guard required human review."
