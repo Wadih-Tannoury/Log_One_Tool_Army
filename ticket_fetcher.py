@@ -94,18 +94,18 @@ HISTORY_COLUMNS = [
     "shipment_order_number",
     "shipment_tracking_number",
     "return_tracking_number",
-    "requested_data",
-    "confidence",
-    "llm_confidence",
     "notes",
     "human_intervention_required",
     "regex_request_types",
     "regex_requested_data",
+    "regex_confidence",
     "matched_spans",
     "request_language",
     "language_confidence",
     "language_notes",
     "llm_was_used",
+    "llm_confidence",
+    "requested_data",
     "draft_response",
 ]
 
@@ -433,13 +433,11 @@ def history_schema(bigquery):
         bigquery.SchemaField("shipment_order_number", "STRING"),
         bigquery.SchemaField("shipment_tracking_number", "STRING"),
         bigquery.SchemaField("return_tracking_number", "STRING"),
-        bigquery.SchemaField("requested_data", "STRING", mode="REPEATED"),
-        bigquery.SchemaField("confidence", "FLOAT64"),
-        bigquery.SchemaField("llm_confidence", "FLOAT64"),
         bigquery.SchemaField("notes", "STRING"),
         bigquery.SchemaField("human_intervention_required", "BOOL"),
         bigquery.SchemaField("regex_request_types", "STRING", mode="REPEATED"),
         bigquery.SchemaField("regex_requested_data", "STRING", mode="REPEATED"),
+        bigquery.SchemaField("regex_confidence", "FLOAT64"),
         bigquery.SchemaField(
             "matched_spans",
             "RECORD",
@@ -455,6 +453,8 @@ def history_schema(bigquery):
         bigquery.SchemaField("language_confidence", "FLOAT64"),
         bigquery.SchemaField("language_notes", "STRING"),
         bigquery.SchemaField("llm_was_used", "BOOL"),
+        bigquery.SchemaField("llm_confidence", "FLOAT64"),
+        bigquery.SchemaField("requested_data", "STRING", mode="REPEATED"),
         bigquery.SchemaField("draft_response", "STRING"),
     ]
 
@@ -495,10 +495,15 @@ def prepare_history_row(
     )
 
     llm_was_used = _infer_llm_was_used(row)
+    regex_confidence = _to_float(row.get("regex_confidence"))
     llm_confidence = _to_float(row.get("llm_confidence"))
 
-    # Backward-compatible fallback for older local handoff files that only
-    # contain the generic confidence column.
+    # Backward-compatible fallbacks for older local handoff files that only
+    # contained a generic confidence column.  For regex-only rows the generic
+    # value belongs to regex_confidence; for LLM rows it belongs to llm_confidence.
+    if regex_confidence is None and not llm_was_used:
+        regex_confidence = _to_float(row.get("confidence"))
+
     if llm_confidence is None and llm_was_used:
         llm_confidence = _to_float(row.get("confidence"))
 
@@ -524,20 +529,20 @@ def prepare_history_row(
         "shipment_order_number": _to_str(row.get("shipment_order_number")),
         "shipment_tracking_number": _to_str(row.get("shipment_tracking_number")),
         "return_tracking_number": _to_str(row.get("return_tracking_number")),
-        "requested_data": _string_list(row.get("requested_data")),
-        "confidence": _to_float(row.get("confidence")),
-        "llm_confidence": llm_confidence,
         "notes": _to_str(row.get("notes")),
         "human_intervention_required": bool(
             _to_bool(row.get("human_intervention_required"))
         ),
         "regex_request_types": _string_list(row.get("regex_request_types")),
         "regex_requested_data": _string_list(row.get("regex_requested_data")),
+        "regex_confidence": regex_confidence,
         "matched_spans": _matched_spans(row.get("matched_spans")),
         "request_language": _to_str(row.get("request_language")),
         "language_confidence": _to_float(row.get("language_confidence")),
         "language_notes": _to_str(row.get("language_notes")),
         "llm_was_used": llm_was_used,
+        "llm_confidence": llm_confidence,
+        "requested_data": _string_list(row.get("requested_data")),
         "draft_response": _to_str(row.get("draft_response")),
     }
 
