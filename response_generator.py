@@ -204,7 +204,16 @@ def normalize_text(text):
 
 
 def row_confidence(row):
-    return safe_float(row.get("confidence", 0.0))
+    for column in ("regex_confidence", "llm_confidence", "confidence"):
+        value = row.get(column)
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
+            pass
+        if value is not None:
+            return safe_float(value, 0.0)
+    return 0.0
 
 
 def human_reason(row, default):
