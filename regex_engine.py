@@ -17,8 +17,8 @@ The regex layer is intentionally conservative:
   auto-answered.
 
 Creates:
-- output/regex_matches.xlsx       high-confidence regex matches only
-- output/unmatched_tickets.xlsx   unmatched or review-needed rows
+- output/regex_matches.jsonl.gz       high-confidence/excluded regex-resolved rows
+- output/unmatched_tickets.jsonl.gz   unmatched or review-needed rows
 """
 
 import json
@@ -28,6 +28,11 @@ from collections import defaultdict
 from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
+from pipeline_io import (
+    REGEX_MATCHES_PATH,
+    UNMATCHED_TICKETS_PATH,
+    write_dataframe,
+)
 from customs_rules import (
     HUMAN_INTERVENTION_REQUIRED,
     UNKNOWN_REQUEST,
@@ -153,6 +158,9 @@ class RegexEngine:
     def load_active_tickets(self):
         query = """
         SELECT
+            request_id,
+            request_submission_timestamp,
+            ticket_submission_timestamp,
             zendesk_ticket_id,
             requester_email,
             subject,
@@ -185,6 +193,9 @@ class RegexEngine:
             )
 
             output_row = {
+                "request_id": ticket.get("request_id"),
+                "request_submission_timestamp": ticket.get("request_submission_timestamp"),
+                "ticket_submission_timestamp": ticket.get("ticket_submission_timestamp"),
                 "zendesk_ticket_id": ticket["zendesk_ticket_id"],
                 "request_number": ticket["request_number"],
                 "requester_email": ticket["requester_email"],
@@ -201,6 +212,7 @@ class RegexEngine:
 
             if result.get("excluded"):
                 excluded_count += 1
+                matched_results.append(output_row)
                 print(f"Excluded ticket {ticket['zendesk_ticket_id']}")
 
             elif result["matched"]:
@@ -229,7 +241,7 @@ class RegexEngine:
                         "request_type": request_type,
                         "span": match.group(0)[:160],
                         "start": match.start(),
-                        "end": match.end(),
+                        "end_pos": match.end(),
                     }
                 )
                 break
@@ -273,6 +285,7 @@ class RegexEngine:
             "request_types": request_types,
             "requested_data": requested_data,
             "confidence": confidence,
+            "llm_confidence": None,
             "notes": notes,
             "needs_llm_confirmation": needs_llm_confirmation,
             "force_human_intervention": force_human_intervention,
@@ -282,6 +295,7 @@ class RegexEngine:
             "regex_request_types": regex_request_types or request_types,
             "regex_requested_data": regex_requested_data or requested_data,
             "matched_spans": matched_spans,
+            "llm_was_used": False,
             "cleaned_request_text": cleaned_request_text,
             "quoted_history_removed": quoted_history_removed,
             "signature_removed": signature_removed,
@@ -333,7 +347,7 @@ class RegexEngine:
                         "request_type": HUMAN_INTERVENTION_REQUIRED,
                         "span": "FedEx Support Hub platform handoff",
                         "start": 0,
-                        "end": 0,
+                        "end_pos": 0,
                     }
                 ],
                 confidence=HIGH_CONFIDENCE,
@@ -362,7 +376,7 @@ class RegexEngine:
                         "request_type": "ups_account",
                         "span": "customer did not pay extra/outstanding charges",
                         "start": 0,
-                        "end": 0,
+                        "end_pos": 0,
                     }
                 ],
                 confidence=HIGH_CONFIDENCE,
@@ -649,19 +663,13 @@ if __name__ == "__main__":
 
     os.makedirs("output", exist_ok=True)
 
-    pd.DataFrame(matched_results).to_excel(
-        "output/regex_matches.xlsx",
-        index=False,
-    )
+    write_dataframe(pd.DataFrame(matched_results), REGEX_MATCHES_PATH)
 
-    pd.DataFrame(unmatched_tickets).to_excel(
-        "output/unmatched_tickets.xlsx",
-        index=False,
-    )
+    write_dataframe(pd.DataFrame(unmatched_tickets), UNMATCHED_TICKETS_PATH)
 
     print(f"Regex high-confidence matched: {len(matched_results)}")
     print(f"Regex unmatched/review-needed: {len(unmatched_tickets)}")
     print(f"Regex excluded acknowledgement-only: {excluded_count}")
     print("Files written:")
-    print("output/regex_matches.xlsx")
-    print("output/unmatched_tickets.xlsx")
+    print(REGEX_MATCHES_PATH)
+    print(UNMATCHED_TICKETS_PATH)
