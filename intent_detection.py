@@ -12,7 +12,7 @@ The pipeline is conservative:
   human review instead of risking a wrong answer.
 
 Creates:
-- output/request_intent_results.xlsx
+- output/request_intent_results.jsonl.gz
 """
 
 import json
@@ -24,6 +24,14 @@ from typing import Dict, List
 import pandas as pd
 from google import genai
 
+from pipeline_io import (
+    REGEX_MATCHES_PATH,
+    REQUEST_INTENT_RESULTS_PATH,
+    UNMATCHED_TICKETS_PATH,
+    build_request_id,
+    read_dataframe,
+    write_dataframe,
+)
 from customs_rules import (
     HUMAN_INTERVENTION_REQUIRED,
     UNKNOWN_REQUEST,
@@ -213,7 +221,10 @@ REQUESTS:
 
 
 def build_source_id(row):
-    return f"{row['zendesk_ticket_id']}_{row.get('request_number', 1)}"
+    return row.get("request_id") or build_request_id(
+        row.get("zendesk_ticket_id"),
+        row.get("request_number", 1),
+    )
 
 
 def as_bool(value):
@@ -264,6 +275,12 @@ def source_text_for_llm(row) -> str:
 
 def base_output_row(source_row) -> Dict[str, object]:
     return {
+        "request_id": source_row.get("request_id") or build_request_id(
+            source_row.get("zendesk_ticket_id"),
+            source_row.get("request_number"),
+        ),
+        "request_submission_timestamp": source_row.get("request_submission_timestamp"),
+        "ticket_submission_timestamp": source_row.get("ticket_submission_timestamp"),
         "zendesk_ticket_id": source_row.get("zendesk_ticket_id"),
         "request_number": source_row.get("request_number"),
         "requester_email": source_row.get("requester_email"),
@@ -299,8 +316,10 @@ def build_human_output_row(source_row, reason, engine="human_guardrail"):
             "request_types": ["human_intervention_required"],
             "requested_data": [HUMAN_INTERVENTION_REQUIRED],
             "confidence": 0.0,
+            "llm_confidence": None,
             "notes": reason,
             "human_intervention_required": True,
+            "llm_was_used": False,
         }
     )
     return output
@@ -403,8 +422,10 @@ def build_llm_output_row(source_row, result):
             "request_types": request_types,
             "requested_data": requested_data,
             "confidence": confidence,
+            "llm_confidence": confidence,
             "notes": notes,
             "human_intervention_required": human_intervention_required,
+            "llm_was_used": True,
         }
     )
     return output
@@ -442,8 +463,8 @@ def add_language_detection(final_df):
 def main():
     detector = RequestedDataDetector()
 
-    regex_df = pd.read_excel("output/regex_matches.xlsx")
-    unmatched_df = pd.read_excel("output/unmatched_tickets.xlsx")
+    regex_df = read_dataframe(REGEX_MATCHES_PATH)
+    unmatched_df = read_dataframe(UNMATCHED_TICKETS_PATH)
 
     llm_results = []
     rows_for_llm = []
@@ -530,10 +551,10 @@ def main():
     final_df = add_language_detection(final_df)
 
     os.makedirs("output", exist_ok=True)
-    final_df.to_excel("output/request_intent_results.xlsx", index=False)
+    write_dataframe(final_df, REQUEST_INTENT_RESULTS_PATH)
 
     print(
-        f"Saved {len(final_df)} rows to output/request_intent_results.xlsx"
+        f"Saved {len(final_df)} rows to {REQUEST_INTENT_RESULTS_PATH}"
     )
 
 
