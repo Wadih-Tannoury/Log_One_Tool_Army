@@ -285,6 +285,7 @@ class RegexEngine:
             "request_types": request_types,
             "requested_data": requested_data,
             "confidence": confidence,
+            "regex_confidence": confidence,
             "llm_confidence": None,
             "notes": notes,
             "needs_llm_confirmation": needs_llm_confirmation,
