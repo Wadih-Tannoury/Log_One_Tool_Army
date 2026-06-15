@@ -16,6 +16,7 @@ jobs:
       ZENDESK_API_CREDENTIALS: ${{ secrets.ZENDESK_API_CREDENTIALS }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: gemini-2.5-flash
+      LOG_HISTORY_TABLE: tlg-business-intelligence-prd.til.log_one_tool_army_logs_history
 
     steps:
       - name: Checkout Repository
@@ -32,7 +33,6 @@ jobs:
 
           pip install \
             pandas \
-            openpyxl \
             numpy \
             requests \
             db-dtypes \
@@ -42,10 +42,15 @@ jobs:
             google-cloud-bigquery-storage \
             google-genai
 
+      - name: Initialize Workflow Run
+        run: python -c "import uuid; print(f'WORKFLOW_RUN_ID={uuid.uuid4()}')" >> "$GITHUB_ENV"
+
       - name: Verify Environment
         run: |
           echo "Workflow started"
           echo "Project: $PROJECT_ID"
+          echo "History table: $LOG_HISTORY_TABLE"
+          echo "Workflow run id: $WORKFLOW_RUN_ID"
 
       - name: Fetch Tickets
         run: python ticket_fetcher.py
@@ -56,24 +61,19 @@ jobs:
       - name: Verify Regex Outputs
         run: |
           ls -lah output
+          test -f output/regex_matches.jsonl.gz
+          test -f output/unmatched_tickets.jsonl.gz
 
       - name: Run Intent Detection
         run: python intent_detection.py
 
-      - name: Generate Draft Responses
+      - name: Generate Draft Responses and Log to BigQuery
         run: python response_generator.py
 
-      - name: Verify Final Output
+      - name: Verify Local Handoffs
         run: |
           ls -lah output
-          test -f output/request_intent_results.xlsx
-
-      - name: Upload Results
-        uses: actions/upload-artifact@v4
-        with:
-          name: request-intent-results
-          path: output/request_intent_results_with_drafts.xlsx
-          if-no-files-found: error
+          test -f output/request_intent_results.jsonl.gz
 
       - name: Workflow Complete
         run: |
