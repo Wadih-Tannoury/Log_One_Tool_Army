@@ -292,6 +292,10 @@ def base_output_row(source_row) -> Dict[str, object]:
         "shipment_order_number": source_row.get("shipment_order_number"),
         "shipment_tracking_number": source_row.get("shipment_tracking_number"),
         "return_tracking_number": source_row.get("return_tracking_number"),
+        "regex_confidence": source_row.get(
+            "regex_confidence",
+            source_row.get("confidence"),
+        ),
         "needs_standard_reply_confirmation": as_bool(
             source_row.get("needs_standard_reply_confirmation")
         ),
