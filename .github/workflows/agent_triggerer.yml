@@ -3,6 +3,9 @@ name: Log One Tool Army
 on:
   workflow_dispatch:
 
+  schedule:
+    - cron: "0 * * * *"
+
 jobs:
   process_requests:
     runs-on: ubuntu-latest
