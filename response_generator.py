@@ -2,8 +2,8 @@
 response_generator.py
 
 Deterministic draft-response generator.
-Reads requested_data from output/request_intent_results.xlsx and creates:
-- output/request_intent_results_with_drafts.xlsx
+Reads requested_data from output/request_intent_results.jsonl.gz, builds draft responses,
+and appends the final rows to the BigQuery history table through ticket_fetcher.
 
 No LLM is used here. The dictionary-detected request_language column
 produced by intent_detection.py is used to choose the response language.
@@ -17,6 +17,8 @@ import re
 
 import pandas as pd
 
+from ticket_fetcher import append_history_rows
+from pipeline_io import REQUEST_INTENT_RESULTS_PATH, read_dataframe
 from customs_rules import (
     FEDEX_BROKERAGE_EMAIL,
     HUMAN_INTERVENTION_REQUIRED,
@@ -33,8 +35,7 @@ from customs_rules import (
     normalize_requested_data,
 )
 
-INPUT_PATH = "output/request_intent_results.xlsx"
-OUTPUT_PATH = "output/request_intent_results_with_drafts.xlsx"
+INPUT_PATH = REQUEST_INTENT_RESULTS_PATH
 AUTO_ADD_UPS_MIN_CONFIDENCE = float(os.getenv("AUTO_ADD_UPS_MIN_CONFIDENCE", "0.90"))
 
 DHL_BROKERAGE_EMAIL = os.getenv("DHL_BROKERAGE_EMAIL", "kamil.it@dhl.com")
@@ -677,7 +678,11 @@ def requires_human_intervention(row):
 
 
 def main():
-    df = pd.read_excel(INPUT_PATH)
+    df = read_dataframe(INPUT_PATH)
+
+    if df.empty:
+        print("No request intent rows found. Nothing to log to BigQuery history.")
+        return
 
     if "request_language" not in df.columns:
         df["request_language"] = df.apply(row_language, axis=1)
@@ -687,10 +692,9 @@ def main():
     df["draft_response"] = df.apply(build_response, axis=1)
     df["human_intervention_required"] = df.apply(requires_human_intervention, axis=1)
 
-    os.makedirs("output", exist_ok=True)
-    df.to_excel(OUTPUT_PATH, index=False)
+    logged_rows = append_history_rows(df)
 
-    print(f"Saved draft responses to {OUTPUT_PATH}")
+    print(f"Generated draft responses for {len(df)} rows. Logged {logged_rows} new rows.")
 
 
 if __name__ == "__main__":
