@@ -176,7 +176,8 @@ Return EXACTLY this structure:
     "source_id": "...",
     "requested_data": ["..."],
     "confidence": 0.0,
-    "notes": "short reason"
+    "notes": "short reason",
+    "human_intervention_draft_response": ""
   }}
 ]
 
@@ -204,6 +205,10 @@ REQUESTS:
 
                     if "notes" not in result:
                         result["notes"] = ""
+
+                    result["human_intervention_draft_response"] = str(
+                        result.get("human_intervention_draft_response", "") or ""
+                    ).strip()
 
                 return results
 
@@ -292,6 +297,15 @@ def base_output_row(source_row) -> Dict[str, object]:
         "shipment_order_number": source_row.get("shipment_order_number"),
         "shipment_tracking_number": source_row.get("shipment_tracking_number"),
         "return_tracking_number": source_row.get("return_tracking_number"),
+        "shipment_carrier_code": source_row.get("shipment_carrier_code"),
+        "return_carrier_code": source_row.get("return_carrier_code"),
+        "tracking_not_found_in_shipping_platform_shipments": as_bool(
+            source_row.get("tracking_not_found_in_shipping_platform_shipments")
+        ),
+        "llm_human_intervention_draft_response": source_row.get(
+            "llm_human_intervention_draft_response",
+            "",
+        ),
         "regex_confidence": source_row.get(
             "regex_confidence",
             source_row.get("confidence"),
@@ -329,6 +343,56 @@ def build_human_output_row(source_row, reason, engine="human_guardrail"):
     return output
 
 
+def is_tracking_lookup_not_found(row) -> bool:
+    return as_bool(row.get("tracking_not_found_in_shipping_platform_shipments"))
+
+
+def requested_data_summary(values: List[str]) -> str:
+    understood = [
+        value.replace("_", " ")
+        for value in values
+        if value not in {UNKNOWN_REQUEST, HUMAN_INTERVENTION_REQUIRED}
+    ]
+    return ", ".join(understood) if understood else "the sender's request"
+
+
+def build_tracking_lookup_fallback_draft(source_row, requested_data, llm_notes: object) -> str:
+    language = detect_language_with_dictionary(
+        source_row.get("subject", ""),
+        source_text_for_llm(source_row),
+    )
+    tracking_number = str(source_row.get("extracted_tracking_number") or "N/A").strip()
+    understood = requested_data_summary(requested_data)
+    notes = str(llm_notes or "").strip()
+
+    if language == "it":
+        detail = f" Ho interpretato la richiesta come relativa a: {understood}."
+        if notes:
+            detail += f" Dettagli LLM: {notes}"
+        return (
+            "Buongiorno,\n\n"
+            f"Abbiamo ricevuto la vostra richiesta relativa al tracking {tracking_number}."
+            f"{detail}\n\n"
+            "Non sono riuscito a trovare questo tracking nella tabella spedizioni, "
+            "quindi è necessario l'intervento di un operatore per verificare la pratica "
+            "e confermare la documentazione o le informazioni corrette.\n\n"
+            "Cordiali saluti,"
+        )
+
+    detail = f" I understood the request as related to: {understood}."
+    if notes:
+        detail += f" LLM details: {notes}"
+    return (
+        "Hello,\n\n"
+        f"We received your request regarding tracking number {tracking_number}."
+        f"{detail}\n\n"
+        "I could not find this tracking number in the shipment table, so human "
+        "intervention is required to verify the case and confirm the correct "
+        "documentation or information.\n\n"
+        "Kind regards,"
+    )
+
+
 def build_llm_output_row(source_row, result):
     requested_data = result.get("requested_data", [UNKNOWN_REQUEST])
     requested_data = normalize_requested_data(requested_data) or [UNKNOWN_REQUEST]
@@ -355,8 +419,36 @@ def build_llm_output_row(source_row, result):
     )
     regex_candidates = requested_data_set(collapsed_regex_requested_data)
     llm_candidates = requested_data_set(requested_data)
+    llm_human_intervention_draft_response = str(
+        result.get("human_intervention_draft_response", "") or ""
+    ).strip()
 
-    if requested_data == [HUMAN_INTERVENTION_REQUIRED]:
+    if is_tracking_lookup_not_found(source_row):
+        engine = "llm_tracking_lookup_not_found_guard"
+        request_types = ["tracking_lookup_not_found_guard"]
+        understood_requested_data = [
+            item
+            for item in requested_data
+            if item not in {UNKNOWN_REQUEST, HUMAN_INTERVENTION_REQUIRED}
+        ]
+        requested_data = understood_requested_data or [HUMAN_INTERVENTION_REQUIRED]
+        human_intervention_required = True
+        if not llm_human_intervention_draft_response:
+            llm_human_intervention_draft_response = build_tracking_lookup_fallback_draft(
+                source_row,
+                requested_data,
+                notes,
+            )
+        notes = (
+            "Tracking number extracted from the ticket was not found in "
+            "tlg-business-intelligence-prd.bi.shipping_platform_shipments. "
+            "Regex processing was skipped and this request was handled only by the LLM. "
+            f"LLM understood requested_data={requested_data}. "
+            "Human intervention is required. "
+            f"LLM notes: {notes}"
+        )
+
+    elif requested_data == [HUMAN_INTERVENTION_REQUIRED]:
         engine = "llm_human_intervention_guard"
         request_types = [HUMAN_INTERVENTION_REQUIRED]
         human_intervention_required = True
@@ -430,6 +522,7 @@ def build_llm_output_row(source_row, result):
             "notes": notes,
             "human_intervention_required": human_intervention_required,
             "llm_was_used": True,
+            "llm_human_intervention_draft_response": llm_human_intervention_draft_response,
         }
     )
     return output
@@ -474,7 +567,12 @@ def main():
     rows_for_llm = []
 
     for _, row in unmatched_df.iterrows():
-        if is_request_number_3_or_higher(row.get("request_number")):
+        if is_tracking_lookup_not_found(row):
+            # User requirement: when the extracted tracking number is missing from
+            # shipping_platform_shipments, bypass regex/hard guards and let the
+            # LLM summarize what it understood before routing to human review.
+            rows_for_llm.append(row)
+        elif is_request_number_3_or_higher(row.get("request_number")):
             llm_results.append(
                 build_human_output_row(
                     row,
@@ -517,6 +615,12 @@ def main():
                     "ticket_category": str(row.get("ticket_category", "") or ""),
                     "regex_candidates": list_or_empty(row.get("regex_requested_data")),
                     "regex_notes": str(row.get("notes", "") or ""),
+                    "extracted_tracking_number": str(
+                        row.get("extracted_tracking_number", "") or ""
+                    ),
+                    "tracking_not_found_in_shipping_platform_shipments": as_bool(
+                        row.get("tracking_not_found_in_shipping_platform_shipments")
+                    ),
                 }
             )
 
