@@ -259,6 +259,50 @@ def data_value(row, data_key):
     return PLACEHOLDER
 
 
+def export_tracking_value(row):
+    """Return the non-return/export tracking number from shipment enrichment."""
+    return first_available_value(
+        row.get("shipment_tracking_number"),
+        default=PLACEHOLDER,
+    )
+
+
+def normalize_carrier_code_value(value):
+    if is_blank(value):
+        return ""
+    return re.sub(r"\s+", "", str(value).strip().upper())
+
+
+def return_export_carriers_are_same(row):
+    """
+    Return True/False when the return and export rows were found in
+    shipping_platform_shipments and both carrier_code values are available.
+    Return None when the order/carrier relationship could not be determined.
+    """
+    if is_blank(row.get("shipment_order_number")):
+        return None
+
+    export_carrier = normalize_carrier_code_value(row.get("shipment_carrier_code"))
+    return_carrier = normalize_carrier_code_value(row.get("return_carrier_code"))
+
+    if not export_carrier or not return_carrier:
+        return None
+
+    return export_carrier == return_carrier
+
+
+def is_tracking_lookup_not_found(row):
+    engine = str(row.get("engine", "") or "").strip().lower()
+    return (
+        as_bool(row.get("tracking_not_found_in_shipping_platform_shipments"))
+        or engine == "llm_tracking_lookup_not_found_guard"
+    )
+
+
+def llm_human_intervention_draft(row):
+    return normalize_text(row.get("llm_human_intervention_draft_response", ""))
+
+
 def normalize_data_key(value):
     value = str(value or "").strip()
     return REQUESTED_DATA_ALIASES.get(value, value)
@@ -442,6 +486,21 @@ def requested_data_for_response(row):
 def build_human_intervention_note(row, reason):
     ticket_id = row.get("zendesk_ticket_id", "")
     request_number = row.get("request_number", "")
+    draft = llm_human_intervention_draft(row) if is_tracking_lookup_not_found(row) else ""
+
+    if draft:
+        return (
+            "HUMAN INTERVENTION REQUIRED\n\n"
+            "Do not send this draft automatically. A human must review the ticket "
+            "because the extracted tracking number was not found in "
+            "tlg-business-intelligence-prd.bi.shipping_platform_shipments.\n\n"
+            "LLM-drafted response for human review:\n\n"
+            f"{draft}\n\n"
+            "---\n"
+            f"Reason: {reason}\n"
+            f"Ticket: {ticket_id}\n"
+            f"Request number: {request_number}"
+        )
 
     return (
         "HUMAN INTERVENTION REQUIRED\n\n"
@@ -532,7 +591,48 @@ def build_ups_account_standard_response(row):
     )
 
 
+def build_ups_returns_same_carrier_response(row):
+    export_tracking = export_tracking_value(row)
+    ups_account = data_value(row, "ups_account_number")
+    rpi = data_value(row, "return_proforma_invoice")
+
+    return (
+        "Buongiorno,\n\n"
+        "In allegato la documentazione per la reintroduzione in franchigia:\n\n"
+        f"- TRK in export: {export_tracking}\n"
+        f"- Cod UPS: {ups_account}\n"
+        f"- Return Proforma Invoice: {rpi}\n\n"
+        "Tutti prodotti sono stati resi.\n\n"
+        "Cordiali saluti,\n\n"
+        "Piero T."
+    )
+
+
+def build_ups_returns_different_carrier_response(row):
+    ups_account = data_value(row, "ups_account_number")
+    rpi = data_value(row, "return_proforma_invoice")
+
+    return (
+        "Buongiorno,\n\n"
+        "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
+        "- TRK in export: non disponibile, avvenuto con altro vettore\n"
+        f"- Cod UPS: {ups_account}\n"
+        f"- Return Proforma Invoice: {rpi}\n\n"
+        "Tutti prodotti sono stati resi.\n\n"
+        "Cordiali saluti,\n\n"
+        "Piero T."
+    )
+
+
 def build_ups_returns_first_rpi_account_response(row):
+    carrier_match = return_export_carriers_are_same(row)
+
+    if carrier_match is True:
+        return build_ups_returns_same_carrier_response(row)
+
+    if carrier_match is False:
+        return build_ups_returns_different_carrier_response(row)
+
     export_tracking = data_value(row, "export_tracking_number")
     ups_account = data_value(row, "ups_account_number")
     rpi = data_value(row, "return_proforma_invoice")
@@ -559,18 +659,85 @@ def build_ups_returns_first_rpi_account_response(row):
     )
 
 
-def build_fedex_dhl_returns_first_rpi_contact_response(row):
-    awb_export = data_value(row, "export_tracking_number")
+def build_fedex_returns_same_carrier_response(row):
+    awb_export = export_tracking_value(row)
     rpi = data_value(row, "return_proforma_invoice")
 
     return (
-        "Answer 1:\n"
         "Buongiorno,\n\n"
         "In allegato invio la documentazione richiesta.\n\n"
         f"AWB in export: {awb_export}\n"
         f"RPI: {rpi}\n"
         "Cordiali saluti,\n\n"
-        "Piero T.\n\n"
+        "Piero T."
+    )
+
+
+def build_dhl_returns_same_carrier_response(row):
+    awb_export = export_tracking_value(row)
+    rpi = data_value(row, "return_proforma_invoice")
+
+    return (
+        "Buongiorno,\n\n"
+        "In allegato la documentazione richiesta per la reintroduzione in franchigia.\n"
+        f"AWB in export: {awb_export}\n"
+        f"RPI: {rpi}\n"
+        "Cordiali saluti,\n"
+        "Piero T."
+    )
+
+
+def build_fedex_dhl_returns_different_carrier_response(row):
+    rpi = data_value(row, "return_proforma_invoice")
+
+    return (
+        "Buongiorno,\n\n"
+        "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
+        "AWB in export: non disponibile, avvenuto con altro vettore\n"
+        f"RPI: {rpi}\n\n"
+        "Tutti prodotti sono stati resi.\n\n"
+        "Cordiali saluti,\n\n"
+        "Piero T."
+    )
+
+
+def build_fedex_dhl_returns_first_rpi_contact_response(row, carrier="fedex"):
+    carrier_match = return_export_carriers_are_same(row)
+    carrier = str(carrier or "fedex").strip().lower()
+
+    if carrier_match is True:
+        if carrier == "dhl":
+            return build_dhl_returns_same_carrier_response(row)
+        return build_fedex_returns_same_carrier_response(row)
+
+    if carrier_match is False:
+        return build_fedex_dhl_returns_different_carrier_response(row)
+
+    awb_export = data_value(row, "export_tracking_number")
+    rpi = data_value(row, "return_proforma_invoice")
+
+    if carrier == "dhl":
+        answer_1_body = (
+            "Buongiorno,\n\n"
+            "In allegato la documentazione richiesta per la reintroduzione in franchigia.\n"
+            f"AWB in export: {awb_export}\n"
+            f"RPI: {rpi}\n"
+            "Cordiali saluti,\n"
+            "Piero T."
+        )
+    else:
+        answer_1_body = (
+            "Buongiorno,\n\n"
+            "In allegato invio la documentazione richiesta.\n\n"
+            f"AWB in export: {awb_export}\n"
+            f"RPI: {rpi}\n"
+            "Cordiali saluti,\n\n"
+            "Piero T."
+        )
+
+    return (
+        "Answer 1:\n"
+        f"{answer_1_body}\n\n"
         "Answer 2:\n"
         "Buongiorno,\n\n"
         "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
@@ -583,27 +750,7 @@ def build_fedex_dhl_returns_first_rpi_contact_response(row):
 
 
 def build_dhl_returns_first_rpi_response(row):
-    awb_export = data_value(row, "export_tracking_number")
-    rpi = data_value(row, "return_proforma_invoice")
-
-    return (
-        "Answer 1:\n"
-        "Buongiorno,\n\n"
-        "In allegato la documentazione richiesta per la reintroduzione in franchigia.\n"
-        f"AWB in export: {awb_export}\n"
-        f"Items returned: {PLACEHOLDER}\n"
-        f"RPI: {rpi}\n\n"
-        "Cordiali saluti,\n\n"
-        "Piero T.\n\n"
-        "Answer 2:\n"
-        "Buongiorno,\n\n"
-        "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
-        "AWB in export: non disponibile, avvenuto con altro vettore\n"
-        f"RPI: {rpi}\n\n"
-        "Tutti prodotti sono stati resi.\n\n"
-        "Cordiali saluti,\n\n"
-        "Piero T."
-    )
+    return build_fedex_dhl_returns_first_rpi_contact_response(row, carrier="dhl")
 
 
 def should_force_human_intervention(row, requested_data):
@@ -657,13 +804,13 @@ def build_response(row):
         if {"ups_account_number", "return_proforma_invoice"}.issubset(set(requested_data)):
             return build_ups_returns_first_rpi_account_response(row)
 
-    if first_returns_request and (
-        is_fedex_requester_email(requester_email) or is_dhl_requester_email(requester_email)
-    ):
+    if first_returns_request and is_fedex_requester_email(requester_email):
         if "return_proforma_invoice" in requested_data and has_embedded_rpi_contact_fields(row):
-            return build_fedex_dhl_returns_first_rpi_contact_response(row)
+            return build_fedex_dhl_returns_first_rpi_contact_response(row, carrier="fedex")
 
     if first_returns_request and is_dhl_requester_email(requester_email):
+        if "return_proforma_invoice" in requested_data and has_embedded_rpi_contact_fields(row):
+            return build_fedex_dhl_returns_first_rpi_contact_response(row, carrier="dhl")
         if "return_proforma_invoice" in requested_data:
             return build_dhl_returns_first_rpi_response(row)
 
