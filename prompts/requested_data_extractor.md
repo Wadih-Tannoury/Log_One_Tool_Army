@@ -120,20 +120,49 @@ If a UPS Returns Customs Clearance request asks for the UPS account and the retu
 
 If a DHL Returns Customs Clearance request asks for documentation for reintroduzione in franchigia, return `return_proforma_invoice`.
 
+For first Returns Customs Clearance requests, ignore `dichiarazione d'intento`, `dichiarazione di intento`, and declaration-of-intent checklist wording when it appears as part of the carrier's generic import/RPI checklist. Do not return `dichiarazione_di_libera_esportazione` for those first-request Returns Customs Clearance checklists.
+
+For request number `1`, ignore exporter EIN / employer identification number checklist wording unless the request is clearly not a first-request carrier checklist.
+
+For the UPS UK import-clearance instruction template from UPS Brokerage at East Midlands Airport, return exactly these operational data elements when the context is Returns Customs Clearance: `export_tracking_number`, `ups_account_number`, and `return_proforma_invoice`. Treat EORI/VAT, commodity code, customs procedure, deferment, and generic shipment instructions as part of that specific return-clearance package.
+
 ## UPS Extra Charges Rule
 
-If the request says the customer, consignee, receiver, destinatario, or cliente did not pay extra charges, outstanding charges, oneri, costi, spese, dazi, or diritti, return only:
+If the request says the customer, consignee, receiver, destinatario, or cliente did not pay extra charges, outstanding charges, oneri, costi, spese, addebiti, dazi, or diritti, return only:
 
 ```json
 {
-  "requested_data": ["ups_account_number"],
+  "requested_data": ["human_intervention_required"],
   "confidence": 0.95,
-  "notes": "Customer did not pay extra/outstanding charges; UPS account is needed",
+  "notes": "Customer did not pay extra/outstanding charges; a human must verify whether the customer or TLG should pay.",
   "human_intervention_draft_response": ""
 }
 ```
 
-Do not add other requested_data values in this case.
+Do not return `ups_account_number` for unpaid-extra-charge cases unless the message separately and explicitly asks for the UPS account code as requested data.
+
+## Customer Refused Package Rule
+
+If the carrier says the customer, consignee, receiver, destinatario, or cliente refused the package and asks how TLG wants to proceed, return `ups_account_number`. This is the standard return-cost/LOA response case.
+
+Do not classify a refused-package request as generic `shipment_instructions`.
+
+## UPS Receiver Contact / Clearance Templates
+
+UPS ERN export templates often contain a cost paragraph saying that return/disposal charges will be charged to the shipper's UPS account. That paragraph is boilerplate and is not a request for `ups_account_number`.
+
+If the actionable line asks the receiver/destinatario to contact the local UPS office, provide customs-clearance documents, or provide alternative contact details, return customer contact data instead:
+
+```json
+{
+  "requested_data": ["customer_email", "customer_phone"],
+  "confidence": 0.95,
+  "notes": "UPS receiver-contact clearance template; the UPS account paragraph is boilerplate.",
+  "human_intervention_draft_response": ""
+}
+```
+
+If the same template explicitly asks for a power of attorney, include `power_of_attorney` and `customer_phone`, but do not add `customer_email` unless it is separately requested.
 
 ## Declaration Rule
 
@@ -168,6 +197,12 @@ Return:
 ```
 
 If a request appears to quote an old email and the current sender only says “thank you”, “noted”, or “see below”, return `unknown_request` with low confidence.
+
+If a FedEx/UPS/DHL message is purely an operational status update or confirmation, such as releasing a customs hold or informing TLG that the return AWB is already in transit, return `human_intervention_required` rather than extracting phone numbers, AWBs, or tracking references from signatures or informational text.
+
+If a message says an AWB, tracking number, or tracking/reference number only as a reference label, do not return `export_tracking_number`. Return export tracking only when the sender explicitly asks TLG to provide the export AWB/TRK/tracking value.
+
+If a shipment is held because it is missing the invoice, for example `priva della fattura`, `fattura mancante`, or `missing invoice`, return `commercial_invoice`, even when an AWB or tracking number appears at the top as a reference.
 
 ## Exclusion Logic
 
