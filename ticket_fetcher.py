@@ -74,6 +74,9 @@ ACTIVE_TICKET_COLUMNS = [
     "shipment_order_number",
     "shipment_tracking_number",
     "return_tracking_number",
+    "shipment_carrier_code",
+    "return_carrier_code",
+    "tracking_not_found_in_shipping_platform_shipments",
 ]
 
 HISTORY_COLUMNS = [
@@ -176,6 +179,12 @@ def active_tickets_schema(bigquery):
         bigquery.SchemaField("shipment_order_number", "STRING"),
         bigquery.SchemaField("shipment_tracking_number", "STRING"),
         bigquery.SchemaField("return_tracking_number", "STRING"),
+        bigquery.SchemaField("shipment_carrier_code", "STRING"),
+        bigquery.SchemaField("return_carrier_code", "STRING"),
+        bigquery.SchemaField(
+            "tracking_not_found_in_shipping_platform_shipments",
+            "BOOL",
+        ),
     ]
 
 
@@ -196,7 +205,10 @@ def empty_active_tickets_table(client) -> None:
             extracted_tracking_number STRING,
             shipment_order_number STRING,
             shipment_tracking_number STRING,
-            return_tracking_number STRING
+            return_tracking_number STRING,
+            shipment_carrier_code STRING,
+            return_carrier_code STRING,
+            tracking_not_found_in_shipping_platform_shipments BOOL
         )
         """
     ).result()
@@ -902,7 +914,9 @@ def fetch_ticket_rows(
 
 def enrich_with_shipment_numbers(df: pd.DataFrame, client, bigquery) -> pd.DataFrame:
     tracking_numbers = [
-        x for x in df["extracted_tracking_number"].dropna().unique() if x != "N/A"
+        str(x).strip()
+        for x in df["extracted_tracking_number"].dropna().unique()
+        if str(x).strip() and str(x).strip().upper() != "N/A"
     ]
 
     shipment_map = {}
@@ -924,7 +938,8 @@ def enrich_with_shipment_numbers(df: pd.DataFrame, client, bigquery) -> pd.DataF
             matched.tracking_number AS source_tracking_number,
             matched.shipment_order_number,
             s.tracking_number,
-            s.is_return
+            s.is_return,
+            s.carrier_code
 
         FROM matched
 
@@ -954,28 +969,47 @@ def enrich_with_shipment_numbers(df: pd.DataFrame, client, bigquery) -> pd.DataF
 
             shipment_tracking = None
             return_tracking = None
+            shipment_carrier_code = None
+            return_carrier_code = None
 
             for _, row in subset.iterrows():
-                if row["is_return"]:
+                is_return = bool(row["is_return"])
+                if is_return:
                     return_tracking = row["tracking_number"]
+                    return_carrier_code = row.get("carrier_code")
                 else:
                     shipment_tracking = row["tracking_number"]
+                    shipment_carrier_code = row.get("carrier_code")
 
             shipment_map[tracking] = {
                 "shipment_order_number": shipment_order_number,
                 "shipment_tracking_number": shipment_tracking,
                 "return_tracking_number": return_tracking,
+                "shipment_carrier_code": shipment_carrier_code,
+                "return_carrier_code": return_carrier_code,
             }
 
     df = df.copy()
+    normalized_tracking = df["extracted_tracking_number"].map(
+        lambda x: str(x).strip() if pd.notna(x) else ""
+    )
     df["shipment_order_number"] = df["extracted_tracking_number"].map(
-        lambda x: shipment_map.get(x, {}).get("shipment_order_number")
+        lambda x: shipment_map.get(str(x).strip(), {}).get("shipment_order_number")
     )
     df["shipment_tracking_number"] = df["extracted_tracking_number"].map(
-        lambda x: shipment_map.get(x, {}).get("shipment_tracking_number")
+        lambda x: shipment_map.get(str(x).strip(), {}).get("shipment_tracking_number")
     )
     df["return_tracking_number"] = df["extracted_tracking_number"].map(
-        lambda x: shipment_map.get(x, {}).get("return_tracking_number")
+        lambda x: shipment_map.get(str(x).strip(), {}).get("return_tracking_number")
+    )
+    df["shipment_carrier_code"] = df["extracted_tracking_number"].map(
+        lambda x: shipment_map.get(str(x).strip(), {}).get("shipment_carrier_code")
+    )
+    df["return_carrier_code"] = df["extracted_tracking_number"].map(
+        lambda x: shipment_map.get(str(x).strip(), {}).get("return_carrier_code")
+    )
+    df["tracking_not_found_in_shipping_platform_shipments"] = normalized_tracking.map(
+        lambda x: bool(x and x.upper() != "N/A" and x not in shipment_map)
     )
 
     return df
