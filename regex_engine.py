@@ -41,12 +41,22 @@ from customs_rules import (
     contains_correction_or_discrepancy,
     get_standard_reply_requested_data,
     has_actionable_request_language,
+    is_customer_refused_return_request,
+    is_delivery_address_phone_unreachable_request,
+    is_explicit_export_tracking_request,
+    is_explicit_ups_account_request,
+    is_informative_status_update_only,
+    is_missing_invoice_request,
     is_acknowledgement_only,
     is_platform_handoff_request,
     is_request_number_3_or_higher,
     normalize_request_number,
     is_special_followup_ticket,
+    is_tracking_reference_only,
+    is_ups_account_boilerplate_context,
     is_unpaid_extra_charges_request,
+    is_ups_receiver_contact_clearance_request,
+    is_ups_uk_import_clearance_instructions_request,
     looks_like_commercial_invoice_boilerplate,
     requested_data_already_answered_by_first_reply,
 )
@@ -170,7 +180,10 @@ class RegexEngine:
             extracted_tracking_number,
             shipment_order_number,
             shipment_tracking_number,
-            return_tracking_number
+            return_tracking_number,
+            shipment_carrier_code,
+            return_carrier_code,
+            tracking_not_found_in_shipping_platform_shipments
         FROM `tlg-business-intelligence-prd.til.log_one_tool_army_active_tickets`
         """
 
@@ -190,6 +203,9 @@ class RegexEngine:
                 requester_email=ticket["requester_email"],
                 request_number=ticket["request_number"],
                 ticket_category=ticket["ticket_category"],
+                tracking_not_found_in_shipping_platform_shipments=ticket.get(
+                    "tracking_not_found_in_shipping_platform_shipments"
+                ),
             )
 
             output_row = {
@@ -207,6 +223,11 @@ class RegexEngine:
                 "shipment_order_number": ticket["shipment_order_number"],
                 "shipment_tracking_number": ticket["shipment_tracking_number"],
                 "return_tracking_number": ticket["return_tracking_number"],
+                "shipment_carrier_code": ticket.get("shipment_carrier_code"),
+                "return_carrier_code": ticket.get("return_carrier_code"),
+                "tracking_not_found_in_shipping_platform_shipments": ticket.get(
+                    "tracking_not_found_in_shipping_platform_shipments"
+                ),
                 **result,
             }
 
@@ -308,12 +329,38 @@ class RegexEngine:
         requester_email: object = "",
         request_number: object = 1,
         ticket_category: object = "",
+        tracking_not_found_in_shipping_platform_shipments: object = False,
     ):
         text_details = clean_latest_request_text(request_text)
         cleaned_text = str(text_details["cleaned_request_text"] or "")
         raw_text = str(text_details["raw_request_text"] or "")
         quoted_history_removed = bool(text_details["quoted_history_removed"])
         signature_removed = bool(text_details["signature_removed"])
+
+        tracking_not_found = str(
+            tracking_not_found_in_shipping_platform_shipments or ""
+        ).strip().lower() in {"true", "1", "yes", "y"}
+
+        if tracking_not_found:
+            return self._as_output(
+                matched=False,
+                excluded=False,
+                request_types=[],
+                requested_data=[],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[],
+                confidence=0.0,
+                notes=(
+                    "Tracking number extracted from the ticket was not found in "
+                    "tlg-business-intelligence-prd.bi.shipping_platform_shipments. "
+                    "Regex processing skipped; send to LLM for a human-intervention draft."
+                ),
+                needs_llm_confirmation=True,
+                regex_request_types=[],
+                regex_requested_data=[],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
 
         if is_request_number_3_or_higher(request_number):
             return self._as_output(
@@ -369,12 +416,12 @@ class RegexEngine:
             return self._as_output(
                 matched=True,
                 excluded=False,
-                request_types=["ups_account"],
-                requested_data=["ups_account_number"],
+                request_types=[HUMAN_INTERVENTION_REQUIRED],
+                requested_data=[HUMAN_INTERVENTION_REQUIRED],
                 cleaned_request_text=cleaned_text,
                 matched_spans=[
                     {
-                        "request_type": "ups_account",
+                        "request_type": HUMAN_INTERVENTION_REQUIRED,
                         "span": "customer did not pay extra/outstanding charges",
                         "start": 0,
                         "end_pos": 0,
@@ -382,10 +429,66 @@ class RegexEngine:
                 ],
                 confidence=HIGH_CONFIDENCE,
                 notes=(
-                    "Customer did not pay extra/outstanding charges. "
-                    "Classified only as ups_account."
+                    "Customer did not pay extra/outstanding charges. Human intervention "
+                    "is required to verify whether the customer or TLG should pay."
                 ),
                 needs_llm_confirmation=False,
+                force_human_intervention=True,
+                human_intervention_required=True,
+                regex_request_types=[HUMAN_INTERVENTION_REQUIRED],
+                regex_requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        if is_informative_status_update_only(cleaned_text):
+            return self._as_output(
+                matched=True,
+                excluded=False,
+                request_types=[HUMAN_INTERVENTION_REQUIRED],
+                requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[
+                    {
+                        "request_type": HUMAN_INTERVENTION_REQUIRED,
+                        "span": "informative status update only",
+                        "start": 0,
+                        "end_pos": 0,
+                    }
+                ],
+                confidence=HIGH_CONFIDENCE,
+                notes=(
+                    "The latest message is an informative status update/confirmation, "
+                    "not a request for data. Human intervention is required."
+                ),
+                force_human_intervention=True,
+                human_intervention_required=True,
+                regex_request_types=[HUMAN_INTERVENTION_REQUIRED],
+                regex_requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
+
+        if is_customer_refused_return_request(cleaned_text):
+            return self._as_output(
+                matched=True,
+                excluded=False,
+                request_types=["ups_account"],
+                requested_data=["ups_account_number"],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[
+                    {
+                        "request_type": "ups_account",
+                        "span": "customer refused package; return-to-shipper costs authorization",
+                        "start": 0,
+                        "end_pos": 0,
+                    }
+                ],
+                confidence=HIGH_CONFIDENCE,
+                notes=(
+                    "Customer/receiver refused the package and the carrier asks how "
+                    "to proceed. Use the UPS account/LOA return-cost response."
+                ),
                 regex_request_types=["ups_account"],
                 regex_requested_data=["ups_account_number"],
                 quoted_history_removed=quoted_history_removed,
@@ -394,6 +497,61 @@ class RegexEngine:
 
         request_types, matched_spans = self._find_matches(cleaned_text)
         raw_request_types, raw_matched_spans = self._find_matches(raw_text)
+
+        if is_missing_invoice_request(cleaned_text) and "invoice" not in request_types:
+            request_types.append("invoice")
+            matched_spans.append(
+                {
+                    "request_type": "invoice",
+                    "span": "shipment held because invoice is missing",
+                    "start": 0,
+                    "end_pos": 0,
+                }
+            )
+
+        if (
+            is_delivery_address_phone_unreachable_request(cleaned_text)
+            and "shipping_address" not in request_types
+        ):
+            request_types.extend(
+                request_type
+                for request_type in [
+                    "shipping_address",
+                    "customer_phone",
+                    "customer_email",
+                ]
+                if request_type not in request_types
+            )
+            matched_spans.append(
+                {
+                    "request_type": "shipping_address",
+                    "span": "address unknown / street number missing and phone unreachable",
+                    "start": 0,
+                    "end_pos": 0,
+                }
+            )
+
+        if is_ups_uk_import_clearance_instructions_request(cleaned_text):
+            request_types = [
+                request_type
+                for request_type in request_types
+                if request_type in {"return_proforma_invoice", "tracking_number", "ups_account"}
+            ]
+            for request_type in [
+                "tracking_number",
+                "ups_account",
+                "return_proforma_invoice",
+            ]:
+                if request_type not in request_types:
+                    request_types.append(request_type)
+            matched_spans.append(
+                {
+                    "request_type": "return_proforma_invoice",
+                    "span": "UPS UK import clearance instruction template",
+                    "start": 0,
+                    "end_pos": 0,
+                }
+            )
 
         if HUMAN_INTERVENTION_REQUIRED in request_types:
             return self._as_output(
@@ -515,6 +673,57 @@ class RegexEngine:
         suppressed_types: List[str] = []
         effective_request_types = list(real_request_types)
 
+        if (
+            "ups_account" in effective_request_types
+            and not is_explicit_ups_account_request(cleaned_text)
+            and not is_ups_uk_import_clearance_instructions_request(cleaned_text)
+            and (
+                is_ups_receiver_contact_clearance_request(cleaned_text)
+                or is_ups_account_boilerplate_context(cleaned_text)
+            )
+        ):
+            effective_request_types = [
+                request_type
+                for request_type in effective_request_types
+                if request_type != "ups_account"
+            ]
+            suppressed_types.append("ups_account")
+
+        if (
+            "tracking_number" in effective_request_types
+            and not is_explicit_export_tracking_request(cleaned_text)
+            and not is_ups_uk_import_clearance_instructions_request(cleaned_text)
+            and is_tracking_reference_only(cleaned_text)
+        ):
+            effective_request_types = [
+                request_type
+                for request_type in effective_request_types
+                if request_type != "tracking_number"
+            ]
+            suppressed_types.append("tracking_number")
+
+        if is_ups_receiver_contact_clearance_request(cleaned_text):
+            if not is_missing_invoice_request(cleaned_text):
+                removed_document_types = [
+                    request_type
+                    for request_type in effective_request_types
+                    if request_type in {"invoice", "return_proforma_invoice"}
+                ]
+                if removed_document_types:
+                    effective_request_types = [
+                        request_type
+                        for request_type in effective_request_types
+                        if request_type not in {"invoice", "return_proforma_invoice"}
+                    ]
+                    suppressed_types.extend(removed_document_types)
+
+            if "power_of_attorney" not in effective_request_types:
+                for request_type in ["customer_email", "customer_phone"]:
+                    if request_type not in effective_request_types:
+                        effective_request_types.append(request_type)
+            elif "customer_phone" not in effective_request_types:
+                effective_request_types.append("customer_phone")
+
         if "invoice" in effective_request_types and looks_like_commercial_invoice_boilerplate(cleaned_text):
             effective_request_types = [
                 request_type
@@ -522,7 +731,8 @@ class RegexEngine:
                 if request_type not in INVOICE_BOILERPLATE_SUSCEPTIBLE_TYPES
             ]
             suppressed_types = sorted(
-                set(real_request_types) - set(effective_request_types)
+                set(suppressed_types)
+                | (set(real_request_types) - set(effective_request_types))
             )
 
         requested_data = collapse_document_embedded_requested_data(
@@ -546,7 +756,7 @@ class RegexEngine:
 
         if suppressed_types:
             audit_notes.append(
-                "Suppressed commercial-invoice boilerplate fields: "
+                "Suppressed boilerplate/reference fields: "
                 + ", ".join(suppressed_types)
             )
 
