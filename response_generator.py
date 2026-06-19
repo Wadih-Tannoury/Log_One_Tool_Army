@@ -28,6 +28,7 @@ from customs_rules import (
     detect_language_with_dictionary,
     extract_ups_code,
     first_available_value,
+    is_customer_refused_return_request,
     is_returns_customs_clearance,
     normalize_email,
     normalize_language,
@@ -100,15 +101,15 @@ UNPAID_EXTRA_CHARGES_RE = re.compile(
     r"(?:customer|consignee|receiver|destinatario|cliente)"
     r"[\s\S]{0,120}"
     r"(?:did\s+not\s+pay|didn(?:'|’)?t\s+pay|has\s+not\s+paid|not\s+paid|"
-    r"non\s+ha\s+pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r"non\s+ha\s+(?:ancora\s+)?pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
     r"[\s\S]{0,120}"
     r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|charges?|"
-    r"oneri|costi|spese|supplementi|dazi|diritti)|"
+    r"oneri|costi|spese|supplementi|dazi|diritti|addebiti)|"
     r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|charges?|"
-    r"oneri|costi|spese|supplementi|dazi|diritti)"
+    r"oneri|costi|spese|supplementi|dazi|diritti|addebiti)"
     r"[\s\S]{0,120}"
     r"(?:did\s+not\s+pay|didn(?:'|’)?t\s+pay|has\s+not\s+paid|not\s+paid|"
-    r"non\s+ha\s+pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r"non\s+ha\s+(?:ancora\s+)?pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
     r")",
     re.IGNORECASE,
 )
@@ -410,6 +411,10 @@ def collapse_embedded_document_fields(row, requested_data):
     contact_fields_found = False
 
     for data_key in requested_data:
+        if first_returns and data_key == "dichiarazione_di_libera_esportazione":
+            continue
+        if first_request and data_key == "exporter_ein":
+            continue
         if data_key in RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA:
             if "return_proforma_invoice" not in result:
                 result.append("return_proforma_invoice")
@@ -457,10 +462,13 @@ def collapse_embedded_document_fields(row, requested_data):
 def requested_data_for_response(row):
     request_text = row_request_text(row)
 
-    # Response-builder rule: unpaid extra/outstanding charges are answered only
-    # with the UPS account templates, even if upstream detected other fields.
-    if is_unpaid_extra_charges_request(request_text):
+    if is_customer_refused_return_request(request_text):
         return ["ups_account_number"]
+
+    # Unpaid extra/outstanding charges require a human decision about who must
+    # pay.  Do not auto-authorize charges to the UPS account.
+    if is_unpaid_extra_charges_request(request_text):
+        return [HUMAN_INTERVENTION_REQUIRED]
 
     requested_data = normalize_requested_data_with_aliases(row.get("requested_data"))
     requested_data = collapse_embedded_document_fields(row, requested_data)
@@ -633,29 +641,9 @@ def build_ups_returns_first_rpi_account_response(row):
     if carrier_match is False:
         return build_ups_returns_different_carrier_response(row)
 
-    export_tracking = data_value(row, "export_tracking_number")
-    ups_account = data_value(row, "ups_account_number")
-    rpi = data_value(row, "return_proforma_invoice")
-
-    return (
-        "Answer 1:\n"
-        "Buongiorno,\n\n"
-        "In allegato la documentazione per la reintroduzione in franchigia:\n\n"
-        f"- TRK in export: {export_tracking}\n"
-        f"- Cod UPS: {ups_account}\n"
-        f"- Return Proforma Invoice: {rpi}\n\n"
-        "Tutti prodotti sono stati resi.\n\n"
-        "Cordiali saluti,\n\n"
-        "Piero T.\n\n"
-        "Answer 2:\n"
-        "Buongiorno,\n\n"
-        "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
-        "- TRK in export: non disponibile, avvenuto con altro vettore\n"
-        f"- Cod UPS: {ups_account}\n"
-        f"- Return Proforma Invoice: {rpi}\n\n"
-        "Tutti prodotti sono stati resi.\n\n"
-        "Cordiali saluti,\n\n"
-        "Piero T."
+    return build_human_intervention_note(
+        row,
+        "Carrier-code comparison between export and return shipments could not be determined.",
     )
 
 
@@ -713,39 +701,9 @@ def build_fedex_dhl_returns_first_rpi_contact_response(row, carrier="fedex"):
     if carrier_match is False:
         return build_fedex_dhl_returns_different_carrier_response(row)
 
-    awb_export = data_value(row, "export_tracking_number")
-    rpi = data_value(row, "return_proforma_invoice")
-
-    if carrier == "dhl":
-        answer_1_body = (
-            "Buongiorno,\n\n"
-            "In allegato la documentazione richiesta per la reintroduzione in franchigia.\n"
-            f"AWB in export: {awb_export}\n"
-            f"RPI: {rpi}\n"
-            "Cordiali saluti,\n"
-            "Piero T."
-        )
-    else:
-        answer_1_body = (
-            "Buongiorno,\n\n"
-            "In allegato invio la documentazione richiesta.\n\n"
-            f"AWB in export: {awb_export}\n"
-            f"RPI: {rpi}\n"
-            "Cordiali saluti,\n\n"
-            "Piero T."
-        )
-
-    return (
-        "Answer 1:\n"
-        f"{answer_1_body}\n\n"
-        "Answer 2:\n"
-        "Buongiorno,\n\n"
-        "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
-        "AWB in export: non disponibile, avvenuto con altro vettore\n"
-        f"RPI: {rpi}\n\n"
-        "Tutti prodotti sono stati resi.\n\n"
-        "Cordiali saluti,\n\n"
-        "Piero T."
+    return build_human_intervention_note(
+        row,
+        "Carrier-code comparison between export and return shipments could not be determined.",
     )
 
 
@@ -762,6 +720,51 @@ def should_force_human_intervention(row, requested_data):
 
     if is_platform_handoff_request(request_text):
         return True, "FedEx Support Hub handoff request. A human must handle the external portal."
+
+    if is_tracking_lookup_not_found(row):
+        return (
+            True,
+            "Tracking number extracted from the ticket was not found in "
+            "tlg-business-intelligence-prd.bi.shipping_platform_shipments.",
+        )
+
+    if is_unpaid_extra_charges_request(request_text):
+        return (
+            True,
+            "Customer did not pay extra/outstanding charges. Human intervention "
+            "is required to verify whether the customer or TLG should pay.",
+        )
+
+    first_returns_request = is_first_returns_customs_request(
+        row.get("ticket_category"),
+        row.get("request_number", 1),
+    )
+    requested_set = set(requested_data)
+    returns_reply_needs_carrier_decision = False
+
+    if first_returns_request and is_ups_requester_email(row.get("requester_email")):
+        returns_reply_needs_carrier_decision = {
+            "ups_account_number",
+            "return_proforma_invoice",
+        }.issubset(requested_set)
+
+    if first_returns_request and is_fedex_requester_email(row.get("requester_email")):
+        returns_reply_needs_carrier_decision = (
+            "return_proforma_invoice" in requested_set
+            and has_embedded_rpi_contact_fields(row)
+        )
+
+    if first_returns_request and is_dhl_requester_email(row.get("requester_email")):
+        returns_reply_needs_carrier_decision = "return_proforma_invoice" in requested_set
+
+    if returns_reply_needs_carrier_decision and return_export_carriers_are_same(row) is None:
+        return (
+            True,
+            "Carrier-code comparison between the export and return rows in "
+            "tlg-business-intelligence-prd.bi.shipping_platform_shipments could "
+            "not be determined. Human intervention is required instead of "
+            "drafting multiple alternatives.",
+        )
 
     if (
         as_bool(row.get("human_intervention_required"))
