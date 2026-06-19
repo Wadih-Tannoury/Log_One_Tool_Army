@@ -81,6 +81,7 @@ QUOTE_HISTORY_MARKER_RE = re.compile(
 
 SIGNATURE_MARKER_RE = re.compile(
     r"(?im)^\s*(?:"
+    r"thank\s+you(?:\s+(?:again|for\s+your\s+help))?|"
     r"best\s+regards|kind\s+regards|regards|"
     r"cordiali\s+saluti|distinti\s+saluti|saluti"
     r")\s*[,.-]*\s*$"
@@ -173,15 +174,134 @@ UNPAID_EXTRA_CHARGES_RE = re.compile(
     r"(?:customer|consignee|receiver|destinatario|cliente)"
     r"[\s\S]{0,120}"
     r"(?:did\s+not\s+pay|didn['’]?t\s+pay|has\s+not\s+paid|not\s+paid|"
-    r"non\s+ha\s+pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r"non\s+ha\s+(?:ancora\s+)?pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
     r"[\s\S]{0,120}"
     r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|charges?|"
-    r"oneri|costi|spese|supplementi|dazi|diritti)|"
+    r"oneri|costi|spese|supplementi|dazi|diritti|addebiti)|"
     r"(?:extra\s+charges?|outstanding\s+charges?|additional\s+charges?|charges?|"
-    r"oneri|costi|spese|supplementi|dazi|diritti)"
+    r"oneri|costi|spese|supplementi|dazi|diritti|addebiti)"
     r"[\s\S]{0,120}"
     r"(?:did\s+not\s+pay|didn['’]?t\s+pay|has\s+not\s+paid|not\s+paid|"
-    r"non\s+ha\s+pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r"non\s+ha\s+(?:ancora\s+)?pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r")",
+    re.IGNORECASE,
+)
+
+INFORMATIVE_STATUS_UPDATE_RE = re.compile(
+    r"(?:"
+    r"\bi\s+have\s+released\s+the\s+hold\b|"
+    r"\bsubmitted\s+for\s+release\s+with\s+customs\b|"
+    r"\bdesideriamo\s+informarla\b[\s\S]{0,180}\bawb\s+di\s+ritorno\b|"
+    r"\bawb\s+di\s+ritorno\s+(?:e|è)\s+il\s+seguente\b|"
+    r"\bspedizione\s+(?:e|è)\s+attualmente\s+in\s+transito\s+verso\s+il\s+mittente\b"
+    r")",
+    re.IGNORECASE,
+)
+
+CUSTOMER_REFUSED_RETURN_REQUEST_RE = re.compile(
+    r"(?:"
+    r"rifiutat[oa]\s+dal\s+destinatario|"
+    r"destinatario[\s\S]{0,80}rifiutat[oa]|"
+    r"(?:customer|receiver|consignee|recipient)[\s\S]{0,80}\brefus(?:ed|al)\b|"
+    r"\brefus(?:ed|al)\b[\s\S]{0,80}(?:package|parcel|shipment)"
+    r")",
+    re.IGNORECASE,
+)
+
+UPS_RECEIVER_CONTACT_CLEARANCE_RE = re.compile(
+    r"(?:"
+    r"(?:chieda|chiedere)\s+al\s+(?:suo\s+)?destinatario\s+di\s+contattare\s+l['’]?ufficio\s+locale\s+ups|"
+    r"ask\s+the\s+receiver\s+to\s+contact\s+their\s+local\s+ups\s+office|"
+    r"ask\s+the\s+receiver\s+to\s+contact\s+their\s+local\s+ups\s+office\s+and\s+complete\s+clearance|"
+    r"ask\s+the\s+receiver\s+to\s+contact\s+their\s+local\s+ups\s+office\s+to\s+provide\s+the\s+documents"
+    r")",
+    re.IGNORECASE,
+)
+
+ALTERNATIVE_CONTACT_DETAILS_RE = re.compile(
+    r"(?:"
+    r"dettagli\s+alternativi\s+di\s+contatto[\s\S]{0,120}"
+    r"(?:numero\s+di\s+telefono|indirizzo\s+e-?mail|indirizzo\s+email)|"
+    r"alternative\s+contact\s+details[\s\S]{0,120}"
+    r"(?:phone\s+number|email\s+address|e-?mail\s+address)"
+    r")",
+    re.IGNORECASE,
+)
+
+DELIVERY_ADDRESS_PHONE_UNREACHABLE_RE = re.compile(
+    r"(?:"
+    r"indirizzo\s+risulta\s+sconosciuto[\s\S]{0,160}"
+    r"(?:manca\s+il\s+numero\s+civico|numero\s+di\s+telefono[\s\S]{0,80}non\s+(?:e|è)\s+raggiungibile)|"
+    r"manca\s+il\s+numero\s+civico[\s\S]{0,160}"
+    r"numero\s+di\s+telefono[\s\S]{0,80}non\s+(?:e|è)\s+raggiungibile|"
+    r"(?:unknown|incomplete)\s+address[\s\S]{0,160}(?:phone|telephone)[\s\S]{0,80}(?:unreachable|not\s+reachable)"
+    r")",
+    re.IGNORECASE,
+)
+
+MISSING_INVOICE_REQUEST_RE = re.compile(
+    r"(?:"
+    r"(?:priva|privo)\s+della\s+fattura|"
+    r"giunta\s+priva\s+della\s+fattura|"
+    r"fattura\s+(?:mancante|non\s+presente)|"
+    r"(?:fornire|inviare|trasmettere)\s+copia\s+della\s+documentazione[\s\S]{0,120}fattura|"
+    r"shipment[\s\S]{0,120}(?:missing|without)\s+(?:the\s+)?invoice"
+    r")",
+    re.IGNORECASE,
+)
+
+UPS_UK_IMPORT_CLEARANCE_INSTRUCTIONS_RE = re.compile(
+    r"(?:"
+    r"ups\s+brokerage\s+at\s+east\s+midlands\s+airport[\s\S]{0,600}"
+    r"import\s+customs\s+clearance\s+instructions|"
+    r"please\s+provide\s+import\s+customs\s+clearance\s+instructions[\s\S]{0,500}"
+    r"(?:customs\s+procedure|commodity\s+code|eori|vat\s+number|deferment)"
+    r")",
+    re.IGNORECASE,
+)
+
+EXPLICIT_EXPORT_TRACKING_REQUEST_RE = re.compile(
+    r"(?:"
+    r"(?:trk|tracking|awb|lettera\s+di\s+vettura)[\s\S]{0,50}(?:export|andata)|"
+    r"(?:export|andata)[\s\S]{0,50}(?:trk|tracking|awb|lettera\s+di\s+vettura)|"
+    r"(?:please|kindly|provide|send|forward|fornire|fornirci|inviare|inviarci|indicare|richiediamo)"
+    r"[\s\S]{0,80}(?:trk|tracking|awb|lettera\s+di\s+vettura)"
+    r")",
+    re.IGNORECASE,
+)
+
+TRACKING_REFERENCE_MARKER_RE = re.compile(
+    r"(?:"
+    r"tracking\s+number\s*/\s*reference\s+information|"
+    r"tracking\s*#|"
+    r"numero\s+di\s+tracking\s+\d{8,}|"
+    r"\bawb\s+\d{8,}\b"
+    r")",
+    re.IGNORECASE,
+)
+
+UPS_ACCOUNT_BOILERPLATE_CONTEXT_RE = re.compile(
+    r"(?:"
+    r"(?:charges?|costi|spese|tasse|dazi|fees?)"
+    r"[\s\S]{0,140}"
+    r"(?:charged|addebitat[ie])"
+    r"[\s\S]{0,140}"
+    r"(?:shipper['’]?s\s+ups\s+account|mittente)"
+    r"|(?:charged|addebitat[ie])"
+    r"[\s\S]{0,140}"
+    r"(?:shipper['’]?s\s+ups\s+account|mittente)"
+    r"[\s\S]{0,140}"
+    r"(?:charges?|costi|spese|tasse|dazi|fees?)"
+    r")",
+    re.IGNORECASE,
+)
+
+EXPLICIT_UPS_ACCOUNT_REQUEST_RE = re.compile(
+    r"(?:"
+    r"(?:please|kindly|provide|send|forward|fornire|fornirci|inviare|inviarci|indicare|richiediamo|necessitiamo|prego)"
+    r"[\s\S]{0,90}(?:ups\s+account(?:\s+number)?|codice\s+(?:di\s+)?abbonamento\s+ups|cod\s+ups)|"
+    r"(?:ups\s+account(?:\s+number)?|codice\s+(?:di\s+)?abbonamento\s+ups|cod\s+ups)"
+    r"[\s\S]{0,90}(?:please|kindly|provide|send|forward|fornire|fornirci|inviare|inviarci|indicare|richiediamo|necessitiamo|prego)"
     r")",
     re.IGNORECASE,
 )
@@ -334,6 +454,85 @@ def is_unpaid_extra_charges_request(text: object) -> bool:
     return bool(UNPAID_EXTRA_CHARGES_RE.search(normalize_whitespace(text)))
 
 
+def is_informative_status_update_only(text: object) -> bool:
+    """True when the latest message is an operational update, not a data request."""
+    cleaned = normalize_whitespace(text)
+    if not cleaned:
+        return False
+    if not INFORMATIVE_STATUS_UPDATE_RE.search(cleaned):
+        return False
+
+    # A status update can still contain a real request after the update.  Keep
+    # this guard narrow by allowing only messages without explicit request verbs.
+    return not bool(REQUEST_LANGUAGE_RE.search(cleaned))
+
+
+def is_customer_refused_return_request(text: object) -> bool:
+    """True when the carrier reports a refused package and asks how to proceed."""
+    cleaned = normalize_whitespace(text)
+    if not cleaned or not CUSTOMER_REFUSED_RETURN_REQUEST_RE.search(cleaned):
+        return False
+
+    return bool(
+        re.search(
+            r"(?:come\s+desiderate\s+procedere|come\s+vorre(?:sti|ste|bbe)\s+procedere|"
+            r"how\s+(?:you\s+)?(?:would\s+like\s+us\s+to\s+)?proceed|"
+            r"provide\s+instructions|fornire\s+istruzioni)",
+            cleaned,
+            re.IGNORECASE,
+        )
+    )
+
+
+def is_ups_receiver_contact_clearance_request(text: object) -> bool:
+    """
+    True for UPS ERN-style templates where the actionable response is customer
+    contact data, even when the template phrases it as receiver-local-office
+    contact/clearance instructions.
+    """
+    cleaned = normalize_whitespace(text)
+    return bool(
+        UPS_RECEIVER_CONTACT_CLEARANCE_RE.search(cleaned)
+        or ALTERNATIVE_CONTACT_DETAILS_RE.search(cleaned)
+    )
+
+
+def is_delivery_address_phone_unreachable_request(text: object) -> bool:
+    """True when delivery failed because address details and phone are unusable."""
+    return bool(DELIVERY_ADDRESS_PHONE_UNREACHABLE_RE.search(normalize_whitespace(text)))
+
+
+def is_missing_invoice_request(text: object) -> bool:
+    """True when the shipment is held because the invoice is missing."""
+    return bool(MISSING_INVOICE_REQUEST_RE.search(normalize_whitespace(text)))
+
+
+def is_ups_uk_import_clearance_instructions_request(text: object) -> bool:
+    """True for the UPS UK import-clearance instruction template in returns flows."""
+    return bool(UPS_UK_IMPORT_CLEARANCE_INSTRUCTIONS_RE.search(normalize_whitespace(text)))
+
+
+def is_explicit_export_tracking_request(text: object) -> bool:
+    """True when tracking/AWB wording is an actual export-tracking request."""
+    return bool(EXPLICIT_EXPORT_TRACKING_REQUEST_RE.search(normalize_whitespace(text)))
+
+
+def is_tracking_reference_only(text: object) -> bool:
+    """True when tracking/AWB appears as a shipment reference, not requested data."""
+    cleaned = normalize_whitespace(text)
+    return bool(TRACKING_REFERENCE_MARKER_RE.search(cleaned)) and not is_explicit_export_tracking_request(cleaned)
+
+
+def is_explicit_ups_account_request(text: object) -> bool:
+    """True when the sender explicitly asks TLG to provide/use a UPS account code."""
+    return bool(EXPLICIT_UPS_ACCOUNT_REQUEST_RE.search(normalize_whitespace(text)))
+
+
+def is_ups_account_boilerplate_context(text: object) -> bool:
+    """True when UPS account wording appears only in return/disposal cost boilerplate."""
+    return bool(UPS_ACCOUNT_BOILERPLATE_CONTEXT_RE.search(normalize_whitespace(text)))
+
+
 def is_ups_requester_email(email: object) -> bool:
     normalized = normalize_email(email)
     return normalized in UPS_BROKERAGE_EMAILS or normalized.endswith("@ups.com")
@@ -397,6 +596,7 @@ def collapse_document_embedded_requested_data(
     rpi_document_fields_found = False
     first_request_rpi_response_fields_found = False
     first_request = normalize_request_number(request_number) == 1
+    first_returns = is_first_returns_customs_request(ticket_category, request_number)
 
     for value in values:
         if value in RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA:
@@ -410,10 +610,13 @@ def collapse_document_embedded_requested_data(
             continue
         if value == "declaration_of_intent":
             value = "dichiarazione_di_libera_esportazione"
+        if first_returns and value == "dichiarazione_di_libera_esportazione":
+            continue
+        if first_request and value == "exporter_ein":
+            continue
         if value not in result:
             result.append(value)
 
-    first_returns = is_first_returns_customs_request(ticket_category, request_number)
     text = normalize_whitespace(request_text)
     field_phrase_found = bool(DOCUMENT_FIELD_PHRASE_RE.search(text))
 
