@@ -18,6 +18,8 @@ If `tracking_not_found_in_shipping_platform_shipments` is true, regex processing
 
 FedEx Support Hub handoff requests are classified as human intervention because a human must handle the external portal. They must not produce a customer-facing email draft.
 
+If a Returns Customs Clearance first-request response depends on comparing export and return `carrier_code` values, but the comparison cannot be determined from `tlg-business-intelligence-prd.bi.shipping_platform_shipments`, do not draft two alternatives. Create a human-intervention note.
+
 ## Tracking Not Found in Shipments Table Rule
 
 When the tracking number extracted from the ticket is not found in `tlg-business-intelligence-prd.bi.shipping_platform_shipments`, the regex layer must not process the request. The row must be sent only to the LLM.
@@ -60,31 +62,11 @@ Cordiali saluti,
 
 ## UPS Extra Charges Rule
 
-When the request says the customer/receiver/destinatario did not pay extra or outstanding charges, classify only `ups_account_number` and draft two alternatives.
+When the request says the customer/receiver/destinatario did not pay extra or outstanding charges, do not authorize payment automatically and do not draft a UPS-account response. Create a human-intervention note because a human must verify whether the customer or TLG should pay the extra charges.
 
-```text
-Response 1:
-Hello,
+## Customer Refused Package Rule
 
-Please, debit the outstanding charges to our UPS account <UPS account>, authorized by Piero Trevisan and proceed with the delivery.
-
-Best regards,
-
-Piero T.
-
-Response 2:
-Hello,
-
-I confirm you the return of shipment on topic.
-Debit all the relative costs to our UPS account <UPS account>, authorized by Piero T.
-You can find attached the LOA
-
-Best regards
-
-Piero T.
-```
-
-For other cases where the only requested data is `ups_account_number`, draft:
+When the carrier says the customer/receiver refused the package and asks how to proceed, classify as `ups_account_number` and draft the standard UPS account/LOA return-cost response:
 
 ```text
 Hello,
@@ -97,6 +79,8 @@ Best regards
 
 Piero T.
 ```
+
+For other cases where the only requested data is `ups_account_number`, draft the same standard UPS account/LOA response.
 
 ## Return Customs Clearance Carrier-Match Lookup Rule
 
@@ -106,7 +90,7 @@ Compare the `carrier_code` for the row where `is_return = true` with the `carrie
 
 - If the two `carrier_code` values are the same, use the response that includes the export tracking/AWB retrieved from the `is_return = false` row.
 - If the two `carrier_code` values are different, use the response that says the export tracking/AWB is not available because the export shipment happened with another carrier.
-- If the order cannot be found, or either carrier code is unavailable, keep the existing two-answer fallback so a human can choose the correct option.
+- If the order cannot be found, or either carrier code is unavailable, create a human-intervention note instead of drafting multiple alternatives.
 
 ## UPS Returns Customs Clearance First Request
 
@@ -148,39 +132,7 @@ Cordiali saluti,
 Piero T.
 ```
 
-If the order/carrier comparison cannot be determined, draft two alternatives:
-
-```text
-Answer 1:
-Buongiorno,
-
-In allegato la documentazione per la reintroduzione in franchigia:
-
-- TRK in export: <retrieved value or placeholder>
-- Cod UPS: <retrieved value or placeholder>
-- Return Proforma Invoice: <retrieved value or placeholder>
-
-Tutti prodotti sono stati resi.
-
-Cordiali saluti,
-
-Piero T.
-
-Answer 2:
-Buongiorno,
-
-Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.
-
-- TRK in export: non disponibile, avvenuto con altro vettore
-- Cod UPS: <retrieved value or placeholder>
-- Return Proforma Invoice: <retrieved value or placeholder>
-
-Tutti prodotti sono stati resi.
-
-Cordiali saluti,
-
-Piero T.
-```
+If the order/carrier comparison cannot be determined, create a human-intervention note instead of drafting two alternatives.
 
 ## FedEx/DHL Returns Customs Clearance RPI Contact/Address Rule
 
@@ -231,63 +183,7 @@ Cordiali saluti,
 Piero T.
 ```
 
-If the order/carrier comparison cannot be determined, draft two alternatives. Use the carrier-specific first answer and the shared second answer.
-
-FedEx fallback:
-
-```text
-Answer 1:
-Buongiorno,
-
-In allegato invio la documentazione richiesta.
-
-AWB in export: <retrieved value or placeholder>
-RPI: <retrieved value or placeholder>
-Cordiali saluti,
-
-Piero T.
-
-Answer 2:
-Buongiorno,
-
-Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.
-
-AWB in export: non disponibile, avvenuto con altro vettore
-RPI: <retrieved value or placeholder>
-
-Tutti prodotti sono stati resi.
-
-Cordiali saluti,
-
-Piero T.
-```
-
-DHL fallback:
-
-```text
-Answer 1:
-Buongiorno,
-
-In allegato la documentazione richiesta per la reintroduzione in franchigia.
-AWB in export: <retrieved value or placeholder>
-RPI: <retrieved value or placeholder>
-Cordiali saluti,
-Piero T.
-
-Answer 2:
-Buongiorno,
-
-Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.
-
-AWB in export: non disponibile, avvenuto con altro vettore
-RPI: <retrieved value or placeholder>
-
-Tutti prodotti sono stati resi.
-
-Cordiali saluti,
-
-Piero T.
-```
+If the order/carrier comparison cannot be determined, create a human-intervention note instead of drafting two alternatives.
 
 ## DHL Returns Customs Clearance First Request
 
@@ -322,7 +218,7 @@ Cordiali saluti,
 Piero T.
 ```
 
-If the order/carrier comparison cannot be determined, draft the DHL two-answer fallback shown in the FedEx/DHL rule above.
+If the order/carrier comparison cannot be determined, create a human-intervention note instead of drafting two alternatives.
 
 ## Power of Attorney Only
 
