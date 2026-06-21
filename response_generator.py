@@ -24,9 +24,11 @@ from response_data_extractor import (
     FULL_ORDER_LOOKUP_KEYS,
     FULL_ORDER_RESPONSE_COLUMNS,
     GetFullOrderClient,
+    document_path_exists,
     document_value_for_response,
     fetch_shipment_order_data,
     generate_authorization_letter,
+    generate_documents_for_dataframe,
     generate_power_of_attorney,
     tracking_number_for_documents,
     ups_account_number_for_documents,
@@ -276,8 +278,15 @@ def full_order_data_value(row, data_key):
 
 def generated_document_value(row, data_key):
     column = DOCUMENT_RESPONSE_COLUMNS.get(data_key)
-    if column and not is_blank(row.get(column)):
-        return document_value_for_response(row.get(column))
+    existing_path = row.get(column) if column else None
+    if column and not is_blank(existing_path):
+        text_path = str(existing_path).strip()
+        if re.match(r"^[a-z][a-z0-9+.-]*://", text_path, flags=re.IGNORECASE) or document_path_exists(text_path):
+            return document_value_for_response(text_path)
+        print(
+            "WARNING: Stored generated document path does not exist locally; "
+            f"regenerating {data_key} for request_id={row.get('request_id')}: {text_path}"
+        )
 
     try:
         if data_key == "authorization_letter":
@@ -644,6 +653,22 @@ def enrich_with_full_order_data(df):
     return df
 
 
+def generated_document_is_ready(row, data_key):
+    column = DOCUMENT_RESPONSE_COLUMNS.get(data_key)
+    if not column:
+        return False
+
+    value = row.get(column)
+    if is_blank(value):
+        return False
+
+    text_value = str(value).strip()
+    return bool(
+        re.match(r"^[a-z][a-z0-9+.-]*://", text_value, flags=re.IGNORECASE)
+        or document_path_exists(text_value)
+    )
+
+
 def missing_required_full_order_values(row, requested_data):
     missing = []
 
@@ -667,6 +692,11 @@ def missing_required_full_order_values(row, requested_data):
             missing.append("authorization_letter_ups_account_number")
         if is_blank(row.get(FULL_ORDER_SHIPPED_AT_COLUMN)):
             missing.append("authorization_letter_export_date")
+        if not generated_document_is_ready(row, "authorization_letter"):
+            missing.append("authorization_letter_pdf")
+
+    if needs_poa and not generated_document_is_ready(row, "power_of_attorney"):
+        missing.append("power_of_attorney_pdf")
 
     return missing
 
@@ -1041,6 +1071,7 @@ def main():
         return
 
     df = enrich_with_full_order_data(df)
+    df = generate_documents_for_dataframe(df)
 
     if "request_language" not in df.columns:
         df["request_language"] = df.apply(row_language, axis=1)
