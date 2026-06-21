@@ -17,6 +17,18 @@ import re
 
 import pandas as pd
 
+from response_data_extractor import (
+    DocumentGenerationError,
+    FULL_ORDER_RESPONSE_COLUMNS,
+    GetFullOrderClient,
+    document_value_for_response,
+    fetch_shipment_order_data,
+    generate_authorization_letter,
+    generate_power_of_attorney,
+    tracking_number_for_documents,
+    ups_account_number_for_documents,
+)
+
 from ticket_fetcher import append_history_rows
 from pipeline_io import REQUEST_INTENT_RESULTS_PATH, read_dataframe
 from customs_rules import (
@@ -40,6 +52,16 @@ INPUT_PATH = REQUEST_INTENT_RESULTS_PATH
 AUTO_ADD_UPS_MIN_CONFIDENCE = float(os.getenv("AUTO_ADD_UPS_MIN_CONFIDENCE", "0.90"))
 
 DHL_BROKERAGE_EMAIL = os.getenv("DHL_BROKERAGE_EMAIL", "kamil.it@dhl.com")
+
+FULL_ORDER_DATA_KEYS = {
+    "return_proforma_invoice",
+    "commercial_invoice",
+    "customer_email",
+    "customer_phone",
+}
+FULL_ORDER_LOOKUP_KEYS = FULL_ORDER_DATA_KEYS | {"authorization_letter"}
+FULL_ORDER_SHIPPED_AT_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["shipped_at"]
+FULL_ORDER_API_ERROR_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["api_error"]
 
 # Keep this local to response generation so the generator remains safe even if
 # upstream regex/LLM output still contains older aliases.
@@ -169,9 +191,12 @@ DATA_LABELS = {
 def is_blank(value):
     if value is None:
         return True
-    if isinstance(value, float) and pd.isna(value):
-        return True
-    return str(value).strip().lower() in {"", "nan", "none", "n/a", "na"}
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip().lower() in {"", "nan", "none", "n/a", "na", "<na>"}
 
 
 def as_bool(value):
@@ -241,11 +266,41 @@ def label_for(data_key, language):
     return labels.get(data_key, data_key.replace("_", " ").title())
 
 
+def full_order_column_for_data_key(data_key):
+    return FULL_ORDER_RESPONSE_COLUMNS.get(data_key)
+
+
+def full_order_data_value(row, data_key):
+    column = full_order_column_for_data_key(data_key)
+    if not column:
+        return PLACEHOLDER
+    return first_available_value(row.get(column), default=PLACEHOLDER)
+
+
+def generated_document_value(row, data_key):
+    try:
+        if data_key == "authorization_letter":
+            return document_value_for_response(generate_authorization_letter(row))
+        if data_key == "power_of_attorney":
+            return document_value_for_response(generate_power_of_attorney(row))
+    except DocumentGenerationError as exc:
+        print(
+            "WARNING: Could not generate "
+            f"{data_key} for request_id={row.get('request_id')}: {exc}"
+        )
+    except Exception as exc:  # pragma: no cover - defensive runtime guard
+        print(
+            "WARNING: Unexpected document-generation error for "
+            f"{data_key} request_id={row.get('request_id')}: {exc}"
+        )
+
+    return PLACEHOLDER
+
+
 def data_value(row, data_key):
     if data_key == "export_tracking_number":
         return first_available_value(
             row.get("shipment_tracking_number"),
-            row.get("extracted_tracking_number"),
             default=PLACEHOLDER,
         )
 
@@ -256,6 +311,12 @@ def data_value(row, data_key):
             row.get("return_tracking_number"),
         )
         return ups_code or PLACEHOLDER
+
+    if data_key in FULL_ORDER_DATA_KEYS:
+        return full_order_data_value(row, data_key)
+
+    if data_key in {"authorization_letter", "power_of_attorney"}:
+        return generated_document_value(row, data_key)
 
     return PLACEHOLDER
 
@@ -491,6 +552,119 @@ def requested_data_for_response(row):
     return requested_data
 
 
+def row_needs_full_order_lookup(row, requested_data=None):
+    requested_data = requested_data if requested_data is not None else requested_data_for_response(row)
+    requested_set = set(requested_data)
+
+    if requested_set & FULL_ORDER_LOOKUP_KEYS:
+        return True
+
+    # The standard UPS-account response promises an LOA, and the LOA export date
+    # comes from GET_FULL_ORDER.shipments[].shippedAt.
+    return requested_data == ["ups_account_number"] and is_ups_requester_email(row.get("requester_email"))
+
+
+def _initialize_full_order_columns(df):
+    for column in FULL_ORDER_RESPONSE_COLUMNS.values():
+        if column not in df.columns:
+            df[column] = None
+    return df
+
+
+def enrich_with_full_order_data(df):
+    if df.empty:
+        return df
+
+    df = _initialize_full_order_columns(df.copy())
+    requested_data_by_index = {}
+
+    for index, row in df.iterrows():
+        requested_data = requested_data_for_response(row)
+        requested_data_by_index[index] = requested_data
+
+    lookup_indices = [
+        index
+        for index, row in df.iterrows()
+        if row_needs_full_order_lookup(row, requested_data_by_index[index])
+    ]
+
+    if not lookup_indices:
+        return df
+
+    try:
+        client = GetFullOrderClient()
+    except Exception as exc:
+        print(f"WARNING: GET_FULL_ORDER client could not be configured: {exc}")
+        for index in lookup_indices:
+            df.at[index, FULL_ORDER_API_ERROR_COLUMN] = str(exc)
+        return df
+
+    if not client.is_configured:
+        message = "Missing GET_FULL_ORDER_API_CREDENTIALS"
+        print(f"WARNING: {message}; API-backed response data will be unavailable.")
+        for index in lookup_indices:
+            df.at[index, FULL_ORDER_API_ERROR_COLUMN] = message
+        return df
+
+    cache = {}
+
+    for index in lookup_indices:
+        shipment_order_number = df.at[index, "shipment_order_number"] if "shipment_order_number" in df.columns else None
+
+        if is_blank(shipment_order_number):
+            df.at[index, FULL_ORDER_API_ERROR_COLUMN] = "Missing shipment_order_number for GET_FULL_ORDER lookup"
+            continue
+
+        cache_key = str(shipment_order_number).strip().upper()
+
+        if cache_key not in cache:
+            try:
+                cache[cache_key] = fetch_shipment_order_data(
+                    shipment_order_number,
+                    client=client,
+                )
+            except Exception as exc:
+                print(
+                    "WARNING: GET_FULL_ORDER lookup failed for "
+                    f"shipment_order_number={shipment_order_number}: {exc}"
+                )
+                cache[cache_key] = {FULL_ORDER_API_ERROR_COLUMN: str(exc)}
+
+        for column, value in cache[cache_key].items():
+            if column not in df.columns:
+                df[column] = None
+            df.at[index, column] = value
+
+    return df
+
+
+def missing_required_full_order_values(row, requested_data):
+    missing = []
+
+    for data_key in sorted(set(requested_data) & FULL_ORDER_DATA_KEYS):
+        column = full_order_column_for_data_key(data_key)
+        if column and is_blank(row.get(column)):
+            missing.append(data_key)
+
+    needs_loa = "authorization_letter" in requested_data or (
+        requested_data == ["ups_account_number"]
+        and is_ups_requester_email(row.get("requester_email"))
+    )
+    needs_poa = "power_of_attorney" in requested_data
+
+    if needs_loa or needs_poa:
+        if is_blank(tracking_number_for_documents(row)):
+            missing.append("document_tracking_number")
+
+    if needs_loa:
+        if is_blank(ups_account_number_for_documents(row)):
+            missing.append("authorization_letter_ups_account_number")
+        if is_blank(row.get(FULL_ORDER_SHIPPED_AT_COLUMN)):
+            missing.append("authorization_letter_export_date")
+
+    return missing
+
+
 def build_human_intervention_note(row, reason):
     ticket_id = row.get("zendesk_ticket_id", "")
     request_number = row.get("request_number", "")
@@ -568,6 +742,7 @@ def build_generic_response(row, requested_data, language):
 
 def build_ups_extra_charges_response(row):
     ups_account = data_value(row, "ups_account_number")
+    loa = data_value(row, "authorization_letter")
 
     return (
         "Response 1:\n"
@@ -580,7 +755,7 @@ def build_ups_extra_charges_response(row):
         "Hello,\n\n"
         "I confirm you the return of shipment on topic.\n"
         f"Debit all the relative costs to our UPS account {ups_account}, authorized by Piero T.\n"
-        "You can find attached the LOA\n\n"
+        f"LOA: {loa}\n\n"
         "Best regards\n\n"
         "Piero T."
     )
@@ -588,12 +763,13 @@ def build_ups_extra_charges_response(row):
 
 def build_ups_account_standard_response(row):
     ups_account = data_value(row, "ups_account_number")
+    loa = data_value(row, "authorization_letter")
 
     return (
         "Hello,\n\n"
         "I confirm you the return of shipment on topic.\n"
         f"Debit all the relative costs to our UPS account {ups_account}, authorized by Piero T.\n"
-        "You can find attached the LOA\n\n"
+        f"LOA: {loa}\n\n"
         "Best regards\n\n"
         "Piero T."
     )
@@ -735,6 +911,18 @@ def should_force_human_intervention(row, requested_data):
             "is required to verify whether the customer or TLG should pay.",
         )
 
+    missing_full_order_values = missing_required_full_order_values(row, requested_data)
+    if missing_full_order_values:
+        api_error = str(row.get(FULL_ORDER_API_ERROR_COLUMN) or "").strip()
+        reason = (
+            "GET_FULL_ORDER API data is missing for: "
+            + ", ".join(missing_full_order_values)
+            + "."
+        )
+        if api_error:
+            reason += f" API detail: {api_error}"
+        return True, reason
+
     first_returns_request = is_first_returns_customs_request(
         row.get("ticket_category"),
         row.get("request_number", 1),
@@ -842,6 +1030,8 @@ def main():
     if df.empty:
         print("No request intent rows found. Nothing to log to BigQuery history.")
         return
+
+    df = enrich_with_full_order_data(df)
 
     if "request_language" not in df.columns:
         df["request_language"] = df.apply(row_language, axis=1)
