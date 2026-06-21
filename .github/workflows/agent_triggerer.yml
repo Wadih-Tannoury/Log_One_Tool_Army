@@ -3,9 +3,6 @@ name: Log One Tool Army
 on:
   workflow_dispatch:
 
-  schedule:
-    - cron: "0 * * * *"
-
 jobs:
   process_requests:
     runs-on: ubuntu-latest
@@ -19,6 +16,7 @@ jobs:
       ZENDESK_API_CREDENTIALS: ${{ secrets.ZENDESK_API_CREDENTIALS }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: gemini-2.5-flash
+      GET_FULL_ORDER_API_CREDENTIALS: ${{ secrets.GET_FULL_ORDER_API_CREDENTIALS }}
       LOG_HISTORY_TABLE: tlg-business-intelligence-prd.til.log_one_tool_army_logs_history
 
     steps:
@@ -43,7 +41,8 @@ jobs:
             google-auth \
             google-cloud-bigquery \
             google-cloud-bigquery-storage \
-            google-genai
+            google-genai \
+            pymupdf
 
       - name: Initialize Workflow Run
         run: python -c "import uuid; print(f'WORKFLOW_RUN_ID={uuid.uuid4()}')" >> "$GITHUB_ENV"
@@ -77,6 +76,14 @@ jobs:
         run: |
           ls -lah output
           test -f output/request_intent_results.jsonl.gz
+
+      - name: Upload Generated PDF Documents
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-customs-documents
+          path: output/generated_documents
+          if-no-files-found: ignore
 
       - name: Workflow Complete
         run: |
