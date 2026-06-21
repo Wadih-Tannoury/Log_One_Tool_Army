@@ -245,3 +245,57 @@ Procura / delega: [TO BE RETRIEVED]
 
 Cordiali saluti,
 ```
+
+## GET_FULL_ORDER API Data Enrichment
+
+After `requested_data` has been finalized, `response_generator.py` uses `response_data_extractor.py` to enrich rows that need order-backed data through the GET_FULL_ORDER API.
+
+For a `shipment_order_number` such as `DG-EUA01663254`:
+
+- brand path segment: first two characters, `DG`;
+- order path segment: replace the 6th character with `-`, producing `DG-EU-01663254`;
+- final URL shape: `https://zelda.thelevelgroup.com/return/api/v1/brands/DG/orders/DG-EU-01663254`.
+
+The API credentials come from the `GET_FULL_ORDER_API_CREDENTIALS` repository secret, with this JSON shape:
+
+```json
+{
+  "client_id": "...",
+  "client_secret": "..."
+}
+```
+
+The full order payload can contain several shipments. The response generator must use only the shipment block where `shipmentOrderNumber` equals the current `shipment_order_number`.
+
+From that shipment block:
+
+- `return_proforma_invoice`: use `erpDocuments.invoiceDocuments[].documentLink` where `documentType = "RPI"`, preferring `intercompanyDocument = true`; if no intercompany RPI exists, use the first RPI document link.
+- `commercial_invoice`: use `erpDocuments.invoiceDocuments[].documentLink` where `documentType = "INV"`, preferring `intercompanyDocument = true`; if no intercompany INV exists, use the first INV document link.
+- `customer_email`: use `customer.email`.
+- `customer_phone`: use `customer.customerNumber`.
+- LOA export date: use shipment `shippedAt`, formatted from API ISO datetime to `dd/mm/yyyy`.
+
+`export_tracking_number` does not come from GET_FULL_ORDER. It is the existing `shipment_tracking_number` retrieved from `tlg-business-intelligence-prd.bi.shipping_platform_shipments`.
+
+If API data required for an automatic response is missing, create a human-intervention note rather than sending a placeholder for that API-backed item.
+
+## Generated PDF Documents
+
+PDF templates are stored in `templates/pdf`.
+
+Generated copies are written under `output/generated_documents` and uploaded as the `generated-customs-documents` GitHub Actions artifact.
+
+For `authorization_letter` / LOA, generate `output/generated_documents/authorization_letter/<extracted_tracking_number>.pdf` and fill:
+
+- UPS Account number: the same UPS account value already extracted from the UPS tracking number;
+- Export date: GET_FULL_ORDER shipment `shippedAt`, formatted `dd/mm/yyyy`;
+- Date: generation date, formatted `dd/mm/yyyy`;
+- Tracking number(s): `extracted_tracking_number`;
+- `to our UPS account`: same UPS account value.
+
+For `power_of_attorney` / POA, generate `output/generated_documents/power_of_attorney/<extracted_tracking_number>.pdf` and fill:
+
+- UPS Tracking Number: `extracted_tracking_number`;
+- Date `(β)`: generation date, formatted `mm/dd/yyyy`.
+
+Draft responses should include the generated file path as a Markdown-style link when the document is referenced.
