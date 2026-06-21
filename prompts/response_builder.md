@@ -283,9 +283,9 @@ If API data required for an automatic response is missing, create a human-interv
 
 PDF templates are stored in `templates/pdf`.
 
-Generated copies are written under `output/generated_documents` and uploaded as the `generated-customs-documents` GitHub Actions artifact.
+Generated copies are written under the top-level `generated_documents` folder, committed by the workflow before draft generation, and uploaded as the `generated-customs-documents` GitHub Actions artifact.
 
-For `authorization_letter` / LOA, generate `output/generated_documents/authorization_letter/<extracted_tracking_number>.pdf` and fill:
+For `authorization_letter` / LOA, generate `generated_documents/authorization_letter/<extracted_tracking_number>.pdf` and fill:
 
 - UPS Account number: the same UPS account value already extracted from the UPS tracking number;
 - Export date: GET_FULL_ORDER shipment `shippedAt`, formatted `dd/mm/yyyy`;
@@ -293,7 +293,7 @@ For `authorization_letter` / LOA, generate `output/generated_documents/authoriza
 - Tracking number(s): `extracted_tracking_number`;
 - `to our UPS account`: same UPS account value.
 
-For `power_of_attorney` / POA, generate `output/generated_documents/power_of_attorney/<extracted_tracking_number>.pdf` and fill:
+For `power_of_attorney` / POA, generate `generated_documents/power_of_attorney/<extracted_tracking_number>.pdf` and fill:
 
 - UPS Tracking Number: `extracted_tracking_number`;
 - Date `(β)`: generation date, formatted `mm/dd/yyyy`.
