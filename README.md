@@ -4,7 +4,7 @@ Agent pipeline that fetches active Zendesk customs-clearance tickets, detects th
 
 ## GET_FULL_ORDER enrichment
 
-`response_generator.py` enriches rows after `requested_data` has been finalized using `response_data_extractor.py`. It calls the GET_FULL_ORDER API only for rows that need order-backed data:
+The GitHub Actions workflow runs `response_data_extractor.py` immediately after `intent_detection.py` and before `response_generator.py`. The extractor reads `output/request_intent_results.jsonl.gz`, enriches the rows after `requested_data` has been finalized, writes the enriched rows back to the same handoff file, and then `response_generator.py` builds the final draft responses. It calls the GET_FULL_ORDER API only for rows that need order-backed data:
 
 - `return_proforma_invoice`
 - `commercial_invoice`
@@ -62,8 +62,29 @@ output/generated_documents/power_of_attorney/<extracted_tracking_number>.pdf
 The GitHub Actions workflow uploads `output/generated_documents` as the `generated-customs-documents` artifact so filled LOA and POA PDFs can be verified after each run.
 
 
-## Response data extractor module
+## Response data extractor script
 
 All GET_FULL_ORDER API extraction and generated-PDF logic lives in `response_data_extractor.py`. The older split-module design (`full_order_api.py` plus `document_generator.py`) is no longer used.
+
+The workflow triggers it directly with:
+
+```bash
+python response_data_extractor.py
+```
+
+By default, the script reads and overwrites:
+
+```text
+output/request_intent_results.jsonl.gz
+```
+
+Optional local/debug flags:
+
+```bash
+python response_data_extractor.py --input output/request_intent_results.jsonl.gz --output output/request_intent_results.jsonl.gz
+python response_data_extractor.py --fetch-all
+python response_data_extractor.py --skip-documents
+python response_data_extractor.py --force-documents
+```
 
 The extractor expects the current GET_FULL_ORDER structure where the payload has top-level `order.customer`, top-level `shipments`, each shipment has `shipmentOrderNumber`, and the shipment date is `shippedAt`. It also accepts legacy `shipped_at` as a fallback.
