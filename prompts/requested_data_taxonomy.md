@@ -70,3 +70,16 @@ Classification:
 ```json
 ["commercial_invoice"]
 ```
+
+## Runtime Data Sources
+
+After classification, the response generator retrieves these values from the GET_FULL_ORDER API when they are requested:
+
+- `return_proforma_invoice`
+- `commercial_invoice`
+- `customer_email`
+- `customer_phone`
+
+The response generator also uses the API shipment `shippedAt` value to fill generated LOA PDFs. `export_tracking_number` remains sourced from the BigQuery `shipment_tracking_number` value.
+
+Generated PDF documents use templates stored in `templates/pdf` and are written under `output/generated_documents`.
