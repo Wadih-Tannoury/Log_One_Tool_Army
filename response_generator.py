@@ -18,7 +18,10 @@ import re
 import pandas as pd
 
 from response_data_extractor import (
+    DOCUMENT_RESPONSE_COLUMNS,
     DocumentGenerationError,
+    FULL_ORDER_DATA_KEYS,
+    FULL_ORDER_LOOKUP_KEYS,
     FULL_ORDER_RESPONSE_COLUMNS,
     GetFullOrderClient,
     document_value_for_response,
@@ -53,15 +56,9 @@ AUTO_ADD_UPS_MIN_CONFIDENCE = float(os.getenv("AUTO_ADD_UPS_MIN_CONFIDENCE", "0.
 
 DHL_BROKERAGE_EMAIL = os.getenv("DHL_BROKERAGE_EMAIL", "kamil.it@dhl.com")
 
-FULL_ORDER_DATA_KEYS = {
-    "return_proforma_invoice",
-    "commercial_invoice",
-    "customer_email",
-    "customer_phone",
-}
-FULL_ORDER_LOOKUP_KEYS = FULL_ORDER_DATA_KEYS | {"authorization_letter"}
 FULL_ORDER_SHIPPED_AT_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["shipped_at"]
 FULL_ORDER_API_ERROR_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["api_error"]
+DOCUMENT_GENERATION_ERROR_COLUMN = DOCUMENT_RESPONSE_COLUMNS["document_error"]
 
 # Keep this local to response generation so the generator remains safe even if
 # upstream regex/LLM output still contains older aliases.
@@ -278,6 +275,10 @@ def full_order_data_value(row, data_key):
 
 
 def generated_document_value(row, data_key):
+    column = DOCUMENT_RESPONSE_COLUMNS.get(data_key)
+    if column and not is_blank(row.get(column)):
+        return document_value_for_response(row.get(column))
+
     try:
         if data_key == "authorization_letter":
             return document_value_for_response(generate_authorization_letter(row))
@@ -571,6 +572,10 @@ def _initialize_full_order_columns(df):
     return df
 
 
+def row_has_full_order_attempt(row):
+    return any(not is_blank(row.get(column)) for column in FULL_ORDER_RESPONSE_COLUMNS.values())
+
+
 def enrich_with_full_order_data(df):
     if df.empty:
         return df
@@ -586,6 +591,7 @@ def enrich_with_full_order_data(df):
         index
         for index, row in df.iterrows()
         if row_needs_full_order_lookup(row, requested_data_by_index[index])
+        and not row_has_full_order_attempt(row)
     ]
 
     if not lookup_indices:
@@ -921,6 +927,9 @@ def should_force_human_intervention(row, requested_data):
         )
         if api_error:
             reason += f" API detail: {api_error}"
+        document_error = str(row.get(DOCUMENT_GENERATION_ERROR_COLUMN) or "").strip()
+        if document_error:
+            reason += f" Document detail: {document_error}"
         return True, reason
 
     first_returns_request = is_first_returns_customs_request(
