@@ -3,12 +3,13 @@ name: Log One Tool Army
 on:
   workflow_dispatch:
 
+
 jobs:
   process_requests:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read
+      contents: write
 
     env:
       PROJECT_ID: tlg-business-intelligence-prd
@@ -17,6 +18,8 @@ jobs:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: gemini-2.5-flash
       GET_FULL_ORDER_API_CREDENTIALS: ${{ secrets.GET_FULL_ORDER_API_CREDENTIALS }}
+      GENERATED_DOCUMENTS_DIR: generated_documents
+      DOCUMENT_PUBLIC_BASE_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}
       LOG_HISTORY_TABLE: tlg-business-intelligence-prd.til.log_one_tool_army_logs_history
 
     steps:
@@ -72,6 +75,25 @@ jobs:
       - name: Extract API-Backed Response Data and Documents
         run: python response_data_extractor.py
 
+      - name: Persist Generated PDF Documents in Repository
+        run: |
+          if [ ! -d generated_documents ] || ! find generated_documents -type f -name '*.pdf' | grep -q .; then
+            echo "No generated PDF documents to persist."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add generated_documents
+
+          if git diff --cached --quiet; then
+            echo "Generated PDF documents are already tracked and unchanged."
+            exit 0
+          fi
+
+          git commit -m "Add generated customs documents for $WORKFLOW_RUN_ID"
+          git push
+
       - name: Generate Draft Responses and Log to BigQuery
         run: python response_generator.py
 
@@ -85,7 +107,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: generated-customs-documents
-          path: output/generated_documents
+          path: generated_documents
           if-no-files-found: ignore
 
       - name: Workflow Complete
