@@ -14,6 +14,7 @@ API-backed response data and generated customs documents:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -27,7 +28,15 @@ import fitz
 import requests
 from requests.auth import HTTPBasicAuth
 
-from customs_rules import PLACEHOLDER, extract_ups_code, first_available_value
+from customs_rules import (
+    PLACEHOLDER,
+    UPS_BROKERAGE_EMAIL,
+    extract_ups_code,
+    first_available_value,
+    normalize_email,
+    normalize_requested_data,
+)
+from pipeline_io import REQUEST_INTENT_RESULTS_PATH, read_dataframe, write_dataframe
 
 DEFAULT_BASE_URL = "https://zelda.thelevelgroup.com/return/api/v1"
 CREDENTIALS_ENV = "GET_FULL_ORDER_API_CREDENTIALS"
@@ -44,6 +53,39 @@ FULL_ORDER_RESPONSE_COLUMNS = {
     "shipped_at": "full_order_shipped_at",
     "api_error": "full_order_api_error",
 }
+
+FULL_ORDER_DATA_KEYS = {
+    "return_proforma_invoice",
+    "commercial_invoice",
+    "customer_email",
+    "customer_phone",
+}
+FULL_ORDER_LOOKUP_KEYS = FULL_ORDER_DATA_KEYS | {"authorization_letter"}
+DOCUMENT_DATA_KEYS = {"authorization_letter", "power_of_attorney"}
+
+DOCUMENT_RESPONSE_COLUMNS = {
+    "authorization_letter": "generated_authorization_letter_path",
+    "power_of_attorney": "generated_power_of_attorney_path",
+    "document_error": "generated_document_error",
+}
+
+REQUESTED_DATA_ALIASES = {
+    "ups_account": "ups_account_number",
+    "ups_account_code": "ups_account_number",
+    "ups_code": "ups_account_number",
+    "invoice": "commercial_invoice",
+    "commercial_invoice_required": "commercial_invoice",
+    "invoice_correction": "corrected_invoice",
+    "declaration_of_intent": "dichiarazione_di_libera_esportazione",
+}
+
+REQUESTED_DATA_SOURCE_COLUMNS = (
+    "requested_data",
+    "regex_requested_data",
+    "regex_request_types",
+    "request_types",
+    "standard_reply_requested_data",
+)
 
 TEMPLATE_DIR = Path(os.getenv("PDF_TEMPLATE_DIR", "templates/pdf"))
 LOA_TEMPLATE_PATH = Path(
@@ -254,6 +296,267 @@ def safe_filename(value: object) -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
     text = text.strip("._-")
     return text or "document"
+
+
+def normalize_data_key(value: object) -> str:
+    key = str(value or "").strip()
+    return REQUESTED_DATA_ALIASES.get(key, key)
+
+
+def normalize_requested_data_with_aliases(value: object) -> list[str]:
+    cleaned: list[str] = []
+    for item in normalize_requested_data(value):
+        key = normalize_data_key(item)
+        if key and key not in cleaned:
+            cleaned.append(key)
+    return cleaned
+
+
+def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
+    keys: list[str] = []
+    for column in REQUESTED_DATA_SOURCE_COLUMNS:
+        for key in normalize_requested_data_with_aliases(row.get(column)):
+            if key and key not in keys:
+                keys.append(key)
+    return keys
+
+
+def _email_domain(email: object) -> str:
+    normalized = normalize_email(email)
+    if "@" not in normalized:
+        return ""
+    return normalized.rsplit("@", 1)[-1]
+
+
+def is_ups_requester_email(email: object) -> bool:
+    normalized = normalize_email(email)
+    domain = _email_domain(email)
+    return normalized == UPS_BROKERAGE_EMAIL or domain == "ups.com" or domain.endswith(".ups.com")
+
+
+def row_needs_full_order_lookup(
+    row: Mapping[str, Any],
+    requested_data: list[str] | None = None,
+) -> bool:
+    requested_data = requested_data if requested_data is not None else requested_data_keys_from_row(row)
+    requested_set = set(requested_data)
+
+    if requested_set & FULL_ORDER_LOOKUP_KEYS:
+        return True
+
+    # The standard UPS-account draft includes an LOA.  The LOA export date comes
+    # from GET_FULL_ORDER.shipments[].shippedAt, so the lookup is still needed.
+    return requested_data == ["ups_account_number"] and is_ups_requester_email(row.get("requester_email"))
+
+
+def row_needs_document_generation(
+    row: Mapping[str, Any],
+    requested_data: list[str] | None = None,
+) -> bool:
+    requested_data = requested_data if requested_data is not None else requested_data_keys_from_row(row)
+    requested_set = set(requested_data)
+
+    if requested_set & DOCUMENT_DATA_KEYS:
+        return True
+
+    # The standard UPS-account reply includes the generated LOA even when
+    # authorization_letter was not explicitly requested as standalone data.
+    return requested_data == ["ups_account_number"] and is_ups_requester_email(row.get("requester_email"))
+
+
+def _initialize_response_data_columns(df):
+    for column in FULL_ORDER_RESPONSE_COLUMNS.values():
+        if column not in df.columns:
+            df[column] = None
+    for column in DOCUMENT_RESPONSE_COLUMNS.values():
+        if column not in df.columns:
+            df[column] = None
+    return df
+
+
+def row_has_full_order_attempt(row: Mapping[str, Any]) -> bool:
+    return any(not is_blank(row.get(column)) for column in FULL_ORDER_RESPONSE_COLUMNS.values())
+
+
+def enrich_dataframe_with_full_order_data(
+    df,
+    *,
+    client: GetFullOrderClient | None = None,
+    fetch_all: bool = False,
+    skip_existing: bool = True,
+):
+    """Enrich request rows with GET_FULL_ORDER values and return the DataFrame.
+
+    This function is used by the standalone workflow step.  It writes API data
+    back to the local handoff file before response_generator.py builds the final
+    draft, making response_data_extractor.py an explicit part of the pipeline.
+    """
+
+    if df.empty:
+        return df
+
+    df = _initialize_response_data_columns(df.copy())
+    requested_data_by_index = {
+        index: requested_data_keys_from_row(row)
+        for index, row in df.iterrows()
+    }
+
+    lookup_indices = []
+    for index, row in df.iterrows():
+        if skip_existing and row_has_full_order_attempt(row):
+            continue
+        if fetch_all:
+            needs_lookup = not is_blank(row.get("shipment_order_number"))
+        else:
+            needs_lookup = row_needs_full_order_lookup(row, requested_data_by_index[index])
+        if needs_lookup:
+            lookup_indices.append(index)
+
+    if not lookup_indices:
+        print("No rows need GET_FULL_ORDER enrichment.")
+        return df
+
+    try:
+        api_client = client or GetFullOrderClient()
+    except Exception as exc:
+        print(f"WARNING: GET_FULL_ORDER client could not be configured: {exc}")
+        for index in lookup_indices:
+            df.at[index, FULL_ORDER_RESPONSE_COLUMNS["api_error"]] = str(exc)
+        return df
+
+    if not api_client.is_configured:
+        message = "Missing GET_FULL_ORDER_API_CREDENTIALS"
+        print(f"WARNING: {message}; API-backed response data will be unavailable.")
+        for index in lookup_indices:
+            df.at[index, FULL_ORDER_RESPONSE_COLUMNS["api_error"]] = message
+        return df
+
+    cache: dict[str, dict[str, Any]] = {}
+
+    for index in lookup_indices:
+        shipment_order_number = df.at[index, "shipment_order_number"] if "shipment_order_number" in df.columns else None
+        if is_blank(shipment_order_number):
+            df.at[index, FULL_ORDER_RESPONSE_COLUMNS["api_error"]] = "Missing shipment_order_number for GET_FULL_ORDER lookup"
+            continue
+
+        cache_key = str(shipment_order_number).strip().upper()
+        if cache_key not in cache:
+            try:
+                cache[cache_key] = fetch_shipment_order_data(
+                    shipment_order_number,
+                    client=api_client,
+                )
+            except Exception as exc:
+                print(
+                    "WARNING: GET_FULL_ORDER lookup failed for "
+                    f"shipment_order_number={shipment_order_number}: {exc}"
+                )
+                cache[cache_key] = {FULL_ORDER_RESPONSE_COLUMNS["api_error"]: str(exc)}
+
+        for column, value in cache[cache_key].items():
+            if column not in df.columns:
+                df[column] = None
+            df.at[index, column] = value
+
+    print(f"GET_FULL_ORDER enrichment attempted for {len(lookup_indices)} row(s).")
+    return df
+
+
+def generate_documents_for_dataframe(df, *, force: bool = False):
+    if df.empty:
+        return df
+
+    df = _initialize_response_data_columns(df.copy())
+    generated = 0
+
+    for index, row in df.iterrows():
+        requested_data = requested_data_keys_from_row(row)
+        if not row_needs_document_generation(row, requested_data):
+            continue
+
+        needs_loa = "authorization_letter" in requested_data or (
+            requested_data == ["ups_account_number"] and is_ups_requester_email(row.get("requester_email"))
+        )
+        needs_poa = "power_of_attorney" in requested_data
+
+        if needs_loa:
+            column = DOCUMENT_RESPONSE_COLUMNS["authorization_letter"]
+            if force or is_blank(row.get(column)):
+                try:
+                    row_data = df.loc[index].to_dict()
+                    df.at[index, column] = generate_authorization_letter(row_data)
+                    generated += 1
+                except Exception as exc:
+                    message = f"authorization_letter: {exc}"
+                    print(f"WARNING: Could not generate authorization_letter for row {index}: {exc}")
+                    df.at[index, DOCUMENT_RESPONSE_COLUMNS["document_error"]] = message
+
+        if needs_poa:
+            column = DOCUMENT_RESPONSE_COLUMNS["power_of_attorney"]
+            if force or is_blank(row.get(column)):
+                try:
+                    row_data = df.loc[index].to_dict()
+                    df.at[index, column] = generate_power_of_attorney(row_data)
+                    generated += 1
+                except Exception as exc:
+                    message = f"power_of_attorney: {exc}"
+                    existing_error = df.at[index, DOCUMENT_RESPONSE_COLUMNS["document_error"]]
+                    if not is_blank(existing_error):
+                        message = f"{existing_error}; {message}"
+                    print(f"WARNING: Could not generate power_of_attorney for row {index}: {exc}")
+                    df.at[index, DOCUMENT_RESPONSE_COLUMNS["document_error"]] = message
+
+    print(f"Generated {generated} PDF document(s).")
+    return df
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Enrich request-intent rows with GET_FULL_ORDER data and generated PDF documents."
+    )
+    parser.add_argument(
+        "--input",
+        default=str(REQUEST_INTENT_RESULTS_PATH),
+        help="Compressed JSONL handoff to read. Defaults to output/request_intent_results.jsonl.gz.",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(REQUEST_INTENT_RESULTS_PATH),
+        help="Compressed JSONL handoff to write. Defaults to the same request-intent file.",
+    )
+    parser.add_argument(
+        "--fetch-all",
+        action="store_true",
+        help="Call GET_FULL_ORDER for every row with a shipment_order_number, not only rows whose requested_data needs it.",
+    )
+    parser.add_argument(
+        "--skip-documents",
+        action="store_true",
+        help="Skip LOA/POA PDF generation.",
+    )
+    parser.add_argument(
+        "--force-documents",
+        action="store_true",
+        help="Regenerate LOA/POA PDFs even when generated paths already exist in the handoff.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    df = read_dataframe(args.input)
+
+    if df.empty:
+        print("No request-intent rows found. Nothing to enrich.")
+        write_dataframe(df, args.output)
+        return
+
+    df = enrich_dataframe_with_full_order_data(df, fetch_all=args.fetch_all)
+    if not args.skip_documents:
+        df = generate_documents_for_dataframe(df, force=args.force_documents)
+
+    write_dataframe(df, args.output)
+    print(f"Response data extraction completed for {len(df)} row(s). Wrote {args.output}.")
 
 
 def brand_from_shipment_order_number(shipment_order_number: object) -> str:
@@ -699,3 +1002,7 @@ def generate_power_of_attorney(row: Mapping[str, Any]) -> str:
 
 def document_value_for_response(document_path: str | None) -> str:
     return document_reference(document_path)
+
+
+if __name__ == "__main__":
+    main()
