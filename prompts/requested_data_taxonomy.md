@@ -79,7 +79,8 @@ After classification, the response generator retrieves these values from the GET
 - `commercial_invoice`
 - `customer_email`
 - `customer_phone`
+- `returned_items_confirmation`, extracted from `items[].sku`, `items[].productName`, and `items[].imageUrl`
 
 The response generator also uses the API shipment `shippedAt` value to fill generated LOA PDFs. `export_tracking_number` remains sourced from the BigQuery `shipment_tracking_number` value.
 
-Generated PDF documents use templates stored in `templates/pdf` and are written under the top-level `generated_documents` folder so the workflow can persist them in the repository.
+Generated PDF documents use templates stored in `templates/pdf` and are written under the top-level `generated_documents` folder so the workflow can persist them in the repository. Invoice PDFs selected from GET_FULL_ORDER are downloaded to `generated_documents/invoice`.
