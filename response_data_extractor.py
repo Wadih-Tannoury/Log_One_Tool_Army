@@ -20,9 +20,10 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from html import unescape as html_unescape
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import fitz
 import requests
@@ -46,6 +47,7 @@ TOKEN_URL_ENV = "GET_FULL_ORDER_API_TOKEN_URL"
 TIMEOUT_ENV = "GET_FULL_ORDER_API_TIMEOUT_SECONDS"
 INVOICE_DOWNLOAD_TIMEOUT_ENV = "INVOICE_PDF_DOWNLOAD_TIMEOUT_SECONDS"
 INVOICE_DOWNLOAD_USER_AGENT_ENV = "INVOICE_PDF_DOWNLOAD_USER_AGENT"
+INVOICE_DOWNLOAD_MAX_ATTEMPTS_ENV = "INVOICE_PDF_DOWNLOAD_MAX_ATTEMPTS"
 
 FULL_ORDER_RESPONSE_COLUMNS = {
     "return_proforma_invoice": "full_order_return_proforma_invoice",
@@ -1009,6 +1011,191 @@ def _download_timeout() -> float:
     return float(os.getenv(INVOICE_DOWNLOAD_TIMEOUT_ENV, os.getenv(TIMEOUT_ENV, "60")))
 
 
+def _download_max_attempts() -> int:
+    try:
+        return max(1, int(os.getenv(INVOICE_DOWNLOAD_MAX_ATTEMPTS_ENV, "12")))
+    except ValueError:
+        return 12
+
+
+def _invoice_download_headers(referer: str | None = None) -> dict[str, str]:
+    headers = {
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "application/pdf,application/octet-stream,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": os.getenv(
+            INVOICE_DOWNLOAD_USER_AGENT_ENV,
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        ),
+    }
+    if referer:
+        headers["Referer"] = referer
+    return headers
+
+
+def _looks_like_pdf(sample: bytes, content_type: object) -> bool:
+    return b"%PDF" in sample or "pdf" in str(content_type or "").lower()
+
+
+def _decode_response_bytes(content: bytes, response: requests.Response | None = None) -> str:
+    encodings = []
+    if response is not None:
+        if response.encoding:
+            encodings.append(response.encoding)
+        apparent_encoding = getattr(response, "apparent_encoding", None)
+        if apparent_encoding:
+            encodings.append(apparent_encoding)
+    encodings.extend(["utf-8", "latin-1"])
+
+    for encoding in encodings:
+        try:
+            return content.decode(encoding, errors="replace")
+        except LookupError:
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
+def _append_invoice_candidate(candidates: list[str], seen: set[str], candidate: str) -> None:
+    cleaned = str(candidate or "").strip().strip('"\'')
+    if not cleaned or cleaned.startswith(("#", "javascript:", "mailto:", "tel:")):
+        return
+    cleaned = cleaned.replace("&amp;", "&")
+    normalized = cleaned.split("#", 1)[0]
+    if normalized and normalized not in seen:
+        seen.add(normalized)
+        candidates.append(normalized)
+
+
+def _invoice_candidates_from_html(html: str, base_url: str) -> list[str]:
+    """Return browser-download targets embedded in a DocOpen.aspx HTML wrapper."""
+
+    if not html:
+        return []
+
+    text = html_unescape(unquote(html)).replace("\\/", "/")
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    patterns = [
+        # href/src/action attributes, including the iframe/link/button patterns often
+        # emitted by simple ASP.NET download pages.
+        r"(?:href|src|data|action|formaction)\s*=\s*[\"']([^\"']+)[\"']",
+        r"(?:href|src|data|action|formaction)\s*=\s*([^\s>]+)",
+        # JavaScript redirects that Chrome follows but requests does not execute.
+        r"(?:window\.)?(?:location(?:\.href)?|document\.location)\s*=\s*[\"']([^\"']+)[\"']",
+        r"(?:window\.open|location\.assign|location\.replace)\s*\(\s*[\"']([^\"']+)[\"']",
+        # Meta refresh redirects.
+        r"http-equiv\s*=\s*[\"']?refresh[\"']?[^>]+content\s*=\s*[\"'][^\"']*?url=([^\"']+)",
+        r"content\s*=\s*[\"'][^\"']*?url=([^\"']+)",
+        # Fully-qualified or relative PDF URLs embedded in script blocks.
+        r"(https?://[^\s\"'<>]+?\.pdf(?:\?[^\s\"'<>]*)?)",
+        r"((?:/|\./|\.\./)?[A-Za-z0-9_./%=&?+-]+?\.pdf(?:\?[^\s\"'<>]*)?)",
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            raw_candidate = match.group(1).strip().rstrip(";,)>\"")
+            if not raw_candidate:
+                continue
+            absolute_candidate = urljoin(base_url, raw_candidate)
+            _append_invoice_candidate(candidates, seen, absolute_candidate)
+
+    parsed = urlparse(base_url)
+    query_values = parse_qs(parsed.query)
+    link_values = query_values.get("link") or query_values.get("filename") or query_values.get("file")
+    if link_values:
+        filename = str(link_values[0] or "").strip()
+        if filename:
+            quoted_filename = quote(filename, safe="/._-%")
+            current_name = Path(parsed.path).name.lower()
+            for replacement in (
+                "DocDownload.aspx",
+                "DocFile.aspx",
+                "FileDownload.aspx",
+                "Download.aspx",
+                "DownloadFile.aspx",
+                "GetFile.aspx",
+            ):
+                if current_name == replacement.lower():
+                    continue
+                candidate = parsed._replace(
+                    path=str(Path(parsed.path).with_name(replacement)),
+                    query=f"link={quoted_filename}",
+                    fragment="",
+                ).geturl()
+                _append_invoice_candidate(candidates, seen, candidate)
+
+            direct_candidate = urljoin(base_url, quoted_filename)
+            _append_invoice_candidate(candidates, seen, direct_candidate)
+
+    return candidates
+
+
+def _download_invoice_candidate(
+    requester: requests.Session,
+    url: str,
+    output_path: Path,
+    *,
+    referer: str | None = None,
+) -> tuple[bool, str, str, list[str]]:
+    """Try one URL. Return (saved_pdf, content_type, final_url, html_candidates)."""
+
+    response: requests.Response | None = None
+    temp_path = output_path.with_name(f".{output_path.name}.tmp")
+    sample = b""
+    bytes_written = 0
+
+    try:
+        response = requester.get(
+            url,
+            stream=True,
+            timeout=_download_timeout(),
+            allow_redirects=True,
+            headers=_invoice_download_headers(referer),
+        )
+        response.raise_for_status()
+
+        with temp_path.open("wb") as file:
+            for chunk in response.iter_content(chunk_size=128 * 1024):
+                if not chunk:
+                    continue
+                if len(sample) < 4096:
+                    sample = (sample + chunk)[:4096]
+                bytes_written += len(chunk)
+                file.write(chunk)
+
+        if bytes_written == 0:
+            raise DocumentGenerationError(f"Downloaded invoice PDF was empty: {url}")
+
+        content_type = str(response.headers.get("Content-Type", "") or "").lower()
+        final_url = str(response.url or url)
+        if _looks_like_pdf(sample, content_type):
+            temp_path.replace(output_path)
+            return True, content_type, final_url, []
+
+        content = temp_path.read_bytes()
+        html_candidates: list[str] = []
+        if "html" in content_type or b"<html" in sample.lower() or b"<script" in sample.lower():
+            html = _decode_response_bytes(content, response)
+            html_candidates = _invoice_candidates_from_html(html, final_url)
+
+        if temp_path.exists():
+            temp_path.unlink()
+        return False, content_type, final_url, html_candidates
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
+    finally:
+        if response is not None:
+            response.close()
+
+
 def download_invoice_pdf(
     source_link: object,
     data_key: str,
@@ -1016,7 +1203,12 @@ def download_invoice_pdf(
     row: Mapping[str, Any] | None = None,
     session: requests.Session | None = None,
 ) -> str:
-    """Download an invoice PDF link into generated_documents/invoice."""
+    """Download an invoice PDF link into generated_documents/invoice.
+
+    Some DocOpen.aspx links return an HTML wrapper that Chrome executes before
+    downloading the real PDF. This function follows regular redirects and also
+    resolves PDF links or JavaScript/meta-refresh redirects found in that wrapper.
+    """
 
     source = str(source_link or "").strip()
     if is_blank(source):
@@ -1031,58 +1223,52 @@ def download_invoice_pdf(
     if output_path.exists() and output_path.is_file() and output_path.stat().st_size > 0:
         return output_path.as_posix()
 
-    headers = {
-        "Accept": "application/pdf,application/octet-stream,*/*",
-        "User-Agent": os.getenv(
-            INVOICE_DOWNLOAD_USER_AGENT_ENV,
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        ),
-    }
     requester = session or requests.Session()
-    response: requests.Response | None = None
-    temp_path = output_path.with_name(f".{output_path.name}.tmp")
-    sample = b""
-    bytes_written = 0
+    candidates = [source]
+    seen = {source.split("#", 1)[0]}
+    last_content_type = "unknown"
+    last_url = source
+    last_error = ""
+    attempted: list[str] = []
+    max_attempts = _download_max_attempts()
 
     try:
-        response = requester.get(
-            source,
-            stream=True,
-            timeout=_download_timeout(),
-            allow_redirects=True,
-            headers=headers,
+        while candidates and len(attempted) < max_attempts:
+            candidate = candidates.pop(0)
+            attempted.append(candidate)
+            try:
+                saved, content_type, final_url, html_candidates = _download_invoice_candidate(
+                    requester,
+                    candidate,
+                    output_path,
+                    referer=source if candidate != source else None,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                last_url = candidate
+                continue
+
+            last_content_type = content_type or "unknown"
+            last_url = final_url or candidate
+            if saved:
+                return output_path.as_posix()
+
+            for html_candidate in html_candidates:
+                normalized = html_candidate.split("#", 1)[0]
+                if normalized not in seen:
+                    seen.add(normalized)
+                    candidates.append(html_candidate)
+
+        attempted_summary = ", ".join(attempted[:4])
+        if len(attempted) > 4:
+            attempted_summary += f", ... ({len(attempted)} total)"
+        error_detail = f"; last error: {last_error}" if last_error else ""
+        raise DocumentGenerationError(
+            "Downloaded invoice content did not resolve to a PDF "
+            f"(last Content-Type: {last_content_type}; last URL: {last_url}; "
+            f"attempted: {attempted_summary}; max attempts: {max_attempts}{error_detail})"
         )
-        response.raise_for_status()
-
-        with temp_path.open("wb") as file:
-            for chunk in response.iter_content(chunk_size=128 * 1024):
-                if not chunk:
-                    continue
-                if len(sample) < 1024:
-                    sample = (sample + chunk)[:1024]
-                bytes_written += len(chunk)
-                file.write(chunk)
-
-        if bytes_written == 0:
-            raise DocumentGenerationError(f"Downloaded invoice PDF was empty: {source}")
-
-        content_type = str(response.headers.get("Content-Type", "") or "").lower()
-        if b"%PDF" not in sample and "pdf" not in content_type:
-            raise DocumentGenerationError(
-                "Downloaded invoice content did not look like a PDF "
-                f"(Content-Type: {content_type or 'unknown'})"
-            )
-
-        temp_path.replace(output_path)
-        return output_path.as_posix()
-    except Exception:
-        if temp_path.exists():
-            temp_path.unlink()
-        raise
     finally:
-        if response is not None:
-            response.close()
         if session is None and isinstance(requester, requests.Session):
             requester.close()
 
