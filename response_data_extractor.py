@@ -1043,16 +1043,32 @@ def _looks_like_pdf(sample: bytes, content_type: object) -> bool:
 
 
 def _decode_response_bytes(content: bytes, response: requests.Response | None = None) -> str:
-    encodings = []
+    """Decode already-downloaded response bytes without touching response.content.
+
+    The invoice downloader streams responses to a temp file first. After a streamed
+    response has been consumed, requests.Response.apparent_encoding tries to read
+    response.content again and raises "The content for this response was already
+    consumed". Keep decoding based only on headers plus safe fallbacks.
+    """
+
+    encodings: list[str] = []
     if response is not None:
         if response.encoding:
             encodings.append(response.encoding)
-        apparent_encoding = getattr(response, "apparent_encoding", None)
-        if apparent_encoding:
-            encodings.append(apparent_encoding)
-    encodings.extend(["utf-8", "latin-1"])
 
+        content_type = str(response.headers.get("Content-Type", "") or "")
+        charset_match = re.search(r"charset=([A-Za-z0-9_.:-]+)", content_type, flags=re.IGNORECASE)
+        if charset_match:
+            encodings.append(charset_match.group(1))
+
+    encodings.extend(["utf-8", "utf-8-sig", "latin-1"])
+
+    tried: set[str] = set()
     for encoding in encodings:
+        normalized = str(encoding or "").strip().lower()
+        if not normalized or normalized in tried:
+            continue
+        tried.add(normalized)
         try:
             return content.decode(encoding, errors="replace")
         except LookupError:
