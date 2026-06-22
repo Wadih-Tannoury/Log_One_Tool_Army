@@ -271,6 +271,7 @@ From that shipment block:
 
 - `return_proforma_invoice`: use `erpDocuments.invoiceDocuments[].documentLink` where `documentType = "RPI"`, preferring `intercompanyDocument = true`; if no intercompany RPI exists, use the first RPI document link.
 - `commercial_invoice`: use `erpDocuments.invoiceDocuments[].documentLink` where `documentType = "INV"`, preferring `intercompanyDocument = true`; if no intercompany INV exists, use the first INV document link.
+- `returned_items_confirmation`: use the GET_FULL_ORDER `items[]` array and extract `sku`, `productName`, and `imageUrl` for each returned item.
 - `customer_email`: use `customer.email`.
 - `customer_phone`: use `customer.customerNumber`.
 - LOA export date: use shipment `shippedAt`, formatted from API ISO datetime to `dd/mm/yyyy`.
@@ -279,11 +280,15 @@ From that shipment block:
 
 If API data required for an automatic response is missing, create a human-intervention note rather than sending a placeholder for that API-backed item.
 
+If `previously_requested_documentation` is detected, do not write a customer-facing line such as `Documentazione precedentemente richiesta: [TO BE RETRIEVED]`; omit that item because the previously requested documents are unknown.
+
 ## Generated PDF Documents
 
 PDF templates are stored in `templates/pdf`.
 
-Generated copies are written under the top-level `generated_documents` folder, committed by the workflow before draft generation, and uploaded as the `generated-customs-documents` GitHub Actions artifact.
+Generated and downloaded copies are written under the top-level `generated_documents` folder, committed by the workflow before draft generation, and uploaded as the `generated-customs-documents` GitHub Actions artifact.
+
+When `return_proforma_invoice` or `commercial_invoice` is requested, download the selected `documentLink` PDF and save it under `generated_documents/invoice/<invoice_filename>.pdf`. Use the saved file path in the draft response.
 
 For `authorization_letter` / LOA, generate `generated_documents/authorization_letter/<extracted_tracking_number>.pdf` and fill:
 
