@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import fitz
 import requests
@@ -44,10 +44,13 @@ BASE_URL_ENV = "GET_FULL_ORDER_API_BASE_URL"
 AUTH_MODE_ENV = "GET_FULL_ORDER_AUTH_MODE"
 TOKEN_URL_ENV = "GET_FULL_ORDER_API_TOKEN_URL"
 TIMEOUT_ENV = "GET_FULL_ORDER_API_TIMEOUT_SECONDS"
+INVOICE_DOWNLOAD_TIMEOUT_ENV = "INVOICE_PDF_DOWNLOAD_TIMEOUT_SECONDS"
+INVOICE_DOWNLOAD_USER_AGENT_ENV = "INVOICE_PDF_DOWNLOAD_USER_AGENT"
 
 FULL_ORDER_RESPONSE_COLUMNS = {
     "return_proforma_invoice": "full_order_return_proforma_invoice",
     "commercial_invoice": "full_order_commercial_invoice",
+    "returned_items_confirmation": "full_order_returned_items",
     "customer_email": "full_order_customer_email",
     "customer_phone": "full_order_customer_phone",
     "shipped_at": "full_order_shipped_at",
@@ -57,15 +60,19 @@ FULL_ORDER_RESPONSE_COLUMNS = {
 FULL_ORDER_DATA_KEYS = {
     "return_proforma_invoice",
     "commercial_invoice",
+    "returned_items_confirmation",
     "customer_email",
     "customer_phone",
 }
 FULL_ORDER_LOOKUP_KEYS = FULL_ORDER_DATA_KEYS | {"authorization_letter"}
 DOCUMENT_DATA_KEYS = {"authorization_letter", "power_of_attorney"}
+INVOICE_DOCUMENT_DATA_KEYS = {"return_proforma_invoice", "commercial_invoice"}
 
 DOCUMENT_RESPONSE_COLUMNS = {
     "authorization_letter": "generated_authorization_letter_path",
     "power_of_attorney": "generated_power_of_attorney_path",
+    "return_proforma_invoice": "generated_return_proforma_invoice_path",
+    "commercial_invoice": "generated_commercial_invoice_path",
     "document_error": "generated_document_error",
 }
 
@@ -363,7 +370,7 @@ def row_needs_document_generation(
     requested_data = requested_data if requested_data is not None else requested_data_keys_from_row(row)
     requested_set = set(requested_data)
 
-    if requested_set & DOCUMENT_DATA_KEYS:
+    if requested_set & (DOCUMENT_DATA_KEYS | INVOICE_DOCUMENT_DATA_KEYS):
         return True
 
     # The standard UPS-account reply includes the generated LOA even when
@@ -469,6 +476,14 @@ def enrich_dataframe_with_full_order_data(
     return df
 
 
+def _append_document_error(df, index: object, message: str) -> None:
+    error_column = DOCUMENT_RESPONSE_COLUMNS["document_error"]
+    existing_error = df.at[index, error_column] if error_column in df.columns else None
+    if not is_blank(existing_error):
+        message = f"{existing_error}; {message}"
+    df.at[index, error_column] = message
+
+
 def generate_documents_for_dataframe(df, *, force: bool = False):
     if df.empty:
         return df
@@ -486,6 +501,31 @@ def generate_documents_for_dataframe(df, *, force: bool = False):
         )
         needs_poa = "power_of_attorney" in requested_data
 
+        for invoice_key in sorted(set(requested_data) & INVOICE_DOCUMENT_DATA_KEYS):
+            column = DOCUMENT_RESPONSE_COLUMNS[invoice_key]
+            existing_path = row.get(column)
+            if not force and not is_blank(existing_path) and document_path_exists(existing_path):
+                continue
+
+            source_column = FULL_ORDER_RESPONSE_COLUMNS[invoice_key]
+            source_link = row.get(source_column)
+            if is_blank(source_link):
+                # The full-order missing-value check will block the automatic reply.
+                continue
+
+            try:
+                row_data = df.loc[index].to_dict()
+                df.at[index, column] = download_invoice_pdf(
+                    source_link,
+                    invoice_key,
+                    row=row_data,
+                )
+                generated += 1
+            except Exception as exc:
+                message = f"{invoice_key}: {exc}"
+                print(f"WARNING: Could not download {invoice_key} PDF for row {index}: {exc}")
+                _append_document_error(df, index, message)
+
         if needs_loa:
             column = DOCUMENT_RESPONSE_COLUMNS["authorization_letter"]
             existing_path = row.get(column)
@@ -497,7 +537,7 @@ def generate_documents_for_dataframe(df, *, force: bool = False):
                 except Exception as exc:
                     message = f"authorization_letter: {exc}"
                     print(f"WARNING: Could not generate authorization_letter for row {index}: {exc}")
-                    df.at[index, DOCUMENT_RESPONSE_COLUMNS["document_error"]] = message
+                    _append_document_error(df, index, message)
 
         if needs_poa:
             column = DOCUMENT_RESPONSE_COLUMNS["power_of_attorney"]
@@ -509,13 +549,10 @@ def generate_documents_for_dataframe(df, *, force: bool = False):
                     generated += 1
                 except Exception as exc:
                     message = f"power_of_attorney: {exc}"
-                    existing_error = df.at[index, DOCUMENT_RESPONSE_COLUMNS["document_error"]]
-                    if not is_blank(existing_error):
-                        message = f"{existing_error}; {message}"
                     print(f"WARNING: Could not generate power_of_attorney for row {index}: {exc}")
-                    df.at[index, DOCUMENT_RESPONSE_COLUMNS["document_error"]] = message
+                    _append_document_error(df, index, message)
 
-    print(f"Generated {generated} PDF document(s).")
+    print(f"Generated or downloaded {generated} PDF document(s).")
     return df
 
 
@@ -677,6 +714,66 @@ def _invoice_documents_from_shipment(shipment: Mapping[str, Any] | None) -> list
     return [document for document in invoice_documents if isinstance(document, Mapping)]
 
 
+def _items_from_payload(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    items = payload.get("items")
+    if items is None and isinstance(payload.get("order"), Mapping):
+        items = payload["order"].get("items")
+    if items is None:
+        items = _find_first_key(payload, "items")
+
+    if not isinstance(items, list):
+        return []
+
+    return [item for item in items if isinstance(item, Mapping)]
+
+
+def _clean_item_field(value: object) -> str:
+    if is_blank(value):
+        return ""
+    return str(value).strip()
+
+
+def extract_returned_items(payload: Mapping[str, Any]) -> list[dict[str, str]]:
+    returned_items: list[dict[str, str]] = []
+
+    for item in _items_from_payload(payload):
+        returned_item = {
+            "sku": _clean_item_field(_get_any(item, ("sku", "SKU"))),
+            "productName": _clean_item_field(
+                _get_any(item, ("productName", "product_name", "name", "productTitle"))
+            ),
+            "imageUrl": _clean_item_field(
+                _get_any(item, ("imageUrl", "image_url", "imageURL", "image", "imageLink"))
+            ),
+        }
+        if any(returned_item.values()):
+            returned_items.append(returned_item)
+
+    return returned_items
+
+
+def format_returned_items(returned_items: Iterable[Mapping[str, str]]) -> str | None:
+    lines: list[str] = []
+
+    for item in returned_items:
+        parts = []
+        sku = _clean_item_field(item.get("sku"))
+        product_name = _clean_item_field(item.get("productName"))
+        image_url = _clean_item_field(item.get("imageUrl"))
+
+        if sku:
+            parts.append(f"SKU: {sku}")
+        if product_name:
+            parts.append(f"Product: {product_name}")
+        if image_url:
+            parts.append(f"Image: {image_url}")
+
+        if parts:
+            lines.append("  - " + "; ".join(parts))
+
+    return "\n".join(lines) if lines else None
+
+
 def select_invoice_document_link(
     invoice_documents: Iterable[Mapping[str, Any]],
     document_type: str,
@@ -759,6 +856,9 @@ def extract_shipment_order_data(
         FULL_ORDER_RESPONSE_COLUMNS["commercial_invoice"]: select_invoice_document_link(
             invoice_documents,
             "INV",
+        ),
+        FULL_ORDER_RESPONSE_COLUMNS["returned_items_confirmation"]: format_returned_items(
+            extract_returned_items(payload)
         ),
         FULL_ORDER_RESPONSE_COLUMNS["customer_email"]: (
             None if is_blank(customer.get("email")) else str(customer.get("email")).strip()
@@ -861,6 +961,130 @@ def document_local_path(path: str | Path | None) -> Path | None:
 def document_path_exists(path: str | Path | None) -> bool:
     local_path = document_local_path(path)
     return bool(local_path and local_path.exists() and local_path.is_file())
+
+
+def is_url(value: object) -> bool:
+    return bool(re.match(r"^[a-z][a-z0-9+.-]*://", str(value or "").strip(), flags=re.IGNORECASE))
+
+
+def _invoice_filename_from_link(source_link: str, data_key: str, row: Mapping[str, Any] | None = None) -> str:
+    row = row or {}
+    parsed = urlparse(source_link)
+    query_values = parse_qs(parsed.query)
+
+    candidate = ""
+    for query_key in ("link", "filename", "file", "name"):
+        values = query_values.get(query_key)
+        if values:
+            candidate = values[0]
+            break
+
+    if not candidate:
+        candidate = Path(unquote(parsed.path)).name
+
+    candidate = unquote(str(candidate or "")).replace("\\", "/").rsplit("/", 1)[-1]
+    if not candidate or candidate.lower().endswith(('.aspx', '.ashx', '.php', '.html', '.htm')):
+        fallback_parts = [
+            data_key,
+            row.get("shipment_order_number"),
+            row.get("extracted_tracking_number"),
+            row.get("shipment_tracking_number"),
+            row.get("request_id"),
+        ]
+        candidate = "_".join(str(part).strip() for part in fallback_parts if not is_blank(part))
+
+    filename = safe_filename(candidate)
+    if not filename.lower().endswith(".pdf"):
+        filename = f"{filename}.pdf"
+    return filename
+
+
+def _invoice_output_path(source_link: str, data_key: str, row: Mapping[str, Any] | None = None) -> Path:
+    output_dir = GENERATED_DOCUMENTS_DIR / "invoice"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / _invoice_filename_from_link(source_link, data_key, row)
+
+
+def _download_timeout() -> float:
+    return float(os.getenv(INVOICE_DOWNLOAD_TIMEOUT_ENV, os.getenv(TIMEOUT_ENV, "60")))
+
+
+def download_invoice_pdf(
+    source_link: object,
+    data_key: str,
+    *,
+    row: Mapping[str, Any] | None = None,
+    session: requests.Session | None = None,
+) -> str:
+    """Download an invoice PDF link into generated_documents/invoice."""
+
+    source = str(source_link or "").strip()
+    if is_blank(source):
+        raise DocumentGenerationError(f"Missing source link for {data_key}")
+
+    if not is_url(source):
+        if document_path_exists(source):
+            return str(source)
+        raise DocumentGenerationError(f"Invoice source is not a downloadable URL: {source}")
+
+    output_path = _invoice_output_path(source, data_key, row)
+    if output_path.exists() and output_path.is_file() and output_path.stat().st_size > 0:
+        return output_path.as_posix()
+
+    headers = {
+        "Accept": "application/pdf,application/octet-stream,*/*",
+        "User-Agent": os.getenv(
+            INVOICE_DOWNLOAD_USER_AGENT_ENV,
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        ),
+    }
+    requester = session or requests.Session()
+    response: requests.Response | None = None
+    temp_path = output_path.with_name(f".{output_path.name}.tmp")
+    sample = b""
+    bytes_written = 0
+
+    try:
+        response = requester.get(
+            source,
+            stream=True,
+            timeout=_download_timeout(),
+            allow_redirects=True,
+            headers=headers,
+        )
+        response.raise_for_status()
+
+        with temp_path.open("wb") as file:
+            for chunk in response.iter_content(chunk_size=128 * 1024):
+                if not chunk:
+                    continue
+                if len(sample) < 1024:
+                    sample = (sample + chunk)[:1024]
+                bytes_written += len(chunk)
+                file.write(chunk)
+
+        if bytes_written == 0:
+            raise DocumentGenerationError(f"Downloaded invoice PDF was empty: {source}")
+
+        content_type = str(response.headers.get("Content-Type", "") or "").lower()
+        if b"%PDF" not in sample and "pdf" not in content_type:
+            raise DocumentGenerationError(
+                "Downloaded invoice content did not look like a PDF "
+                f"(Content-Type: {content_type or 'unknown'})"
+            )
+
+        temp_path.replace(output_path)
+        return output_path.as_posix()
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
+    finally:
+        if response is not None:
+            response.close()
+        if session is None and isinstance(requester, requests.Session):
+            requester.close()
 
 
 def document_reference(path: str | Path | None) -> str:
