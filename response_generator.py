@@ -23,6 +23,7 @@ from response_data_extractor import (
     FULL_ORDER_DATA_KEYS,
     FULL_ORDER_LOOKUP_KEYS,
     FULL_ORDER_RESPONSE_COLUMNS,
+    INVOICE_DOCUMENT_DATA_KEYS,
     GetFullOrderClient,
     document_path_exists,
     document_value_for_response,
@@ -57,6 +58,7 @@ INPUT_PATH = REQUEST_INTENT_RESULTS_PATH
 AUTO_ADD_UPS_MIN_CONFIDENCE = float(os.getenv("AUTO_ADD_UPS_MIN_CONFIDENCE", "0.90"))
 
 DHL_BROKERAGE_EMAIL = os.getenv("DHL_BROKERAGE_EMAIL", "kamil.it@dhl.com")
+SUPPRESSED_RESPONSE_DATA_KEYS = {"previously_requested_documentation"}
 
 FULL_ORDER_SHIPPED_AT_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["shipped_at"]
 FULL_ORDER_API_ERROR_COLUMN = FULL_ORDER_RESPONSE_COLUMNS["api_error"]
@@ -167,7 +169,7 @@ DATA_LABELS = {
         "export_tracking_number": "TRK in export",
         "ups_account_number": "Cod UPS",
         "value_confirmation": "Conferma valore",
-        "returned_items_confirmation": "Items returned",
+        "returned_items_confirmation": "Prodotti resi",
         "customs_description": "Descrizione merce",
         "dichiarazione_di_libera_esportazione": "Dichiarazione di libera esportazione",
         "eori_number": "Numero EORI",
@@ -273,6 +275,23 @@ def full_order_data_value(row, data_key):
     column = full_order_column_for_data_key(data_key)
     if not column:
         return PLACEHOLDER
+
+    if data_key == "returned_items_confirmation":
+        value = row.get(column)
+        return PLACEHOLDER if is_blank(value) else str(value).rstrip()
+
+    if data_key in INVOICE_DOCUMENT_DATA_KEYS:
+        generated_column = DOCUMENT_RESPONSE_COLUMNS.get(data_key)
+        generated_path = row.get(generated_column) if generated_column else None
+        if not is_blank(generated_path):
+            text_path = str(generated_path).strip()
+            if document_path_exists(text_path):
+                return document_value_for_response(text_path)
+
+        source_link = row.get(column)
+        if not is_blank(source_link):
+            return document_value_for_response(str(source_link).strip())
+
     return first_available_value(row.get(column), default=PLACEHOLDER)
 
 
@@ -543,6 +562,11 @@ def requested_data_for_response(row):
 
     requested_data = normalize_requested_data_with_aliases(row.get("requested_data"))
     requested_data = collapse_embedded_document_fields(row, requested_data)
+    requested_data = [
+        data_key
+        for data_key in requested_data
+        if data_key not in SUPPRESSED_RESPONSE_DATA_KEYS
+    ]
 
     # Historical false positives showed that auto-adding UPS account to every
     # Returns Customs Clearance row can amplify weak/incorrect intent matches.
@@ -663,6 +687,9 @@ def generated_document_is_ready(row, data_key):
         return False
 
     text_value = str(value).strip()
+    if data_key in INVOICE_DOCUMENT_DATA_KEYS:
+        return document_path_exists(text_value)
+
     return bool(
         re.match(r"^[a-z][a-z0-9+.-]*://", text_value, flags=re.IGNORECASE)
         or document_path_exists(text_value)
@@ -682,6 +709,10 @@ def missing_required_full_order_values(row, requested_data):
         and is_ups_requester_email(row.get("requester_email"))
     )
     needs_poa = "power_of_attorney" in requested_data
+
+    for invoice_key in sorted(set(requested_data) & INVOICE_DOCUMENT_DATA_KEYS):
+        if not generated_document_is_ready(row, invoice_key):
+            missing.append(f"{invoice_key}_pdf")
 
     if needs_loa or needs_poa:
         if is_blank(tracking_number_for_documents(row)):
@@ -754,7 +785,10 @@ def build_generic_response(row, requested_data, language):
     for data_key in requested_data:
         label = label_for(data_key, language)
         value = data_value(row, data_key)
-        lines.append(f"- {label}: {value}")
+        if "\n" in str(value):
+            lines.append(f"- {label}:\n{value}")
+        else:
+            lines.append(f"- {label}: {value}")
 
     body = "\n".join(lines)
 
@@ -811,6 +845,22 @@ def build_ups_account_standard_response(row):
     )
 
 
+def returned_items_section(row, language="it", fallback=True):
+    if "returned_items_confirmation" in requested_data_for_response(row):
+        value = data_value(row, "returned_items_confirmation")
+        if not is_blank(value) and value != PLACEHOLDER:
+            label = label_for("returned_items_confirmation", language)
+            if "\n" in str(value):
+                return f"{label}:\n{value}\n\n"
+            return f"{label}: {value}\n\n"
+
+    if fallback and language == "it":
+        return "Tutti prodotti sono stati resi.\n\n"
+    if fallback:
+        return "All products have been returned.\n\n"
+    return ""
+
+
 def build_ups_returns_same_carrier_response(row):
     export_tracking = export_tracking_value(row)
     ups_account = data_value(row, "ups_account_number")
@@ -822,7 +872,7 @@ def build_ups_returns_same_carrier_response(row):
         f"- TRK in export: {export_tracking}\n"
         f"- Cod UPS: {ups_account}\n"
         f"- Return Proforma Invoice: {rpi}\n\n"
-        "Tutti prodotti sono stati resi.\n\n"
+        f"{returned_items_section(row)}"
         "Cordiali saluti,\n\n"
         "Piero T."
     )
@@ -838,7 +888,7 @@ def build_ups_returns_different_carrier_response(row):
         "- TRK in export: non disponibile, avvenuto con altro vettore\n"
         f"- Cod UPS: {ups_account}\n"
         f"- Return Proforma Invoice: {rpi}\n\n"
-        "Tutti prodotti sono stati resi.\n\n"
+        f"{returned_items_section(row)}"
         "Cordiali saluti,\n\n"
         "Piero T."
     )
@@ -868,6 +918,7 @@ def build_fedex_returns_same_carrier_response(row):
         "In allegato invio la documentazione richiesta.\n\n"
         f"AWB in export: {awb_export}\n"
         f"RPI: {rpi}\n"
+        f"{returned_items_section(row, fallback=False)}"
         "Cordiali saluti,\n\n"
         "Piero T."
     )
@@ -882,6 +933,7 @@ def build_dhl_returns_same_carrier_response(row):
         "In allegato la documentazione richiesta per la reintroduzione in franchigia.\n"
         f"AWB in export: {awb_export}\n"
         f"RPI: {rpi}\n"
+        f"{returned_items_section(row, fallback=False)}"
         "Cordiali saluti,\n"
         "Piero T."
     )
@@ -895,7 +947,7 @@ def build_fedex_dhl_returns_different_carrier_response(row):
         "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
         "AWB in export: non disponibile, avvenuto con altro vettore\n"
         f"RPI: {rpi}\n\n"
-        "Tutti prodotti sono stati resi.\n\n"
+        f"{returned_items_section(row)}"
         "Cordiali saluti,\n\n"
         "Piero T."
     )
