@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from html import unescape as html_unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
@@ -1076,50 +1077,238 @@ def _decode_response_bytes(content: bytes, response: requests.Response | None = 
     return content.decode("utf-8", errors="replace")
 
 
-def _append_invoice_candidate(candidates: list[str], seen: set[str], candidate: str) -> None:
-    cleaned = str(candidate or "").strip().strip('"\'')
-    if not cleaned or cleaned.startswith(("#", "javascript:", "mailto:", "tel:")):
+@dataclass(frozen=True)
+class InvoiceDownloadAttempt:
+    """A concrete HTTP request to try while resolving an invoice PDF."""
+
+    url: str
+    method: str = "GET"
+    data: tuple[tuple[str, str], ...] = ()
+    referer: str | None = None
+
+    def key(self) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+        normalized_url = self.url.split("#", 1)[0]
+        return (self.method.upper(), normalized_url, self.data)
+
+    def summary(self) -> str:
+        method = self.method.upper()
+        return self.url if method == "GET" else f"{method} {self.url}"
+
+
+class _InvoiceHtmlParser(HTMLParser):
+    """Extract links and ASP.NET form fields from a DocOpen HTML wrapper."""
+
+    DOWNLOAD_ATTRIBUTES = {"href", "src", "data", "action", "formaction"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[str] = []
+        self.forms: list[dict[str, Any]] = []
+        self._current_form: dict[str, Any] | None = None
+
+    @staticmethod
+    def _attrs_to_dict(attrs: list[tuple[str, str | None]]) -> dict[str, str]:
+        return {str(name).lower(): "" if value is None else str(value) for name, value in attrs}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag_name = tag.lower()
+        attr_map = self._attrs_to_dict(attrs)
+
+        if tag_name == "form":
+            self._current_form = {
+                "action": attr_map.get("action", ""),
+                "method": attr_map.get("method", "post"),
+                "fields": [],
+            }
+            self.forms.append(self._current_form)
+
+        for attr_name in self.DOWNLOAD_ATTRIBUTES:
+            value = attr_map.get(attr_name)
+            if value:
+                self.links.append(value)
+
+        if tag_name == "meta" and attr_map.get("http-equiv", "").lower() == "refresh":
+            content = attr_map.get("content", "")
+            match = re.search(r"url\s*=\s*([^;]+)$", content, flags=re.IGNORECASE)
+            if match:
+                self.links.append(match.group(1).strip())
+
+        if tag_name == "input" and self._current_form is not None:
+            name = attr_map.get("name", "")
+            if name:
+                fields = self._current_form.setdefault("fields", [])
+                fields.append((name, attr_map.get("value", "")))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "form":
+            self._current_form = None
+
+
+def _clean_invoice_candidate(candidate: str) -> str:
+    cleaned = html_unescape(str(candidate or "")).strip()
+    # JavaScript-generated attributes can arrive escaped as \"...\". Strip only
+    # wrapping quote/backslash noise, not meaningful URL characters inside the value.
+    for _ in range(3):
+        stripped = cleaned.strip().strip('"\'')
+        stripped = stripped.lstrip("\\").strip().strip('"\'')
+        if stripped == cleaned:
+            break
+        cleaned = stripped
+    cleaned = cleaned.replace("&amp;", "&").strip()
+    return cleaned
+
+
+def _append_invoice_candidate(
+    candidates: list[InvoiceDownloadAttempt],
+    seen: set[tuple[str, str, tuple[tuple[str, str], ...]]],
+    candidate: str,
+    *,
+    base_url: str,
+    method: str = "GET",
+    data: Iterable[tuple[str, str]] | Mapping[str, Any] | None = None,
+    referer: str | None = None,
+) -> None:
+    cleaned = _clean_invoice_candidate(candidate)
+    if not cleaned:
         return
-    cleaned = cleaned.replace("&amp;", "&")
-    normalized = cleaned.split("#", 1)[0]
-    if normalized and normalized not in seen:
-        seen.add(normalized)
-        candidates.append(normalized)
+
+    lower_cleaned = cleaned.lower()
+    if lower_cleaned.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+        return
+
+    # Avoid malformed values produced by regex scans over quoted JavaScript such as
+    # '"javascript:__doPostBack(...)'. Those are browser actions, not URLs.
+    if "javascript:" in lower_cleaned[:40]:
+        return
+
+    absolute_url = urljoin(base_url, cleaned).split("#", 1)[0]
+    if not is_url(absolute_url):
+        return
+
+    if isinstance(data, Mapping):
+        normalized_data = tuple((str(key), "" if value is None else str(value)) for key, value in data.items())
+    else:
+        normalized_data = tuple((str(key), "" if value is None else str(value)) for key, value in (data or ()))
+
+    attempt = InvoiceDownloadAttempt(
+        url=absolute_url,
+        method=method.upper(),
+        data=normalized_data,
+        referer=referer,
+    )
+    key = attempt.key()
+    if key not in seen:
+        seen.add(key)
+        candidates.append(attempt)
 
 
-def _invoice_candidates_from_html(html: str, base_url: str) -> list[str]:
+def _parse_invoice_html(html: str) -> tuple[str, _InvoiceHtmlParser]:
+    text = html_unescape(html or "").replace("\\/", "/")
+    parser = _InvoiceHtmlParser()
+    try:
+        parser.feed(text)
+    except Exception:
+        # HTMLParser is best-effort; keep regex fallbacks available even for bad HTML.
+        pass
+    return text, parser
+
+
+def _aspnet_postback_attempts_from_html(
+    text: str,
+    parser: _InvoiceHtmlParser,
+    base_url: str,
+) -> list[InvoiceDownloadAttempt]:
+    """Build POST attempts for ASP.NET WebForms __doPostBack download links."""
+
+    postbacks: list[InvoiceDownloadAttempt] = []
+    seen: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
+    forms = parser.forms or [{"action": "", "method": "post", "fields": []}]
+
+    for match in re.finditer(
+        r"__doPostBack\s*\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]*)['\"]\s*\)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        event_target = html_unescape(match.group(1)).strip()
+        event_argument = html_unescape(match.group(2)).strip()
+        if not event_target:
+            continue
+
+        for form in forms:
+            fields = [
+                (str(name), "" if value is None else str(value))
+                for name, value in form.get("fields", [])
+                if str(name) not in {"__EVENTTARGET", "__EVENTARGUMENT"}
+            ]
+            fields.extend([
+                ("__EVENTTARGET", event_target),
+                ("__EVENTARGUMENT", event_argument),
+            ])
+            action = str(form.get("action") or "").strip() or base_url
+            _append_invoice_candidate(
+                postbacks,
+                seen,
+                action,
+                base_url=base_url,
+                method="POST",
+                data=fields,
+                referer=base_url,
+            )
+
+    return postbacks
+
+
+def _invoice_candidates_from_html(html: str, base_url: str) -> list[InvoiceDownloadAttempt]:
     """Return browser-download targets embedded in a DocOpen.aspx HTML wrapper."""
 
     if not html:
         return []
 
-    text = html_unescape(unquote(html)).replace("\\/", "/")
-    candidates: list[str] = []
-    seen: set[str] = set()
+    text, parser = _parse_invoice_html(html)
+    candidates: list[InvoiceDownloadAttempt] = []
+    seen: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
 
-    patterns = [
-        # href/src/action attributes, including the iframe/link/button patterns often
-        # emitted by simple ASP.NET download pages.
-        r"(?:href|src|data|action|formaction)\s*=\s*[\"']([^\"']+)[\"']",
-        r"(?:href|src|data|action|formaction)\s*=\s*([^\s>]+)",
-        # JavaScript redirects that Chrome follows but requests does not execute.
-        r"(?:window\.)?(?:location(?:\.href)?|document\.location)\s*=\s*[\"']([^\"']+)[\"']",
-        r"(?:window\.open|location\.assign|location\.replace)\s*\(\s*[\"']([^\"']+)[\"']",
-        # Meta refresh redirects.
-        r"http-equiv\s*=\s*[\"']?refresh[\"']?[^>]+content\s*=\s*[\"'][^\"']*?url=([^\"']+)",
-        r"content\s*=\s*[\"'][^\"']*?url=([^\"']+)",
-        # Fully-qualified or relative PDF URLs embedded in script blocks.
+    # First emulate ASP.NET WebForms download links. DocOpen.aspx pages commonly
+    # render a LinkButton whose href is javascript:__doPostBack(...); Chrome then
+    # posts the hidden __VIEWSTATE/__EVENTVALIDATION fields back to DocOpen.aspx.
+    for postback_attempt in _aspnet_postback_attempts_from_html(text, parser, base_url):
+        key = postback_attempt.key()
+        if key not in seen:
+            seen.add(key)
+            candidates.append(postback_attempt)
+
+    # Then follow real URLs exposed in normal HTML attributes.
+    for raw_link in parser.links:
+        _append_invoice_candidate(
+            candidates,
+            seen,
+            raw_link,
+            base_url=base_url,
+            referer=base_url,
+        )
+
+    # JavaScript redirects that Chrome follows but requests does not execute.
+    redirect_patterns = [
+        r"(?:window\.)?(?:location(?:\.href)?|document\.location)\s*=\s*['\"]([^'\"]+)['\"]",
+        r"(?:window\.open|location\.assign|location\.replace)\s*\(\s*['\"]([^'\"]+)['\"]",
+        r"http-equiv\s*=\s*['\"]?refresh['\"]?[^>]+content\s*=\s*['\"][^'\"]*?url=([^'\"]+)",
+        r"content\s*=\s*['\"][^'\"]*?url=([^'\"]+)",
         r"(https?://[^\s\"'<>]+?\.pdf(?:\?[^\s\"'<>]*)?)",
-        r"((?:/|\./|\.\./)?[A-Za-z0-9_./%=&?+-]+?\.pdf(?:\?[^\s\"'<>]*)?)",
+        # Relative PDF URLs with an explicit path marker. This intentionally does
+        # not match a bare invoice filename inside a DocOpen.aspx?link=... query,
+        # because the valid entry point is DocOpen.aspx, not /<filename>.pdf.
+        r"((?:/|\./|\.\./)[A-Za-z0-9_./%=&?+-]+?\.pdf(?:\?[^\s\"'<>]*)?)",
     ]
-
-    for pattern in patterns:
+    for pattern in redirect_patterns:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            raw_candidate = match.group(1).strip().rstrip(";,)>\"")
-            if not raw_candidate:
-                continue
-            absolute_candidate = urljoin(base_url, raw_candidate)
-            _append_invoice_candidate(candidates, seen, absolute_candidate)
+            raw_candidate = match.group(1).strip().rstrip(";,)>\"'")
+            _append_invoice_candidate(
+                candidates,
+                seen,
+                raw_candidate,
+                base_url=base_url,
+                referer=base_url,
+            )
 
     parsed = urlparse(base_url)
     query_values = parse_qs(parsed.query)
@@ -1139,27 +1328,28 @@ def _invoice_candidates_from_html(html: str, base_url: str) -> list[str]:
             ):
                 if current_name == replacement.lower():
                     continue
-                candidate = parsed._replace(
+                candidate_url = parsed._replace(
                     path=str(Path(parsed.path).with_name(replacement)),
                     query=f"link={quoted_filename}",
                     fragment="",
                 ).geturl()
-                _append_invoice_candidate(candidates, seen, candidate)
-
-            direct_candidate = urljoin(base_url, quoted_filename)
-            _append_invoice_candidate(candidates, seen, direct_candidate)
+                _append_invoice_candidate(
+                    candidates,
+                    seen,
+                    candidate_url,
+                    base_url=base_url,
+                    referer=base_url,
+                )
 
     return candidates
 
 
 def _download_invoice_candidate(
     requester: requests.Session,
-    url: str,
+    attempt: InvoiceDownloadAttempt,
     output_path: Path,
-    *,
-    referer: str | None = None,
-) -> tuple[bool, str, str, list[str]]:
-    """Try one URL. Return (saved_pdf, content_type, final_url, html_candidates)."""
+) -> tuple[bool, str, str, list[InvoiceDownloadAttempt]]:
+    """Try one HTTP request. Return (saved_pdf, content_type, final_url, html_candidates)."""
 
     response: requests.Response | None = None
     temp_path = output_path.with_name(f".{output_path.name}.tmp")
@@ -1167,12 +1357,14 @@ def _download_invoice_candidate(
     bytes_written = 0
 
     try:
-        response = requester.get(
-            url,
+        response = requester.request(
+            attempt.method.upper(),
+            attempt.url,
+            data=list(attempt.data) if attempt.data else None,
             stream=True,
             timeout=_download_timeout(),
             allow_redirects=True,
-            headers=_invoice_download_headers(referer),
+            headers=_invoice_download_headers(attempt.referer),
         )
         response.raise_for_status()
 
@@ -1186,16 +1378,16 @@ def _download_invoice_candidate(
                 file.write(chunk)
 
         if bytes_written == 0:
-            raise DocumentGenerationError(f"Downloaded invoice PDF was empty: {url}")
+            raise DocumentGenerationError(f"Downloaded invoice PDF was empty: {attempt.url}")
 
         content_type = str(response.headers.get("Content-Type", "") or "").lower()
-        final_url = str(response.url or url)
+        final_url = str(response.url or attempt.url)
         if _looks_like_pdf(sample, content_type):
             temp_path.replace(output_path)
             return True, content_type, final_url, []
 
         content = temp_path.read_bytes()
-        html_candidates: list[str] = []
+        html_candidates: list[InvoiceDownloadAttempt] = []
         if "html" in content_type or b"<html" in sample.lower() or b"<script" in sample.lower():
             html = _decode_response_bytes(content, response)
             html_candidates = _invoice_candidates_from_html(html, final_url)
@@ -1222,8 +1414,8 @@ def download_invoice_pdf(
     """Download an invoice PDF link into generated_documents/invoice.
 
     Some DocOpen.aspx links return an HTML wrapper that Chrome executes before
-    downloading the real PDF. This function follows regular redirects and also
-    resolves PDF links or JavaScript/meta-refresh redirects found in that wrapper.
+    downloading the real PDF. This function follows regular redirects, emulates
+    ASP.NET __doPostBack links, and follows PDF/redirect URLs found in that wrapper.
     """
 
     source = str(source_link or "").strip()
@@ -1240,8 +1432,9 @@ def download_invoice_pdf(
         return output_path.as_posix()
 
     requester = session or requests.Session()
-    candidates = [source]
-    seen = {source.split("#", 1)[0]}
+    initial_attempt = InvoiceDownloadAttempt(url=source, method="GET")
+    candidates: list[InvoiceDownloadAttempt] = [initial_attempt]
+    seen = {initial_attempt.key()}
     last_content_type = "unknown"
     last_url = source
     last_error = ""
@@ -1250,29 +1443,28 @@ def download_invoice_pdf(
 
     try:
         while candidates and len(attempted) < max_attempts:
-            candidate = candidates.pop(0)
-            attempted.append(candidate)
+            attempt = candidates.pop(0)
+            attempted.append(attempt.summary())
             try:
                 saved, content_type, final_url, html_candidates = _download_invoice_candidate(
                     requester,
-                    candidate,
+                    attempt,
                     output_path,
-                    referer=source if candidate != source else None,
                 )
             except Exception as exc:
                 last_error = str(exc)
-                last_url = candidate
+                last_url = attempt.url
                 continue
 
             last_content_type = content_type or "unknown"
-            last_url = final_url or candidate
+            last_url = final_url or attempt.url
             if saved:
                 return output_path.as_posix()
 
             for html_candidate in html_candidates:
-                normalized = html_candidate.split("#", 1)[0]
-                if normalized not in seen:
-                    seen.add(normalized)
+                key = html_candidate.key()
+                if key not in seen:
+                    seen.add(key)
                     candidates.append(html_candidate)
 
         attempted_summary = ", ".join(attempted[:4])
@@ -1287,7 +1479,6 @@ def download_invoice_pdf(
     finally:
         if session is None and isinstance(requester, requests.Session):
             requester.close()
-
 
 def document_reference(path: str | Path | None) -> str:
     if not path:
