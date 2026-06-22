@@ -10,6 +10,7 @@ The GitHub Actions workflow runs `response_data_extractor.py` immediately after 
 - `commercial_invoice`
 - `customer_email`
 - `customer_phone`
+- `returned_items_confirmation` from `items[].sku`, `items[].productName`, and `items[].imageUrl`
 - `authorization_letter` / LOA export date
 - standard UPS-account replies that reference a generated LOA
 
@@ -39,7 +40,9 @@ The client supports these optional environment variables:
 - `GET_FULL_ORDER_API_BASE_URL` to override the base URL;
 - `GET_FULL_ORDER_AUTH_MODE` with `auto`, `headers`, `basic`, `oauth2`, or `none`;
 - `GET_FULL_ORDER_API_TOKEN_URL` when `GET_FULL_ORDER_AUTH_MODE=oauth2`;
-- `GET_FULL_ORDER_API_TIMEOUT_SECONDS` to override the request timeout.
+- `GET_FULL_ORDER_API_TIMEOUT_SECONDS` to override the request timeout;
+- `INVOICE_PDF_DOWNLOAD_TIMEOUT_SECONDS` to override the invoice-PDF download timeout;
+- `INVOICE_PDF_DOWNLOAD_USER_AGENT` to override the browser-style user agent used when downloading invoice PDFs.
 
 `auto` tries OAuth2 only when a token URL is configured, then header credentials, then HTTP Basic auth.
 
@@ -52,14 +55,17 @@ templates/pdf/authorization_letter_template.pdf
 templates/pdf/power_of_attorney_template.pdf
 ```
 
-Generated copies are written to:
+Generated and downloaded copies are written to the top-level `generated_documents` folder:
 
 ```text
-output/generated_documents/authorization_letter/<extracted_tracking_number>.pdf
-output/generated_documents/power_of_attorney/<extracted_tracking_number>.pdf
+generated_documents/authorization_letter/<extracted_tracking_number>.pdf
+generated_documents/power_of_attorney/<extracted_tracking_number>.pdf
+generated_documents/invoice/<invoice_filename_from_document_link>.pdf
 ```
 
-The GitHub Actions workflow uploads `output/generated_documents` as the `generated-customs-documents` artifact so filled LOA and POA PDFs can be verified after each run.
+When `return_proforma_invoice` or `commercial_invoice` is requested, the extractor keeps the source link from `erpDocuments.invoiceDocuments[].documentLink`, downloads the PDF with a browser-style request, saves it under `generated_documents/invoice`, and the draft response points to that saved copy.
+
+The GitHub Actions workflow commits `generated_documents` before draft generation and uploads it as the `generated-customs-documents` artifact so filled LOA, POA, RPI, and commercial-invoice PDFs can be verified after each run.
 
 
 ## Response data extractor script
