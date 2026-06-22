@@ -64,7 +64,7 @@ generated_documents/power_of_attorney/<extracted_tracking_number>.pdf
 generated_documents/invoice/<invoice_filename_from_document_link>.pdf
 ```
 
-When `return_proforma_invoice` or `commercial_invoice` is requested, the extractor keeps the source link from `erpDocuments.invoiceDocuments[].documentLink`, downloads the PDF with a browser-style request, resolves DocOpen-style HTML wrappers or JavaScript/meta-refresh download redirects when present, saves the final PDF under `generated_documents/invoice`, and the draft response points to that saved copy.
+When `return_proforma_invoice` or `commercial_invoice` is requested, the extractor keeps the source link from `erpDocuments.invoiceDocuments[].documentLink`, downloads the PDF with a browser-style request, resolves DocOpen-style HTML wrappers, ASP.NET `__doPostBack` download buttons, and JavaScript/meta-refresh redirects when present, saves the final PDF under `generated_documents/invoice`, and the draft response points to that saved copy. The downloader does not rewrite `DocOpen.aspx?link=<file>.pdf` into a bare `/<file>.pdf` URL.
 
 The GitHub Actions workflow commits `generated_documents` before draft generation and uploads it as the `generated-customs-documents` artifact so filled LOA, POA, RPI, and commercial-invoice PDFs can be verified after each run.
 
