@@ -35,8 +35,13 @@ from response_data_extractor import (
     ups_account_number_for_documents,
 )
 
-from ticket_fetcher import append_history_rows
-from pipeline_io import REQUEST_INTENT_RESULTS_PATH, read_dataframe
+from ticket_fetcher import (
+    append_history_rows,
+    new_history_request_ids,
+    submit_final_responses,
+    zendesk_response_submission_enabled,
+)
+from pipeline_io import REQUEST_INTENT_RESULTS_PATH, build_request_id, read_dataframe
 from customs_rules import (
     FEDEX_BROKERAGE_EMAIL,
     HUMAN_INTERVENTION_REQUIRED,
@@ -97,6 +102,36 @@ RPI_EMBEDDED_CONTACT_REQUESTED_DATA = {
     "shipping_address",
     "customer_email",
     "customer_phone",
+}
+
+FIRST_REQUEST_COMMERCIAL_INVOICE_EMBEDDED_REQUESTED_DATA = {
+    "dichiarazione_di_libera_esportazione",
+}
+
+FIRST_REQUEST_IGNORED_REQUESTED_DATA = {
+    "eori_number",
+}
+
+FIRST_REQUEST_SHIPMENT_INSTRUCTIONS_REQUESTED_DATA = {
+    "shipment_instructions",
+}
+
+ALWAYS_HUMAN_INTERVENTION_REQUESTED_DATA = {
+    "address_translation",
+    "exporter_ein",
+    "address_correction",
+}
+
+AFTER_FIRST_REQUEST_HUMAN_INTERVENTION_REQUESTED_DATA = (
+    FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA
+    | FIRST_REQUEST_COMMERCIAL_INVOICE_EMBEDDED_REQUESTED_DATA
+    | FIRST_REQUEST_IGNORED_REQUESTED_DATA
+    | FIRST_REQUEST_SHIPMENT_INSTRUCTIONS_REQUESTED_DATA
+)
+
+DOCUMENT_ATTACHMENT_DATA_KEYS = set(INVOICE_DOCUMENT_DATA_KEYS) | {
+    "authorization_letter",
+    "power_of_attorney",
 }
 
 RETURN_PROFORMA_CONTEXT_RE = re.compile(
@@ -300,10 +335,10 @@ def generated_document_value(row, data_key):
     existing_path = row.get(column) if column else None
     if column and not is_blank(existing_path):
         text_path = str(existing_path).strip()
-        if re.match(r"^[a-z][a-z0-9+.-]*://", text_path, flags=re.IGNORECASE) or document_path_exists(text_path):
+        if document_path_exists(text_path):
             return document_value_for_response(text_path)
         print(
-            "WARNING: Stored generated document path does not exist locally; "
+            "WARNING: Stored generated document path is not a local file; "
             f"regenerating {data_key} for request_id={row.get('request_id')}: {text_path}"
         )
 
@@ -501,10 +536,6 @@ def collapse_embedded_document_fields(row, requested_data):
     contact_fields_found = False
 
     for data_key in requested_data:
-        if first_returns and data_key == "dichiarazione_di_libera_esportazione":
-            continue
-        if first_request and data_key == "exporter_ein":
-            continue
         if data_key in RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA:
             if "return_proforma_invoice" not in result:
                 result.append("return_proforma_invoice")
@@ -512,6 +543,17 @@ def collapse_embedded_document_fields(row, requested_data):
         if first_request and data_key in FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA:
             if "return_proforma_invoice" not in result:
                 result.append("return_proforma_invoice")
+            continue
+        if first_request and data_key in FIRST_REQUEST_COMMERCIAL_INVOICE_EMBEDDED_REQUESTED_DATA:
+            if "commercial_invoice" not in result:
+                result.append("commercial_invoice")
+            continue
+        if first_request and data_key in FIRST_REQUEST_IGNORED_REQUESTED_DATA:
+            continue
+        if first_request and data_key in FIRST_REQUEST_SHIPMENT_INSTRUCTIONS_REQUESTED_DATA:
+            for embedded_key in ("ups_account_number", "export_tracking_number"):
+                if embedded_key not in result:
+                    result.append(embedded_key)
             continue
         if data_key in DOCUMENT_EMBEDDED_REQUESTED_DATA:
             embedded_document_fields_found = True
@@ -534,10 +576,8 @@ def collapse_embedded_document_fields(row, requested_data):
         if target not in result:
             result.append(target)
 
-    if first_returns and contact_fields_found:
-        fedex_or_dhl = is_fedex_requester_email(requester_email) or is_dhl_requester_email(requester_email)
-        if fedex_or_dhl and "return_proforma_invoice" not in result:
-            result.append("return_proforma_invoice")
+    if first_returns and contact_fields_found and "return_proforma_invoice" not in result:
+        result.append("return_proforma_invoice")
 
     if first_returns and "return_proforma_invoice" in result:
         result = [
@@ -686,14 +726,10 @@ def generated_document_is_ready(row, data_key):
     if is_blank(value):
         return False
 
-    text_value = str(value).strip()
-    if data_key in INVOICE_DOCUMENT_DATA_KEYS:
-        return document_path_exists(text_value)
-
-    return bool(
-        re.match(r"^[a-z][a-z0-9+.-]*://", text_value, flags=re.IGNORECASE)
-        or document_path_exists(text_value)
-    )
+    # A document is ready for automatic Zendesk submission only when a local PDF
+    # exists and can be uploaded as an attachment. Public URLs/GitHub links are
+    # not sufficient for final_response.
+    return document_path_exists(str(value).strip())
 
 
 def missing_required_full_order_values(row, requested_data):
@@ -975,6 +1011,38 @@ def build_dhl_returns_first_rpi_response(row):
     return build_fedex_dhl_returns_first_rpi_contact_response(row, carrier="dhl")
 
 
+def _sorted_data_keys_for_reason(data_keys):
+    return ", ".join(sorted(str(data_key) for data_key in data_keys if data_key))
+
+
+def human_intervention_data_policy_reason(row, requested_data):
+    first_request = normalize_request_number(row.get("request_number", 1)) == 1
+    raw_requested_set = set(all_requested_data_sources(row))
+    response_requested_set = set(requested_data)
+    combined_requested_set = raw_requested_set | response_requested_set
+
+    always_human = combined_requested_set & ALWAYS_HUMAN_INTERVENTION_REQUESTED_DATA
+    if always_human:
+        return (
+            "Human intervention is required for requested_data: "
+            + _sorted_data_keys_for_reason(always_human)
+            + "."
+        )
+
+    after_first_request_human = (
+        combined_requested_set & AFTER_FIRST_REQUEST_HUMAN_INTERVENTION_REQUESTED_DATA
+    )
+    if not first_request and after_first_request_human:
+        return (
+            "Human intervention is required because the following requested_data "
+            "is only auto-handled on request number 1: "
+            + _sorted_data_keys_for_reason(after_first_request_human)
+            + "."
+        )
+
+    return ""
+
+
 def should_force_human_intervention(row, requested_data):
     request_text = row_request_text(row)
     raw_requested_data = normalize_requested_data_with_aliases(row.get("requested_data"))
@@ -998,6 +1066,10 @@ def should_force_human_intervention(row, requested_data):
             "Customer did not pay extra/outstanding charges. Human intervention "
             "is required to verify whether the customer or TLG should pay.",
         )
+
+    data_policy_reason = human_intervention_data_policy_reason(row, requested_data)
+    if data_policy_reason:
+        return True, data_policy_reason
 
     missing_full_order_values = missing_required_full_order_values(row, requested_data)
     if missing_full_order_values:
@@ -1115,6 +1187,113 @@ def requires_human_intervention(row):
     return force_human
 
 
+def document_data_keys_for_response(row, requested_data=None):
+    requested_data = requested_data if requested_data is not None else requested_data_for_response(row)
+    document_keys = [
+        data_key
+        for data_key in requested_data
+        if data_key in DOCUMENT_ATTACHMENT_DATA_KEYS
+    ]
+
+    # The standard UPS-account reply includes the generated LOA even when the
+    # requested_data row only contains ups_account_number.
+    if requested_data == ["ups_account_number"] and is_ups_requester_email(row.get("requester_email")):
+        if "authorization_letter" not in document_keys:
+            document_keys.append("authorization_letter")
+
+    return document_keys
+
+
+def document_attachment_paths_for_response(row, requested_data=None):
+    paths = []
+    for data_key in document_data_keys_for_response(row, requested_data):
+        column = DOCUMENT_RESPONSE_COLUMNS.get(data_key)
+        if not column:
+            continue
+        value = row.get(column)
+        if is_blank(value):
+            continue
+        text_value = str(value).strip()
+        if document_path_exists(text_value) and text_value not in paths:
+            paths.append(text_value)
+    return paths
+
+
+def _document_display_values_for_response(row, requested_data=None):
+    values = []
+    for data_key in document_data_keys_for_response(row, requested_data):
+        value = data_value(row, data_key)
+        if is_blank(value) or value == PLACEHOLDER:
+            continue
+        text_value = str(value).strip()
+        if text_value and text_value not in values:
+            values.append(text_value)
+    return values
+
+
+def _remove_document_values_from_response(response_text, document_values):
+    sanitized = str(response_text or "")
+
+    for value in sorted(document_values, key=len, reverse=True):
+        sanitized = sanitized.replace(f": {value}", "")
+        sanitized = sanitized.replace(f":\n{value}", "")
+        sanitized = sanitized.replace(value, "")
+
+    # Safety fallback for generated-document references that may have been
+    # formatted in plain style instead of markdown style. This only targets PDF
+    # document references, leaving ordinary non-document links untouched.
+    sanitized = re.sub(
+        r":\s*\[[^\]\n]+?\.pdf\]\([^\)\n]+\)",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    sanitized = re.sub(
+        r":\s*(?:https?://\S+|generated_documents/\S+|/[^\s:]+/generated_documents/\S+)\.pdf",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    lines = [re.sub(r"[ \t]+$", "", line) for line in sanitized.split("\n")]
+    return normalize_text("\n".join(lines))
+
+
+def build_final_response(row):
+    if requires_human_intervention(row):
+        return ""
+
+    draft_response = row.get("draft_response")
+    if is_blank(draft_response):
+        draft_response = build_response(row)
+
+    if is_blank(draft_response):
+        return ""
+
+    requested_data = requested_data_for_response(row)
+    document_values = _document_display_values_for_response(row, requested_data)
+    return _remove_document_values_from_response(draft_response, document_values)
+
+
+def _row_request_id(row):
+    request_id = row.get("request_id")
+    if not is_blank(request_id):
+        return str(request_id).strip()
+    return build_request_id(
+        row.get("zendesk_ticket_id"),
+        row.get("request_number"),
+    ) or ""
+
+
+def _rows_for_inserted_request_ids(df, inserted_request_ids):
+    inserted_request_ids = {str(request_id) for request_id in inserted_request_ids if request_id}
+    if not inserted_request_ids:
+        return df.iloc[0:0].copy()
+    result = df.copy()
+    result["request_id"] = result.apply(_row_request_id, axis=1)
+    return result[result["request_id"].isin(inserted_request_ids)].copy()
+
+
 def main():
     df = read_dataframe(INPUT_PATH)
 
@@ -1132,10 +1311,40 @@ def main():
 
     df["draft_response"] = df.apply(build_response, axis=1)
     df["human_intervention_required"] = df.apply(requires_human_intervention, axis=1)
+    df["final_response"] = df.apply(build_final_response, axis=1)
+    df["zendesk_attachment_paths"] = df.apply(
+        lambda row: document_attachment_paths_for_response(
+            row,
+            requested_data_for_response(row),
+        ),
+        axis=1,
+    )
 
-    logged_rows = append_history_rows(df)
+    zendesk_submission_enabled = zendesk_response_submission_enabled()
+    print(f"Zendesk final-response submission enabled: {zendesk_submission_enabled}")
 
-    print(f"Generated draft responses for {len(df)} rows. Logged {logged_rows} new rows.")
+    new_request_ids = new_history_request_ids(df)
+    rows_to_log = _rows_for_inserted_request_ids(df, new_request_ids)
+
+    logged_rows, inserted_request_ids = append_history_rows(
+        rows_to_log,
+        return_inserted_request_ids=True,
+    )
+
+    # Submission is controlled only by SUBMIT_ZENDESK_RESPONSES.  We evaluate all
+    # current rows, not only newly inserted history rows, so a dry run with the
+    # flag set to false can be followed by a true run that submits the same
+    # final_response values.  The duplicate-comment guard in ticket_fetcher keeps
+    # retries safe when the exact public response already exists on the ticket.
+    zendesk_submitted = submit_final_responses(df)
+
+    print(
+        f"Generated draft responses for {len(df)} rows. "
+        f"Logged {logged_rows} new rows. "
+        f"Submitted {zendesk_submitted} Zendesk response(s). "
+        f"Zendesk submission enabled: {zendesk_submission_enabled}. "
+        f"Inserted request_ids: {inserted_request_ids}"
+    )
 
 
 if __name__ == "__main__":
