@@ -28,9 +28,23 @@ The LLM must classify what it understood in `requested_data` and produce `llm_hu
 
 `response_generator.py` must wrap that LLM draft in a `HUMAN INTERVENTION REQUIRED` note so it is clearly for human review and not an automatic reply.
 
-## First-Request RPI Embedded Correction/Value Rule
+## Request-number-specific response data policy
 
-When `request_number` is `1`, and upstream regex/LLM classification contains `invoice_correction`, `corrected_invoice`, or `value_confirmation`, treat those values as part of the `return_proforma_invoice` package for response data. Do not list corrected invoice or value confirmation as separate customer-facing lines in the draft.
+When `request_number` is `1`, and upstream regex/LLM classification contains `invoice_correction`, `corrected_invoice`, or `value_confirmation`, treat those values as part of the `return_proforma_invoice` package for response data. Do not list corrected invoice or value confirmation as separate customer-facing lines in the draft. For later request numbers, require human intervention for those keys.
+
+When `request_number` is `1`, treat `dichiarazione_di_libera_esportazione` / declaration-of-intent wording as covered by `commercial_invoice`. For later request numbers, require human intervention.
+
+When `request_number` is `1`, ignore `eori_number`. For later request numbers, require human intervention.
+
+When `request_number` is `1`, treat `shipment_instructions` as covered by `ups_account_number` plus `export_tracking_number`. For later request numbers, require human intervention.
+
+Always require human intervention for `address_translation`, `exporter_ein`, and `address_correction`.
+
+`customer_name` must be retrieved from `GET_FULL_ORDER.shippingAddress.name` + `GET_FULL_ORDER.shippingAddress.surName`. `shipping_address`, when not collapsed into a first Returns Customs Clearance RPI package, must be retrieved from `shippingAddress.addressLine1`, `zip`, non-empty `stateOrProvince`, `country`, and `cityOrTown`.
+
+## Final Zendesk response policy
+
+`draft_response` may contain internal document references. `final_response` is the exact public Zendesk answer. If human intervention is required, `final_response` must be empty and no Zendesk reply is submitted. If a document is provided, remove the document URL/path from `final_response`, keep only the data/document label, and upload the actual PDF as a Zendesk attachment.
 
 ## Generic English Structure
 
