@@ -347,10 +347,21 @@ def _row_request_text(row: Mapping[str, Any]) -> str:
 
 
 def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
-    keys: list[str] = []
-    for column in REQUESTED_DATA_SOURCE_COLUMNS:
+    """Return the effective requested_data keys for API/doc retrieval.
+
+    The canonical ``requested_data`` column is the source of truth for what the
+    response should provide.  Regex and standard-reply columns are only fallbacks
+    for older/incomplete rows where the canonical field is empty.
+
+    This prevents downloading both the commercial invoice and the return
+    proforma invoice when one of the non-canonical helper columns still contains
+    the other document type.
+    """
+
+    def _collapsed_unique_keys(value: Any) -> list[str]:
+        keys: list[str] = []
         collapsed_keys = collapse_document_embedded_requested_data(
-            row.get(column),
+            value,
             ticket_category=row.get("ticket_category", ""),
             request_number=row.get("request_number", 1),
             requester_email=row.get("requester_email", ""),
@@ -360,7 +371,20 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
             key = normalize_data_key(key)
             if key and key not in keys:
                 keys.append(key)
-    return keys
+        return keys
+
+    canonical_keys = _collapsed_unique_keys(row.get("requested_data"))
+    if canonical_keys:
+        return canonical_keys
+
+    fallback_keys: list[str] = []
+    for column in REQUESTED_DATA_SOURCE_COLUMNS:
+        if column == "requested_data":
+            continue
+        for key in _collapsed_unique_keys(row.get(column)):
+            if key and key not in fallback_keys:
+                fallback_keys.append(key)
+    return fallback_keys
 
 
 def _email_domain(email: object) -> str:
@@ -1064,7 +1088,7 @@ def _invoice_filename_from_link(source_link: str, data_key: str, row: Mapping[st
         candidate = Path(unquote(parsed.path)).name
 
     candidate = unquote(str(candidate or "")).replace("\\", "/").rsplit("/", 1)[-1]
-    if not candidate or candidate.lower().endswith(('.aspx', '.ashx', '.php', '.html', '.htm')):
+    if not candidate or candidate.lower().endswith((".aspx", ".ashx", ".php", ".html", ".htm")):
         fallback_parts = [
             data_key,
             row.get("shipment_order_number"),
