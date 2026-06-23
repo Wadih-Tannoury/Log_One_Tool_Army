@@ -19,6 +19,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
@@ -58,6 +59,11 @@ BQ_STORAGE = False
 
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "thelevelgroup")
 ZENDESK_EMAIL = os.getenv("ZENDESK_EMAIL", "beatrice.bettini@thelevelgroup.com")
+
+ZENDESK_RESPONSE_SUBMISSION_ENV = "SUBMIT_ZENDESK_RESPONSES"
+# Safety default: never submit public ticket replies unless the workflow/env flag
+# explicitly opts in with true/1/yes/y/on.
+DEFAULT_SUBMIT_ZENDESK_RESPONSES = False
 
 ACTIVE_TICKET_COLUMNS = [
     "ingestion_timestamp",
@@ -110,6 +116,7 @@ HISTORY_COLUMNS = [
     "llm_confidence",
     "requested_data",
     "draft_response",
+    "final_response",
 ]
 
 VALID_CATEGORIES = [
@@ -468,7 +475,19 @@ def history_schema(bigquery):
         bigquery.SchemaField("llm_confidence", "FLOAT64"),
         bigquery.SchemaField("requested_data", "STRING", mode="REPEATED"),
         bigquery.SchemaField("draft_response", "STRING"),
+        bigquery.SchemaField("final_response", "STRING"),
     ]
+
+
+def _ensure_history_schema(client) -> None:
+    """Apply additive history-table schema changes required by this version."""
+
+    client.query(
+        f"""
+        ALTER TABLE `{HISTORY_TABLE}`
+        ADD COLUMN IF NOT EXISTS final_response STRING
+        """
+    ).result()
 
 
 def _target_history_schema(client):
@@ -479,6 +498,8 @@ def _target_history_schema(client):
     allows future nullable columns to exist in the table even when this pipeline
     does not populate them yet.
     """
+
+    _ensure_history_schema(client)
 
     table = client.get_table(HISTORY_TABLE)
     actual_columns = {field.name for field in table.schema}
@@ -556,13 +577,23 @@ def prepare_history_row(
         "llm_confidence": llm_confidence,
         "requested_data": _string_list(row.get("requested_data")),
         "draft_response": _to_str(row.get("draft_response")),
+        "final_response": _to_str(row.get("final_response")),
     }
 
     return {column: prepared.get(column) for column in HISTORY_COLUMNS}
 
 
-def append_history_rows(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> int:
+def append_history_rows(
+    rows: Iterable[Mapping[str, Any]] | pd.DataFrame,
+    *,
+    return_inserted_request_ids: bool = False,
+) -> int | tuple[int, list[str]]:
     """Append final workflow rows to the BigQuery history table."""
+
+    def _return(count: int, inserted_request_ids: list[str] | None = None):
+        if return_inserted_request_ids:
+            return count, list(inserted_request_ids or [])
+        return count
 
     if isinstance(rows, pd.DataFrame):
         raw_rows = rows.to_dict(orient="records")
@@ -571,7 +602,7 @@ def append_history_rows(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> int
 
     if not raw_rows:
         print("No final rows to log to BigQuery history.")
-        return 0
+        return _return(0)
 
     workflow_run_id = get_workflow_run_id()
     ingestion_timestamp = datetime.now(timezone.utc).isoformat().replace(
@@ -600,7 +631,7 @@ def append_history_rows(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> int
 
     if not unique_rows:
         print("No rows with a valid request_id to log to BigQuery history.")
-        return 0
+        return _return(0)
 
     client, bigquery = bigquery_client()
     target_schema = _target_history_schema(client)
@@ -621,7 +652,7 @@ def append_history_rows(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> int
 
     if not rows_to_insert:
         print("No new rows to append to BigQuery history.")
-        return 0
+        return _return(0)
 
     job_config = bigquery.LoadJobConfig(
         schema=target_schema,
@@ -640,7 +671,50 @@ def append_history_rows(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> int
         f"with workflow_run_id={workflow_run_id}."
     )
 
-    return len(rows_to_insert)
+    return _return(
+        len(rows_to_insert),
+        [str(row["request_id"]) for row in rows_to_insert if row.get("request_id")],
+    )
+
+
+def new_history_request_ids(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> list[str]:
+    """Return request_ids that are not already present in the history table."""
+
+    if isinstance(rows, pd.DataFrame):
+        raw_rows = rows.to_dict(orient="records")
+    else:
+        raw_rows = list(rows)
+
+    if not raw_rows:
+        return []
+
+    workflow_run_id = get_workflow_run_id()
+    ingestion_timestamp = datetime.now(timezone.utc).isoformat().replace(
+        "+00:00",
+        "Z",
+    )
+    prepared_rows = [
+        prepare_history_row(
+            row,
+            workflow_run_id=workflow_run_id,
+            ingestion_timestamp=ingestion_timestamp,
+        )
+        for row in raw_rows
+    ]
+
+    request_ids: list[str] = []
+    for row in prepared_rows:
+        request_id = row.get("request_id")
+        if request_id and request_id not in request_ids:
+            request_ids.append(str(request_id))
+
+    if not request_ids:
+        return []
+
+    client, bigquery = bigquery_client()
+    _target_history_schema(client)
+    existing_ids = _existing_request_ids(client, bigquery, request_ids)
+    return [request_id for request_id in request_ids if request_id not in existing_ids]
 
 
 def append_history_from_file(path=REQUEST_INTENT_RESULTS_PATH) -> int:
@@ -648,6 +722,209 @@ def append_history_from_file(path=REQUEST_INTENT_RESULTS_PATH) -> int:
 
     df = read_dataframe(path)
     return append_history_rows(df)
+
+
+# ============================================================================
+# ZENDESK RESPONSE HELPERS
+# ============================================================================
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def zendesk_response_submission_enabled() -> bool:
+    """Return True only when public Zendesk replies are explicitly enabled."""
+
+    return _env_bool(
+        ZENDESK_RESPONSE_SUBMISSION_ENV,
+        DEFAULT_SUBMIT_ZENDESK_RESPONSES,
+    )
+
+
+def _response_is_blank(value: Any) -> bool:
+    if _is_missing(value):
+        return True
+    return str(value).strip().lower() in {"", "nan", "none", "null", "n/a", "na"}
+
+
+def _attachment_paths(value: Any) -> list[str]:
+    paths: list[str] = []
+    for item in _parse_collection(value):
+        if _is_missing(item):
+            continue
+        path = str(item).strip()
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def upload_zendesk_attachment(
+    path: str | Path,
+    *,
+    auth: HTTPBasicAuth | None = None,
+    base_url: str | None = None,
+) -> str:
+    """Upload one local file to Zendesk and return its upload token."""
+
+    file_path = Path(path)
+    if not file_path.exists() or not file_path.is_file():
+        raise FileNotFoundError(f"Zendesk attachment not found: {file_path}")
+
+    auth = auth or zendesk_auth()
+    base_url = (base_url or zendesk_base_url()).rstrip("/")
+    url = f"{base_url}/uploads.json?filename={quote(file_path.name)}"
+
+    with file_path.open("rb") as file_obj:
+        response = requests.post(
+            url,
+            auth=auth,
+            data=file_obj,
+            headers={"Content-Type": "application/pdf"},
+            timeout=60,
+        )
+    response.raise_for_status()
+    token = str(response.json().get("upload", {}).get("token", "") or "").strip()
+    if not token:
+        raise RuntimeError(f"Zendesk upload did not return a token for {file_path}")
+    return token
+
+
+def _normalize_comment_body(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").replace("\r\n", "\n")).strip()
+
+
+def zendesk_public_comment_exists(
+    ticket_id: int,
+    body: str,
+    *,
+    auth: HTTPBasicAuth | None = None,
+    base_url: str | None = None,
+) -> bool:
+    """Return True when the same public comment body is already on the ticket."""
+
+    auth = auth or zendesk_auth()
+    base_url = (base_url or zendesk_base_url()).rstrip("/")
+    wanted_body = _normalize_comment_body(body)
+    if not wanted_body:
+        return False
+
+    for comment in get_ticket_comments(ticket_id, auth=auth, base_url=base_url):
+        if not comment.get("public", True):
+            continue
+        for body_key in ("body", "plain_body"):
+            if _normalize_comment_body(comment.get(body_key)) == wanted_body:
+                return True
+    return False
+
+
+def submit_ticket_response(
+    ticket_id: int,
+    body: str,
+    *,
+    attachment_paths: Iterable[str] = (),
+    auth: HTTPBasicAuth | None = None,
+    base_url: str | None = None,
+) -> bool:
+    """Submit one public Zendesk ticket comment with optional uploaded files."""
+
+    if _response_is_blank(body):
+        raise ValueError("Cannot submit an empty Zendesk response body")
+
+    auth = auth or zendesk_auth()
+    base_url = (base_url or zendesk_base_url()).rstrip("/")
+
+    if _env_bool("ZENDESK_SKIP_DUPLICATE_FINAL_RESPONSE", True) and zendesk_public_comment_exists(
+        ticket_id,
+        body,
+        auth=auth,
+        base_url=base_url,
+    ):
+        print(f"Skipped Zendesk ticket {ticket_id}: final_response is already present.")
+        return False
+
+    upload_tokens = [
+        upload_zendesk_attachment(path, auth=auth, base_url=base_url)
+        for path in attachment_paths
+    ]
+
+    comment: dict[str, Any] = {
+        "body": str(body).strip(),
+        "public": True,
+    }
+    if upload_tokens:
+        comment["uploads"] = upload_tokens
+
+    response = requests.put(
+        f"{base_url}/tickets/{int(ticket_id)}.json",
+        auth=auth,
+        json={"ticket": {"comment": comment}},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return True
+
+
+def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> int:
+    """Submit non-empty final_response values to Zendesk when enabled.
+
+    Human-intervention rows and blank final responses are intentionally skipped.
+    The actual public Zendesk side effect is controlled by the
+    SUBMIT_ZENDESK_RESPONSES environment/workflow flag. Set it to true to
+    submit; false or an unset value logs only and performs no ticket update.
+    """
+
+    if isinstance(rows, pd.DataFrame):
+        raw_rows = rows.to_dict(orient="records")
+    else:
+        raw_rows = list(rows)
+
+    response_rows = []
+    for row in raw_rows:
+        if bool(_to_bool(row.get("human_intervention_required"))):
+            continue
+        final_response = row.get("final_response")
+        if _response_is_blank(final_response):
+            continue
+        ticket_id = _to_int(row.get("zendesk_ticket_id"))
+        if ticket_id is None:
+            raise ValueError(
+                "Cannot submit Zendesk response without zendesk_ticket_id "
+                f"for request_id={row.get('request_id')}"
+            )
+        response_rows.append((ticket_id, str(final_response).strip(), row))
+
+    if not response_rows:
+        print("No Zendesk final responses to submit.")
+        return 0
+
+    if not zendesk_response_submission_enabled():
+        print(
+            f"{ZENDESK_RESPONSE_SUBMISSION_ENV}=false; skipped "
+            f"{len(response_rows)} Zendesk response(s)."
+        )
+        return 0
+
+    auth = zendesk_auth()
+    base_url = zendesk_base_url()
+    submitted = 0
+
+    for ticket_id, final_response, row in response_rows:
+        attachment_paths = _attachment_paths(row.get("zendesk_attachment_paths"))
+        if submit_ticket_response(
+            ticket_id,
+            final_response,
+            attachment_paths=attachment_paths,
+            auth=auth,
+            base_url=base_url,
+        ):
+            submitted += 1
+
+    print(f"Submitted {submitted} Zendesk final response(s).")
+    return submitted
 
 
 # ============================================================================
