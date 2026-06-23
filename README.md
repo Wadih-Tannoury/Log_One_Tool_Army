@@ -1,6 +1,6 @@
 # Log One Tool Army
 
-Agent pipeline that fetches active Zendesk customs-clearance tickets, detects the requested data, and writes draft responses to the BigQuery history table.
+Agent pipeline that fetches active Zendesk customs-clearance tickets, detects the requested data, logs draft/final responses to BigQuery, and optionally submits automatic Zendesk replies with PDF attachments when no human intervention is required.
 
 ## GET_FULL_ORDER enrichment
 
@@ -10,6 +10,8 @@ The GitHub Actions workflow runs `response_data_extractor.py` immediately after 
 - `commercial_invoice`
 - `customer_email`
 - `customer_phone`
+- `customer_name` from `shippingAddress.name` + `shippingAddress.surName`
+- `shipping_address` from `shippingAddress.addressLine1`, `zip`, `stateOrProvince`, `country`, and `cityOrTown`
 - `returned_items_confirmation` from `items[].sku`, `items[].productName`, and `items[].imageUrl`
 - `authorization_letter` / LOA export date
 - standard UPS-account replies that reference a generated LOA
@@ -68,6 +70,34 @@ When `return_proforma_invoice` or `commercial_invoice` is requested, the extract
 
 The GitHub Actions workflow commits `generated_documents` before draft generation and uploads it as the `generated-customs-documents` artifact so filled LOA, POA, RPI, and commercial-invoice PDFs can be verified after each run.
 
+
+
+## Final Zendesk replies
+
+`response_generator.py` now writes both:
+
+- `draft_response`: the internal/audit draft, which may still include generated-document references;
+- `final_response`: the exact public Zendesk comment body.
+
+For rows that require human intervention, `final_response` is intentionally empty and no Zendesk comment is submitted. For automatic rows, generated PDFs are uploaded to Zendesk as ticket attachments and document links are removed from `final_response`; the body only lists the data/documents being provided, for example `- RPI` instead of a GitHub URL.
+
+The BigQuery history table is migrated additively at runtime with:
+
+```sql
+ALTER TABLE `tlg-business-intelligence-prd.til.log_one_tool_army_logs_history`
+ADD COLUMN IF NOT EXISTS final_response STRING;
+```
+
+Zendesk submission is controlled by one explicit flag:
+
+```bash
+SUBMIT_ZENDESK_RESPONSES=true   # submit public Zendesk replies and upload attachments
+SUBMIT_ZENDESK_RESPONSES=false  # log only; do not update Zendesk tickets
+```
+
+In GitHub Actions, this is exposed as the manual `workflow_dispatch` input `submit_zendesk_responses`. The default is `false` for safety, so a manually triggered run logs BigQuery history and builds `final_response` values without sending anything to Zendesk unless the input is deliberately switched on.
+
+The submission decision is independent from BigQuery history de-duplication. This means a dry run with `submit_zendesk_responses=false` can be followed by another run with `submit_zendesk_responses=true`; the agent will still evaluate the current non-human `final_response` values for Zendesk submission. The duplicate-comment guard skips a ticket when the exact same public response body is already present.
 
 ## Response data extractor script
 
