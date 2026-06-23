@@ -120,9 +120,13 @@ If a UPS Returns Customs Clearance request asks for the UPS account and the retu
 
 If a DHL Returns Customs Clearance request asks for documentation for reintroduzione in franchigia, return `return_proforma_invoice`.
 
-For first Returns Customs Clearance requests, ignore `dichiarazione d'intento`, `dichiarazione di intento`, and declaration-of-intent checklist wording when it appears as part of the carrier's generic import/RPI checklist. Do not return `dichiarazione_di_libera_esportazione` for those first-request Returns Customs Clearance checklists.
+For request number `1`, if the request asks for `dichiarazione d'intento`, `dichiarazione di intento`, declaration-of-intent wording, or `dichiarazione_di_libera_esportazione`, treat it as covered by `commercial_invoice` and return `commercial_invoice`, not `dichiarazione_di_libera_esportazione`.
 
-For request number `1`, ignore exporter EIN / employer identification number checklist wording unless the request is clearly not a first-request carrier checklist.
+For request number `1`, ignore `eori_number` checklist wording. For later request numbers, return `eori_number` when it is explicitly requested so the response generator can route it to human intervention.
+
+For request number `1`, if the request asks for generic shipment/clearance instructions, return `ups_account_number` and `export_tracking_number`. For later request numbers, return `shipment_instructions` so the response generator can route it to human intervention.
+
+When `address_translation`, `exporter_ein`, or `address_correction` is explicitly requested, return that exact key. These keys are not automatically retrieved; the response generator routes them to human intervention.
 
 For the UPS UK import-clearance instruction template from UPS Brokerage at East Midlands Airport, return exactly these operational data elements when the context is Returns Customs Clearance: `export_tracking_number`, `ups_account_number`, and `return_proforma_invoice`. Treat EORI/VAT, commodity code, customs procedure, deferment, and generic shipment instructions as part of that specific return-clearance package.
 
