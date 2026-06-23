@@ -2,7 +2,12 @@ name: Log One Tool Army
 
 on:
   workflow_dispatch:
-
+    inputs:
+      submit_zendesk_responses:
+        description: "Submit final_response as public Zendesk ticket replies"
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   process_requests:
@@ -21,6 +26,7 @@ jobs:
       GENERATED_DOCUMENTS_DIR: generated_documents
       DOCUMENT_PUBLIC_BASE_URL: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}
       LOG_HISTORY_TABLE: tlg-business-intelligence-prd.til.log_one_tool_army_logs_history
+      SUBMIT_ZENDESK_RESPONSES: ${{ inputs.submit_zendesk_responses }}
 
     steps:
       - name: Checkout Repository
@@ -56,6 +62,7 @@ jobs:
           echo "Project: $PROJECT_ID"
           echo "History table: $LOG_HISTORY_TABLE"
           echo "Workflow run id: $WORKFLOW_RUN_ID"
+          echo "Zendesk response submission: $SUBMIT_ZENDESK_RESPONSES"
 
       - name: Fetch Tickets
         run: python ticket_fetcher.py
@@ -94,7 +101,7 @@ jobs:
           git commit -m "Add generated customs documents for $WORKFLOW_RUN_ID"
           git push
 
-      - name: Generate Draft Responses and Log to BigQuery
+      - name: Generate Responses, Log to BigQuery, and Optionally Reply in Zendesk
         run: python response_generator.py
 
       - name: Verify Local Handoffs
