@@ -34,6 +34,7 @@ from customs_rules import (
     PLACEHOLDER,
     UPS_BROKERAGE_EMAIL,
     extract_ups_code,
+    collapse_document_embedded_requested_data,
     first_available_value,
     normalize_email,
     normalize_requested_data,
@@ -56,6 +57,8 @@ FULL_ORDER_RESPONSE_COLUMNS = {
     "returned_items_confirmation": "full_order_returned_items",
     "customer_email": "full_order_customer_email",
     "customer_phone": "full_order_customer_phone",
+    "customer_name": "full_order_customer_name",
+    "shipping_address": "full_order_shipping_address",
     "shipped_at": "full_order_shipped_at",
     "api_error": "full_order_api_error",
 }
@@ -66,6 +69,8 @@ FULL_ORDER_DATA_KEYS = {
     "returned_items_confirmation",
     "customer_email",
     "customer_phone",
+    "customer_name",
+    "shipping_address",
 }
 FULL_ORDER_LOOKUP_KEYS = FULL_ORDER_DATA_KEYS | {"authorization_letter"}
 DOCUMENT_DATA_KEYS = {"authorization_letter", "power_of_attorney"}
@@ -329,10 +334,30 @@ def normalize_requested_data_with_aliases(value: object) -> list[str]:
     return cleaned
 
 
+def _row_request_text(row: Mapping[str, Any]) -> str:
+    return "\n".join(
+        str(value or "")
+        for value in (
+            row.get("subject", ""),
+            row.get("cleaned_request_body", ""),
+            row.get("request_body", ""),
+        )
+        if not is_blank(value)
+    )
+
+
 def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
     keys: list[str] = []
     for column in REQUESTED_DATA_SOURCE_COLUMNS:
-        for key in normalize_requested_data_with_aliases(row.get(column)):
+        collapsed_keys = collapse_document_embedded_requested_data(
+            row.get(column),
+            ticket_category=row.get("ticket_category", ""),
+            request_number=row.get("request_number", 1),
+            requester_email=row.get("requester_email", ""),
+            request_text=_row_request_text(row),
+        )
+        for key in collapsed_keys:
+            key = normalize_data_key(key)
             if key and key not in keys:
                 keys.append(key)
     return keys
@@ -825,6 +850,56 @@ def _customer_from_payload_or_shipment(
     return {}
 
 
+def _shipping_address_from_payload_or_shipment(
+    payload: Mapping[str, Any],
+    shipment: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    shipping_address = _get_any(shipment, ("shippingAddress", "shipping_address"))
+    if isinstance(shipping_address, Mapping):
+        return shipping_address
+
+    shipping_address = _get_any(payload, ("shippingAddress", "shipping_address"))
+    if isinstance(shipping_address, Mapping):
+        return shipping_address
+
+    order = payload.get("order")
+    if isinstance(order, Mapping):
+        shipping_address = _get_any(order, ("shippingAddress", "shipping_address"))
+        if isinstance(shipping_address, Mapping):
+            return shipping_address
+
+    shipping_address = _find_first_key(payload, "shippingAddress")
+    if isinstance(shipping_address, Mapping):
+        return shipping_address
+
+    shipping_address = _find_first_key(payload, "shipping_address")
+    if isinstance(shipping_address, Mapping):
+        return shipping_address
+
+    return {}
+
+
+def _format_customer_name(shipping_address: Mapping[str, Any]) -> str | None:
+    parts = [
+        _clean_item_field(_get_any(shipping_address, ("name", "firstName", "first_name"))),
+        _clean_item_field(_get_any(shipping_address, ("surName", "surname", "lastName", "last_name"))),
+    ]
+    value = " ".join(part for part in parts if part).strip()
+    return value or None
+
+
+def _format_shipping_address(shipping_address: Mapping[str, Any]) -> str | None:
+    parts = [
+        _clean_item_field(_get_any(shipping_address, ("addressLine1", "address_line_1", "address1"))),
+        _clean_item_field(_get_any(shipping_address, ("zip", "postalCode", "postal_code"))),
+        _clean_item_field(_get_any(shipping_address, ("stateOrProvince", "state_or_province", "state", "province"))),
+        _clean_item_field(_get_any(shipping_address, ("country", "countryCode", "country_code"))),
+        _clean_item_field(_get_any(shipping_address, ("cityOrTown", "city_or_town", "city", "town"))),
+    ]
+    value = ", ".join(part for part in parts if part).strip()
+    return value or None
+
+
 def _shipped_at_from_shipment(shipment: Mapping[str, Any] | None) -> str | None:
     # The current GET_FULL_ORDER payload uses camelCase shippedAt.  Keep the
     # snake_case and legacy alternatives to avoid breaking older fixtures.
@@ -850,6 +925,7 @@ def extract_shipment_order_data(
 
     invoice_documents = _invoice_documents_from_shipment(shipment)
     customer = _customer_from_payload_or_shipment(payload, shipment)
+    shipping_address = _shipping_address_from_payload_or_shipment(payload, shipment)
 
     return {
         FULL_ORDER_RESPONSE_COLUMNS["return_proforma_invoice"]: select_invoice_document_link(
@@ -871,6 +947,8 @@ def extract_shipment_order_data(
             if is_blank(customer.get("customerNumber"))
             else str(customer.get("customerNumber")).strip()
         ),
+        FULL_ORDER_RESPONSE_COLUMNS["customer_name"]: _format_customer_name(shipping_address),
+        FULL_ORDER_RESPONSE_COLUMNS["shipping_address"]: _format_shipping_address(shipping_address),
         FULL_ORDER_RESPONSE_COLUMNS["shipped_at"]: _shipped_at_from_shipment(shipment),
         FULL_ORDER_RESPONSE_COLUMNS["api_error"]: None,
     }
