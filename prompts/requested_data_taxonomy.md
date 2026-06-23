@@ -41,7 +41,7 @@ Do not output these as standalone requested_data values:
 - `declaration_of_intent`
 
 Map tax/country/product fields to `commercial_invoice` or `return_proforma_invoice` depending on context. Map customs-description and importer-details fields to `return_proforma_invoice`.
-Map declaration wording to `dichiarazione_di_libera_esportazione`.
+For request number `1`, map declaration wording to `commercial_invoice`; for later requests, map it to `dichiarazione_di_libera_esportazione`.
 
 ## Design Principle
 
@@ -79,6 +79,8 @@ After classification, the response generator retrieves these values from the GET
 - `commercial_invoice`
 - `customer_email`
 - `customer_phone`
+- `customer_name`
+- `shipping_address`
 - `returned_items_confirmation`, extracted from `items[].sku`, `items[].productName`, and `items[].imageUrl`
 
 The response generator also uses the API shipment `shippedAt` value to fill generated LOA PDFs. `export_tracking_number` remains sourced from the BigQuery `shipment_tracking_number` value.
