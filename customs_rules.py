@@ -586,6 +586,9 @@ def collapse_document_embedded_requested_data(
 
     On request number 1, invoice correction and value confirmation are also
     considered part of the return proforma invoice package for response data.
+    On request number 1, declaration-of-intent/libera-esportazione wording is
+    fulfilled by the commercial invoice, EORI is ignored, and shipment
+    instructions are fulfilled by export tracking plus UPS account data.
     """
     values = normalize_requested_data(requested_data)
     if not values:
@@ -595,24 +598,30 @@ def collapse_document_embedded_requested_data(
     embedded_fields_found = False
     rpi_document_fields_found = False
     first_request_rpi_response_fields_found = False
+    first_request_commercial_invoice_fields_found = False
+    first_request_shipment_instructions_found = False
     first_request = normalize_request_number(request_number) == 1
     first_returns = is_first_returns_customs_request(ticket_category, request_number)
 
     for value in values:
+        if value == "declaration_of_intent":
+            value = "dichiarazione_di_libera_esportazione"
         if value in RPI_DOCUMENT_EMBEDDED_REQUESTED_DATA:
             rpi_document_fields_found = True
             continue
         if first_request and value in FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA:
             first_request_rpi_response_fields_found = True
             continue
+        if first_request and value == "dichiarazione_di_libera_esportazione":
+            first_request_commercial_invoice_fields_found = True
+            continue
+        if first_request and value == "eori_number":
+            continue
+        if first_request and value == "shipment_instructions":
+            first_request_shipment_instructions_found = True
+            continue
         if value in DOCUMENT_EMBEDDED_REQUESTED_DATA:
             embedded_fields_found = True
-            continue
-        if value == "declaration_of_intent":
-            value = "dichiarazione_di_libera_esportazione"
-        if first_returns and value == "dichiarazione_di_libera_esportazione":
-            continue
-        if first_request and value == "exporter_ein":
             continue
         if value not in result:
             result.append(value)
@@ -628,12 +637,7 @@ def collapse_document_embedded_requested_data(
         value in RPI_EMBEDDED_CONTACT_REQUESTED_DATA
         for value in result
     )
-    fedex_or_dhl_first_return = first_returns and (
-        is_fedex_requester_email(requester_email)
-        or is_dhl_requester_email(requester_email)
-    )
-
-    if fedex_or_dhl_first_return and contact_fields_found:
+    if first_returns and contact_fields_found:
         result = [
             value
             for value in result
@@ -652,6 +656,14 @@ def collapse_document_embedded_requested_data(
         rpi_document_fields_found or first_request_rpi_response_fields_found
     ) and "return_proforma_invoice" not in result:
         result.append("return_proforma_invoice")
+
+    if first_request_commercial_invoice_fields_found and "commercial_invoice" not in result:
+        result.append("commercial_invoice")
+
+    if first_request_shipment_instructions_found:
+        for value in ("ups_account_number", "export_tracking_number"):
+            if value not in result:
+                result.append(value)
 
     if embedded_fields_found:
         if first_returns or has_return_proforma_context(text):
@@ -673,6 +685,7 @@ def collapse_document_embedded_requested_data(
             or first_request_rpi_response_fields_found
             or field_phrase_found
         )
+        and not first_request_commercial_invoice_fields_found
     ):
         if first_request_rpi_response_fields_found:
             result = [value for value in result if value != "commercial_invoice"]
