@@ -968,8 +968,8 @@ def extract_shipment_order_data(
         ),
         FULL_ORDER_RESPONSE_COLUMNS["customer_phone"]: (
             None
-            if is_blank(customer.get("customerNumber"))
-            else str(customer.get("customerNumber")).strip()
+            if is_blank(_nested_get(shipping_address, "phoneNumbers", "home"))
+            else str(_nested_get(shipping_address, "phoneNumbers", "home")).strip()
         ),
         FULL_ORDER_RESPONSE_COLUMNS["customer_name"]: _format_customer_name(shipping_address),
         FULL_ORDER_RESPONSE_COLUMNS["shipping_address"]: _format_shipping_address(shipping_address),
