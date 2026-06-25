@@ -64,6 +64,8 @@ ZENDESK_RESPONSE_SUBMISSION_ENV = "SUBMIT_ZENDESK_RESPONSES"
 # Safety default: never submit public ticket replies unless the workflow/env flag
 # explicitly opts in with true/1/yes/y/on.
 DEFAULT_SUBMIT_ZENDESK_RESPONSES = False
+ZENDESK_STATUS_AFTER_REPLY_ENV = "ZENDESK_STATUS_AFTER_REPLY"
+DEFAULT_ZENDESK_STATUS_AFTER_REPLY = "closed"
 
 ACTIVE_TICKET_COLUMNS = [
     "ingestion_timestamp",
@@ -745,6 +747,28 @@ def zendesk_response_submission_enabled() -> bool:
     )
 
 
+def zendesk_status_after_reply() -> str:
+    """Return the ticket status to set when posting an automatic Zendesk reply."""
+
+    status = str(
+        os.getenv(
+            ZENDESK_STATUS_AFTER_REPLY_ENV,
+            DEFAULT_ZENDESK_STATUS_AFTER_REPLY,
+        )
+        or ""
+    ).strip().lower()
+    if not status:
+        return ""
+
+    valid_statuses = {"new", "open", "pending", "hold", "solved", "closed"}
+    if status not in valid_statuses:
+        raise ValueError(
+            f"Unsupported {ZENDESK_STATUS_AFTER_REPLY_ENV}={status!r}; "
+            "use one of: new, open, pending, hold, solved, closed"
+        )
+    return status
+
+
 def _response_is_blank(value: Any) -> bool:
     if _is_missing(value):
         return True
@@ -858,13 +882,36 @@ def submit_ticket_response(
     if upload_tokens:
         comment["uploads"] = upload_tokens
 
+    ticket_update: dict[str, Any] = {"comment": comment}
+    status_after_reply = zendesk_status_after_reply()
+    if status_after_reply:
+        ticket_update["status"] = status_after_reply
+
     response = requests.put(
         f"{base_url}/tickets/{int(ticket_id)}.json",
         auth=auth,
-        json={"ticket": {"comment": comment}},
+        json={"ticket": ticket_update},
         timeout=60,
     )
-    response.raise_for_status()
+
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        if status_after_reply == "closed" and response.status_code in {400, 422}:
+            ticket_update["status"] = "solved"
+            fallback_response = requests.put(
+                f"{base_url}/tickets/{int(ticket_id)}.json",
+                auth=auth,
+                json={"ticket": ticket_update},
+                timeout=60,
+            )
+            fallback_response.raise_for_status()
+            print(
+                f"Zendesk ticket {ticket_id}: status 'closed' was rejected; "
+                "submitted automatic reply with status 'solved' instead."
+            )
+        else:
+            raise
     return True
 
 
