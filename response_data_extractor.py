@@ -1592,7 +1592,18 @@ def document_reference(path: str | Path | None) -> str:
 
     if re.match(r"^[a-z][a-z0-9+.-]*://", text, flags=re.IGNORECASE):
         href = text
-        display_path = Path(text)
+        parsed = urlparse(text)
+        query_values = parse_qs(parsed.query)
+        display_name = ""
+        for query_key in ("link", "filename", "file", "name"):
+            values = query_values.get(query_key)
+            if values:
+                display_name = values[0]
+                break
+        if not display_name:
+            display_name = Path(unquote(parsed.path)).name or text
+        display_name = unquote(str(display_name or "")).replace("\\", "/").rsplit("/", 1)[-1]
+        display_path = Path(display_name or text)
     else:
         path_obj = Path(text)
         if path_obj.is_absolute():
