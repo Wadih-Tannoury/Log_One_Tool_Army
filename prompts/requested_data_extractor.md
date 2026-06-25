@@ -126,6 +126,8 @@ For request number `1`, ignore `eori_number` checklist wording. For later reques
 
 For request number `1`, if the request asks for generic shipment/clearance instructions, return `ups_account_number` and `export_tracking_number`. For later request numbers, return `shipment_instructions` so the response generator can route it to human intervention.
 
+If the ticket request body contains the word `sdoganamento`, include `export_tracking_number` in `requested_data` in addition to any other requested data, unless the row must be `human_intervention_required`.
+
 When `address_translation`, `exporter_ein`, or `address_correction` is explicitly requested, return that exact key. These keys are not automatically retrieved; the response generator routes them to human intervention.
 
 For the UPS UK import-clearance instruction template from UPS Brokerage at East Midlands Airport, return exactly these operational data elements when the context is Returns Customs Clearance: `export_tracking_number`, `ups_account_number`, and `return_proforma_invoice`. Treat EORI/VAT, commodity code, customs procedure, deferment, and generic shipment instructions as part of that specific return-clearance package.
