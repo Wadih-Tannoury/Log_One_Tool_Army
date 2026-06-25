@@ -172,6 +172,8 @@ UNPAID_EXTRA_CHARGES_RE = re.compile(
     re.IGNORECASE,
 )
 
+SDOGANAMENTO_RE = re.compile(r"\bsdoganamento\b", re.IGNORECASE)
+
 DATA_LABELS = {
     "en": {
         "commercial_invoice": "Commercial invoice",
@@ -393,6 +395,13 @@ def export_tracking_value(row):
     )
 
 
+def export_tracking_or_unavailable(row, unavailable_text):
+    value = export_tracking_value(row)
+    if is_blank(value) or value == PLACEHOLDER:
+        return unavailable_text
+    return value
+
+
 def normalize_carrier_code_value(value):
     if is_blank(value):
         return ""
@@ -415,6 +424,14 @@ def return_export_carriers_are_same(row):
         return None
 
     return export_carrier == return_carrier
+
+
+def shipment_order_number_starts_with_sc(row):
+    for column in ("shipment_order_number", "shipmentOrderNumber"):
+        value = row.get(column)
+        if not is_blank(value) and str(value).strip().upper().startswith("SC"):
+            return True
+    return False
 
 
 def is_tracking_lookup_not_found(row):
@@ -455,6 +472,23 @@ def row_request_text(row):
             if not is_blank(value)
         )
     )
+
+
+def row_request_body_text(row):
+    return normalize_text(
+        "\n".join(
+            str(value or "")
+            for value in [
+                row.get("cleaned_request_body", ""),
+                row.get("request_body", ""),
+            ]
+            if not is_blank(value)
+        )
+    )
+
+
+def request_body_mentions_sdoganamento(row):
+    return bool(SDOGANAMENTO_RE.search(row_request_body_text(row)))
 
 
 def is_platform_handoff_request(text):
@@ -608,6 +642,14 @@ def requested_data_for_response(row):
         if data_key not in SUPPRESSED_RESPONSE_DATA_KEYS
     ]
 
+    if (
+        request_body_mentions_sdoganamento(row)
+        and "export_tracking_number" not in requested_data
+        and HUMAN_INTERVENTION_REQUIRED not in requested_data
+        and UNKNOWN_REQUEST not in requested_data
+    ):
+        requested_data.append("export_tracking_number")
+
     # Historical false positives showed that auto-adding UPS account to every
     # Returns Customs Clearance row can amplify weak/incorrect intent matches.
     # Keep this fallback only for high-confidence non-first UPS requests.
@@ -726,10 +768,19 @@ def generated_document_is_ready(row, data_key):
     if is_blank(value):
         return False
 
-    # A document is ready for automatic Zendesk submission only when a local PDF
-    # exists and can be uploaded as an attachment. Public URLs/GitHub links are
-    # not sufficient for final_response.
+    # A generated document is ready for attachment upload only when a local PDF
+    # exists. Invoice source links can still be used as public fallback links.
     return document_path_exists(str(value).strip())
+
+
+def invoice_document_is_sendable(row, data_key):
+    """Return True when an invoice/RPI can be sent as an attachment or link."""
+
+    if generated_document_is_ready(row, data_key):
+        return True
+
+    source_column = full_order_column_for_data_key(data_key)
+    return bool(source_column and not is_blank(row.get(source_column)))
 
 
 def missing_required_full_order_values(row, requested_data):
@@ -747,8 +798,8 @@ def missing_required_full_order_values(row, requested_data):
     needs_poa = "power_of_attorney" in requested_data
 
     for invoice_key in sorted(set(requested_data) & INVOICE_DOCUMENT_DATA_KEYS):
-        if not generated_document_is_ready(row, invoice_key):
-            missing.append(f"{invoice_key}_pdf")
+        if not invoice_document_is_sendable(row, invoice_key) and invoice_key not in missing:
+            missing.append(invoice_key)
 
     if needs_loa or needs_poa:
         if is_blank(tracking_number_for_documents(row)):
@@ -915,13 +966,14 @@ def build_ups_returns_same_carrier_response(row):
 
 
 def build_ups_returns_different_carrier_response(row):
+    export_tracking = export_tracking_or_unavailable(row, "non disponibile, avvenuto con altro vettore")
     ups_account = data_value(row, "ups_account_number")
     rpi = data_value(row, "return_proforma_invoice")
 
     return (
         "Buongiorno,\n\n"
         "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
-        "- TRK in export: non disponibile, avvenuto con altro vettore\n"
+        f"- TRK in export: {export_tracking}\n"
         f"- Cod UPS: {ups_account}\n"
         f"- Return Proforma Invoice: {rpi}\n\n"
         f"{returned_items_section(row)}"
@@ -976,12 +1028,13 @@ def build_dhl_returns_same_carrier_response(row):
 
 
 def build_fedex_dhl_returns_different_carrier_response(row):
+    awb_export = export_tracking_or_unavailable(row, "non disponibile, avvenuto con altro vettore")
     rpi = data_value(row, "return_proforma_invoice")
 
     return (
         "Buongiorno,\n\n"
         "Confermo la documentazione in vostro possesso per lo sdoganamento in definitiva.\n\n"
-        "AWB in export: non disponibile, avvenuto con altro vettore\n"
+        f"AWB in export: {awb_export}\n"
         f"RPI: {rpi}\n\n"
         f"{returned_items_section(row)}"
         "Cordiali saluti,\n\n"
@@ -1049,6 +1102,9 @@ def should_force_human_intervention(row, requested_data):
 
     if is_request_number_3_or_higher(row.get("request_number")):
         return True, "Request number is 3 or higher. Human intervention is required by automation policy."
+
+    if shipment_order_number_starts_with_sc(row):
+        return True, "shipmentOrderNumber starts with SC. Human intervention is required by automation policy."
 
     if is_platform_handoff_request(request_text):
         return True, "FedEx Support Hub handoff request. A human must handle the external portal."
@@ -1219,9 +1275,11 @@ def document_attachment_paths_for_response(row, requested_data=None):
     return paths
 
 
-def _document_display_values_for_response(row, requested_data=None):
+def _document_display_values_for_response(row, requested_data=None, *, attached_only=False):
     values = []
     for data_key in document_data_keys_for_response(row, requested_data):
+        if attached_only and not generated_document_is_ready(row, data_key):
+            continue
         value = data_value(row, data_key)
         if is_blank(value) or value == PLACEHOLDER:
             continue
@@ -1239,21 +1297,22 @@ def _remove_document_values_from_response(response_text, document_values):
         sanitized = sanitized.replace(f":\n{value}", "")
         sanitized = sanitized.replace(value, "")
 
-    # Safety fallback for generated-document references that may have been
-    # formatted in plain style instead of markdown style. This only targets PDF
-    # document references, leaving ordinary non-document links untouched.
-    sanitized = re.sub(
-        r":\s*\[[^\]\n]+?\.pdf\]\([^\)\n]+\)",
-        "",
-        sanitized,
-        flags=re.IGNORECASE,
-    )
-    sanitized = re.sub(
-        r":\s*(?:https?://\S+|generated_documents/\S+|/[^\s:]+/generated_documents/\S+)\.pdf",
-        "",
-        sanitized,
-        flags=re.IGNORECASE,
-    )
+    if document_values:
+        # Safety fallback for attached generated-document references that may
+        # have been formatted in plain style instead of markdown style. Keep
+        # source invoice links when no local attachment is being uploaded.
+        sanitized = re.sub(
+            r":\s*\[[^\]\n]+?\.pdf\]\([^\)\n]*generated_documents/[^\)\n]+?\.pdf\)",
+            "",
+            sanitized,
+            flags=re.IGNORECASE,
+        )
+        sanitized = re.sub(
+            r":\s*(?:https?://\S*generated_documents/\S+|generated_documents/\S+|/[^\s:]+/generated_documents/\S+)\.pdf",
+            "",
+            sanitized,
+            flags=re.IGNORECASE,
+        )
 
     lines = [re.sub(r"[ \t]+$", "", line) for line in sanitized.split("\n")]
     return normalize_text("\n".join(lines))
@@ -1271,7 +1330,11 @@ def build_final_response(row):
         return ""
 
     requested_data = requested_data_for_response(row)
-    document_values = _document_display_values_for_response(row, requested_data)
+    document_values = _document_display_values_for_response(
+        row,
+        requested_data,
+        attached_only=True,
+    )
     return _remove_document_values_from_response(draft_response, document_values)
 
 
