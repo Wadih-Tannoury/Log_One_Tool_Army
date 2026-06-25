@@ -66,7 +66,7 @@ generated_documents/power_of_attorney/<extracted_tracking_number>.pdf
 generated_documents/invoice/<invoice_filename_from_document_link>.pdf
 ```
 
-When `return_proforma_invoice` or `commercial_invoice` is requested, the extractor keeps the source link from `erpDocuments.invoiceDocuments[].documentLink`, downloads the PDF with a browser-style request, resolves DocOpen-style HTML wrappers, ASP.NET `__doPostBack` download buttons, and JavaScript/meta-refresh redirects when present, saves the final PDF under `generated_documents/invoice`, and the draft response points to that saved copy. The downloader does not rewrite `DocOpen.aspx?link=<file>.pdf` into a bare `/<file>.pdf` URL.
+When `return_proforma_invoice` or `commercial_invoice` is requested, the extractor keeps the source link from `erpDocuments.invoiceDocuments[].documentLink`, downloads the PDF with a browser-style request, resolves DocOpen-style HTML wrappers, ASP.NET `__doPostBack` download buttons, and JavaScript/meta-refresh redirects when present, saves the final PDF under `generated_documents/invoice`, and the draft response points to that saved copy. The downloader does not rewrite `DocOpen.aspx?link=<file>.pdf` into a bare `/<file>.pdf` URL. If a local PDF cannot be produced but the GET_FULL_ORDER `documentLink` exists, the response uses that source link instead of routing the ticket to human intervention for a missing `*_pdf` value.
 
 The GitHub Actions workflow always uploads `generated_documents` as the `generated-customs-documents` artifact. Committing those files back into the repository is optional and controlled by the manual `workflow_dispatch` input `persist_generated_documents`, which defaults to `false`.
 
@@ -79,7 +79,7 @@ The GitHub Actions workflow always uploads `generated_documents` as the `generat
 - `draft_response`: the internal/audit draft, which may still include generated-document references;
 - `final_response`: the exact public Zendesk comment body.
 
-For rows that require human intervention, `final_response` is intentionally empty and no Zendesk comment is submitted. For automatic rows, generated PDFs are uploaded to Zendesk as ticket attachments and document links are removed from `final_response`; the body only lists the data/documents being provided, for example `- RPI` instead of a GitHub URL.
+For rows that require human intervention, `final_response` is intentionally empty and no Zendesk comment is submitted. For automatic rows, generated PDFs are uploaded to Zendesk as ticket attachments and attached-document links are removed from `final_response`; the body only lists the data/documents being provided, for example `- RPI` instead of a GitHub URL. If an invoice/RPI is available only as a GET_FULL_ORDER source link, that link stays in `final_response` because there is no local attachment to upload.
 
 The BigQuery history table is migrated additively at runtime with:
 
@@ -93,6 +93,7 @@ Zendesk submission is controlled by one explicit flag:
 ```bash
 SUBMIT_ZENDESK_RESPONSES=true   # submit public Zendesk replies and upload attachments
 SUBMIT_ZENDESK_RESPONSES=false  # log only; do not update Zendesk tickets
+ZENDESK_STATUS_AFTER_REPLY=closed  # status set when an automatic public reply is posted
 ```
 
 In GitHub Actions, this is exposed as the manual `workflow_dispatch` input `submit_zendesk_responses`. The default is `false` for safety, so a manually triggered run logs BigQuery history and builds `final_response` values without sending anything to Zendesk unless the input is deliberately switched on.
@@ -100,6 +101,11 @@ In GitHub Actions, this is exposed as the manual `workflow_dispatch` input `subm
 Repository persistence is controlled separately by `persist_generated_documents`. Leaving it set to `false` prevents the workflow from committing downloaded/generated PDFs to GitHub while still allowing the same local PDFs to be logged, attached to Zendesk replies when `submit_zendesk_responses=true`, and uploaded as workflow artifacts.
 
 The submission decision is independent from BigQuery history de-duplication. This means a dry run with `submit_zendesk_responses=false` can be followed by another run with `submit_zendesk_responses=true`; the agent will still evaluate the current non-human `final_response` values for Zendesk submission. The duplicate-comment guard skips a ticket when the exact same public response body is already present.
+
+Additional response guardrails:
+
+- If the ticket request body contains `sdoganamento`, `export_tracking_number` is included in the response data so the draft and final public response mention the export tracking number.
+- If `shipment_order_number` / `shipmentOrderNumber` starts with `SC`, the row is routed to human intervention by default.
 
 ## Response data extractor script
 
