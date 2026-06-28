@@ -53,6 +53,15 @@ Return:
 Do not compress unrelated requested data elements into one intent.
 The system downstream uses each requested_data value to retrieve data and build the final response.
 
+
+## Carrier-Domain Category Fallback Context
+
+Some active Zendesk tickets now come from UPS/DHL/FedEx requester emails that are not present in `tlg-business-intelligence-prd.til.log_one_tool_army_config`. For those rows, `ticket_category` is inferred from the current request body and subject before this prompt is called. Treat that inferred category as workflow context, not as proof that a specific data element was requested.
+
+Do not turn carrier notification boilerplate into requested data. High-volume historical no-action emails include delivery-status notifications, Import Data Summary information-only messages, UPS MRN/document automatic messages, UPS claim/inquiry acknowledgements, carrier billing notices, and no-reply tracking updates. If such a row reaches the LLM and does not ask TLG to provide information, return `unknown_request` with low confidence.
+
+FedEx Support Hub requests are different: if the sender asks TLG to upload/provide information or instructions through FedEx Support Hub, return `human_intervention_required` because a human must handle the external portal.
+
 ## Precision and Escalation Rules
 
 Accuracy is more important than automation.
