@@ -38,6 +38,26 @@ UPS_STANDARD_REPLY_REQUESTED_DATA = [
     "return_proforma_invoice",
     "returned_items_confirmation",
 ]
+
+RETURNS_CUSTOMS_FIRST_REQUEST_REQUIRED_DATA = [
+    "export_tracking_number",
+    "return_proforma_invoice",
+    "ups_account_number",
+    "returned_items_confirmation",
+]
+RETURNS_CUSTOMS_FIRST_REQUEST_TRIGGER_DATA = set(RETURNS_CUSTOMS_FIRST_REQUEST_REQUIRED_DATA)
+RETURNS_CUSTOMS_FIRST_REQUEST_DATA_ALIASES = {
+    "tracking_number": "export_tracking_number",
+    "export_tracking": "export_tracking_number",
+    "return_tracking_number": "export_tracking_number",
+    "ups_account": "ups_account_number",
+    "ups_account_code": "ups_account_number",
+    "ups_code": "ups_account_number",
+    "rpi": "return_proforma_invoice",
+    "pri": "return_proforma_invoice",
+    "returned_items": "returned_items_confirmation",
+    "returned_item": "returned_items_confirmation",
+}
 FEDEX_STANDARD_REPLY_REQUESTED_DATA = [
     "export_tracking_number",
     "returned_items_confirmation",
@@ -68,6 +88,22 @@ STANDARD_REPLY_REQUESTED_DATA[FEDEX_BROKERAGE_EMAIL] = FEDEX_STANDARD_REPLY_REQU
 STANDARD_REPLY_REQUESTED_DATA[DHL_BROKERAGE_EMAIL] = DHL_STANDARD_REPLY_REQUESTED_DATA
 
 UPS_TRACKING_PATTERN = re.compile(r"\b1Z([0-9A-Z]{6})[0-9A-Z]{10}\b", re.IGNORECASE)
+
+KNOWN_REQUESTED_DATA_TOKEN_RE = re.compile(
+    r"\b(?:"
+    r"human_intervention_required|unknown_request|exclude_from_processing|"
+    r"commercial_invoice|return_proforma_invoice|corrected_invoice|invoice_correction|"
+    r"export_tracking_number|ups_account_number|returned_items_confirmation|"
+    r"customs_description|importer_details|value_confirmation|"
+    r"tax_information|country_of_origin|product_description|"
+    r"dichiarazione_di_libera_esportazione|declaration_of_intent|eori_number|"
+    r"power_of_attorney|authorization_letter|shipment_instructions|"
+    r"customer_phone|customer_email|customer_name|shipping_address|"
+    r"address_translation|exporter_ein|address_correction|previously_requested_documentation|"
+    r"tracking_number|ups_account|ups_account_code|ups_code|returned_items|invoice"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1145,6 +1181,66 @@ def collapse_document_embedded_requested_data(
     return result
 
 
+def _normalize_returns_first_request_bundle_values(value: object) -> List[str]:
+    values: List[str] = []
+    for item in normalize_requested_data(value):
+        normalized = RETURNS_CUSTOMS_FIRST_REQUEST_DATA_ALIASES.get(item, item)
+        if normalized and normalized not in values:
+            values.append(normalized)
+    return values
+
+
+def expand_first_returns_customs_clearance_bundle(
+    requested_data: object,
+    ticket_category: object = "",
+    request_number: object = 1,
+    requester_email: object = "",
+    trigger_requested_data: object = None,
+) -> List[str]:
+    """Expand first UPS Returns Customs Clearance regex hits to the full bundle.
+
+    The first UPS return-clearance reply must include the export tracking
+    number, return proforma invoice, UPS account number, and returned-items
+    confirmation together.  If regex/effective requested_data detects any one
+    of those fields on request number 1, downstream enrichment and response
+    generation should prepare all four instead of answering only the partial
+    match.
+
+    The expansion is scoped to UPS-style contexts to avoid adding a UPS account
+    number to DHL/FedEx RPI-only cases.  A non-UPS sender can still trigger the
+    bundle when the detected data explicitly includes ups_account_number.
+    """
+    values = _normalize_returns_first_request_bundle_values(requested_data)
+    triggers = _normalize_returns_first_request_bundle_values(
+        trigger_requested_data if trigger_requested_data is not None else requested_data
+    )
+
+    if not is_first_returns_customs_request(ticket_category, request_number):
+        return values
+
+    if HUMAN_INTERVENTION_REQUIRED in values or UNKNOWN_REQUEST in values:
+        return values
+
+    trigger_set = set(triggers)
+    value_set = set(values)
+    if not (trigger_set | value_set) & RETURNS_CUSTOMS_FIRST_REQUEST_TRIGGER_DATA:
+        return values
+
+    ups_bundle_context = (
+        is_ups_requester_email(requester_email)
+        or "ups_account_number" in trigger_set
+        or "ups_account_number" in value_set
+    )
+    if not ups_bundle_context:
+        return values
+
+    expanded: List[str] = list(RETURNS_CUSTOMS_FIRST_REQUEST_REQUIRED_DATA)
+    for value in values:
+        if value not in expanded:
+            expanded.append(value)
+    return expanded
+
+
 # Deterministic language dictionaries built from recurrent wording in the
 # historical Zendesk tickets.  High-signal phrases receive higher weights;
 # generic carrier/customs words receive lower weights to avoid overreacting to
@@ -1415,7 +1511,12 @@ def normalize_requested_data(value: object) -> List[str]:
         if parsed_ok and isinstance(parsed, (list, tuple, set, dict)):
             raw_values = _flatten_requested_data_values(parsed)
         else:
-            raw_values = [item.strip() for item in text.split(",")]
+            # Tolerate malformed BigQuery repeated-field strings, for example
+            # a broken JSON fragment containing {"v":"return_proforma_invoice"}.
+            # In that case extracting known requested-data tokens is safer than
+            # returning unusable comma-split fragments.
+            extracted_tokens = KNOWN_REQUESTED_DATA_TOKEN_RE.findall(text)
+            raw_values = extracted_tokens if extracted_tokens else [item.strip() for item in text.split(",")]
     else:
         raw_values = _flatten_requested_data_values(value)
 
