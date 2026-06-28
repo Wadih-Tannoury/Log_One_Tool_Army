@@ -38,6 +38,7 @@ from customs_rules import (
     UNKNOWN_REQUEST,
     clean_latest_request_text,
     collapse_document_embedded_requested_data,
+    expand_first_returns_customs_clearance_bundle,
     classify_ticket_category_from_content,
     contains_correction_or_discrepancy,
     get_standard_reply_requested_data,
@@ -790,10 +791,31 @@ class RegexEngine:
             requester_email=requester_email,
             request_text=cleaned_text,
         )
+        requested_data_before_bundle = list(requested_data)
+        regex_requested_data = expand_first_returns_customs_clearance_bundle(
+            regex_requested_data,
+            ticket_category=ticket_category,
+            request_number=request_number,
+            requester_email=requester_email,
+            trigger_requested_data=requested_data,
+        )
+        requested_data = expand_first_returns_customs_clearance_bundle(
+            requested_data,
+            ticket_category=ticket_category,
+            request_number=request_number,
+            requester_email=requester_email,
+            trigger_requested_data=requested_data,
+        )
 
         audit_notes: List[str] = []
         review_reasons: List[str] = []
         force_human = False
+
+        if requested_data != requested_data_before_bundle:
+            audit_notes.append(
+                "Expanded first Returns Customs Clearance regex match to the "
+                "full UPS first-request bundle."
+            )
 
         if suppressed_types:
             audit_notes.append(
