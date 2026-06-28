@@ -949,19 +949,16 @@ def generated_document_is_ready(row, data_key):
     if is_blank(value):
         return False
 
-    # A generated document is ready for attachment upload only when a local PDF
-    # exists. Invoice source links can still be used as public fallback links.
+    # A generated/downloaded document is ready for Zendesk upload only when a
+    # local PDF exists. Source invoice/RPI URLs from GET_FULL_ORDER must remain
+    # internal-only and must not be used as public-response fallbacks.
     return document_path_exists(str(value).strip())
 
 
 def invoice_document_is_sendable(row, data_key):
-    """Return True when an invoice/RPI can be sent as an attachment or link."""
+    """Return True only when an invoice/RPI can be attached to Zendesk."""
 
-    if generated_document_is_ready(row, data_key):
-        return True
-
-    source_column = full_order_column_for_data_key(data_key)
-    return bool(source_column and not is_blank(row.get(source_column)))
+    return generated_document_is_ready(row, data_key)
 
 
 def missing_required_full_order_values(row, requested_data):
@@ -1000,10 +997,67 @@ def missing_required_full_order_values(row, requested_data):
     return missing
 
 
+def _document_reference_candidates(value):
+    if is_blank(value) or value == PLACEHOLDER:
+        return []
+
+    text_value = str(value).strip()
+    if not text_value:
+        return []
+
+    candidates = [text_value]
+    rendered = document_value_for_response(text_value)
+    if rendered and rendered not in candidates and rendered != PLACEHOLDER:
+        candidates.append(rendered)
+    return candidates
+
+
+def document_references_for_reviewer(row, requested_data=None):
+    """Return document links/paths that are safe for internal draft review only."""
+
+    references = []
+    language = row_language(row)
+
+    for data_key in document_data_keys_for_response(row, requested_data):
+        label = label_for(data_key, language)
+        columns = []
+
+        generated_column = DOCUMENT_RESPONSE_COLUMNS.get(data_key)
+        if generated_column:
+            columns.append(generated_column)
+
+        source_column = full_order_column_for_data_key(data_key)
+        if source_column and source_column not in columns:
+            columns.append(source_column)
+
+        for column in columns:
+            for candidate in _document_reference_candidates(row.get(column)):
+                item = (label, candidate)
+                if item not in references:
+                    references.append(item)
+
+    return references
+
+
+def format_reviewer_document_references(row, requested_data=None):
+    references = document_references_for_reviewer(row, requested_data)
+    if not references:
+        return ""
+
+    lines = ["Document references for internal review only:"]
+    for label, value in references:
+        lines.append(f"- {label}: {value}")
+    return "\n".join(lines)
+
+
 def build_human_intervention_note(row, reason):
     ticket_id = row.get("zendesk_ticket_id", "")
     request_number = row.get("request_number", "")
     draft = llm_human_intervention_draft(row) if is_tracking_lookup_not_found(row) else ""
+    reviewer_document_references = format_reviewer_document_references(row)
+    reviewer_document_section = (
+        f"\n\n{reviewer_document_references}" if reviewer_document_references else ""
+    )
 
     if draft:
         return (
@@ -1012,7 +1066,8 @@ def build_human_intervention_note(row, reason):
             "because the extracted tracking number was not found in "
             "tlg-business-intelligence-prd.bi.shipping_platform_shipments.\n\n"
             "LLM-drafted response for human review:\n\n"
-            f"{draft}\n\n"
+            f"{draft}"
+            f"{reviewer_document_section}\n\n"
             "---\n"
             f"Reason: {reason}\n"
             f"Ticket: {ticket_id}\n"
@@ -1025,6 +1080,7 @@ def build_human_intervention_note(row, reason):
         f"Reason: {reason}\n"
         f"Ticket: {ticket_id}\n"
         f"Request number: {request_number}"
+        f"{reviewer_document_section}"
     )
 
 
@@ -1059,20 +1115,38 @@ def build_generic_response(row, requested_data, language):
             lines.append(f"- {label}: {value}")
 
     body = "\n".join(lines)
+    document_requested = bool(set(requested_data) & DOCUMENT_ATTACHMENT_DATA_KEYS)
+    information_requested = any(
+        data_key not in DOCUMENT_ATTACHMENT_DATA_KEYS for data_key in requested_data
+    )
 
     if language == "it":
+        if document_requested and information_requested:
+            intro = "Di seguito le informazioni richieste e in allegato la documentazione:"
+        elif document_requested:
+            intro = "In allegato invio la documentazione richiesta:"
+        else:
+            intro = "Di seguito le informazioni richieste:"
+
         return (
             "Buongiorno,\n\n"
             "Grazie per il vostro messaggio.\n\n"
-            "Di seguito le informazioni richieste:\n\n"
+            f"{intro}\n\n"
             f"{body}\n\n"
             "Cordiali saluti,"
         )
 
+    if document_requested and information_requested:
+        intro = "Please find below the requested information and attached documents:"
+    elif document_requested:
+        intro = "Please find attached the requested documents:"
+    else:
+        intro = "Please find below the requested information:"
+
     return (
         "Hi,\n\n"
         "Thank you for your message.\n\n"
-        "Please find below the requested information:\n\n"
+        f"{intro}\n\n"
         f"{body}\n\n"
         "Kind regards,"
     )
@@ -1507,13 +1581,78 @@ def _document_display_values_for_response(row, requested_data=None, *, attached_
     for data_key in document_data_keys_for_response(row, requested_data):
         if attached_only and not generated_document_is_ready(row, data_key):
             continue
+
+        # Add the value exactly as it appears in the draft response.
         value = data_value(row, data_key)
-        if is_blank(value) or value == PLACEHOLDER:
-            continue
-        text_value = str(value).strip()
-        if text_value and text_value not in values:
-            values.append(text_value)
+        for candidate in _document_reference_candidates(value):
+            if candidate not in values:
+                values.append(candidate)
+
+        # Also add raw/rendered generated paths and GET_FULL_ORDER source links.
+        # This makes final_response safe even when an older draft contains a
+        # source invoice/RPI link while a later run has a local attachment, or
+        # vice versa.
+        columns = []
+        generated_column = DOCUMENT_RESPONSE_COLUMNS.get(data_key)
+        if generated_column:
+            columns.append(generated_column)
+        source_column = full_order_column_for_data_key(data_key)
+        if source_column and source_column not in columns:
+            columns.append(source_column)
+
+        for column in columns:
+            if attached_only and column != generated_column:
+                continue
+            for candidate in _document_reference_candidates(row.get(column)):
+                if candidate not in values:
+                    values.append(candidate)
+
     return values
+
+
+def _strip_public_links_from_final_response(text):
+    """Remove markdown/raw links from public final_response text.
+
+    Internal draft_response may contain document references. Public Zendesk
+    comments must not expose invoice/RPI/LOA/POA/document URLs; the documents
+    are provided through Zendesk attachment uploads instead.
+    """
+
+    sanitized = str(text or "")
+
+    # Remove links that directly follow a label separator, including the
+    # separator, so `RPI: [file](url)` becomes `RPI`.
+    sanitized = re.sub(
+        r":\s*\[[^\]\n]+\]\([^\)\n]+\)",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    sanitized = re.sub(
+        r":\s*(?:https?://\S+|generated_documents/\S+|/[^\s:]+/generated_documents/\S+)",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    # Defense-in-depth: remove any remaining markdown links or raw URLs from a
+    # public response body. This is intentionally broader than PDFs only because
+    # final_response should not contain public document links of any kind.
+    sanitized = re.sub(
+        r"\[[^\]\n]+\]\([^\)\n]+\)",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    sanitized = re.sub(r"https?://\S+", "", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(
+        r"(?:generated_documents/\S+|/[^\s:]+/generated_documents/\S+)",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+
+    return sanitized
 
 
 def _remove_document_values_from_response(response_text, document_values):
@@ -1524,22 +1663,7 @@ def _remove_document_values_from_response(response_text, document_values):
         sanitized = sanitized.replace(f":\n{value}", "")
         sanitized = sanitized.replace(value, "")
 
-    if document_values:
-        # Safety fallback for attached generated-document references that may
-        # have been formatted in plain style instead of markdown style. Keep
-        # source invoice links when no local attachment is being uploaded.
-        sanitized = re.sub(
-            r":\s*\[[^\]\n]+?\.pdf\]\([^\)\n]*generated_documents/[^\)\n]+?\.pdf\)",
-            "",
-            sanitized,
-            flags=re.IGNORECASE,
-        )
-        sanitized = re.sub(
-            r":\s*(?:https?://\S*generated_documents/\S+|generated_documents/\S+|/[^\s:]+/generated_documents/\S+)\.pdf",
-            "",
-            sanitized,
-            flags=re.IGNORECASE,
-        )
+    sanitized = _strip_public_links_from_final_response(sanitized)
 
     lines = [re.sub(r"[ \t]+$", "", line) for line in sanitized.split("\n")]
     return normalize_text("\n".join(lines))
@@ -1566,7 +1690,7 @@ def build_final_response(row):
     document_values = _document_display_values_for_response(
         row,
         requested_data,
-        attached_only=True,
+        attached_only=False,
     )
     return _remove_document_values_from_response(draft_response, document_values)
 
