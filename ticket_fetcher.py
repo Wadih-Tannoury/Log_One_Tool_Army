@@ -43,6 +43,7 @@ from customs_rules import (
     carrier_code_from_email,
     classify_ticket_category_from_content,
     email_matches_any_carrier_domain,
+    is_noreply_requester_email,
     normalize_email,
 )
 
@@ -1036,6 +1037,8 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
 
     response_rows = []
     for row in raw_rows:
+        if is_noreply_requester_email(row.get("requester_email")):
+            continue
         if bool(_to_bool(row.get("human_intervention_required"))):
             continue
         final_response = row.get("final_response")
