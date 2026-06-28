@@ -8,6 +8,8 @@ The response generator must not use an LLM. It uses:
 - the `request_language` column produced by the deterministic dictionary language-detection step;
 - ticket metadata such as requester email, request number, ticket category, and tracking numbers.
 
+If `llm_was_used` is true, the internal `draft_response` must report the model from `llm_model_used` as `LLM analysis model: <model>.`. If `llm_model_attempts` shows a fallback chain, include the attempts in the same internal note. Add that model metadata only to `draft_response`; do not include it in `final_response` or any public Zendesk comment.
+
 ## Safety Rules
 
 If `request_number` is `3` or higher, do not draft a customer-facing answer. Create a human-intervention note.
