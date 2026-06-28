@@ -51,6 +51,7 @@ from customs_rules import (
     detect_language_with_dictionary,
     contains_correction_or_discrepancy,
     extract_ups_code,
+    expand_first_returns_customs_clearance_bundle,
     first_available_value,
     is_customer_refused_return_request,
     is_no_action_carrier_notification,
@@ -81,6 +82,11 @@ REQUESTED_DATA_ALIASES = {
     "ups_account": "ups_account_number",
     "ups_account_code": "ups_account_number",
     "ups_code": "ups_account_number",
+    "tracking_number": "export_tracking_number",
+    "export_tracking": "export_tracking_number",
+    "returned_items": "returned_items_confirmation",
+    "rpi": "return_proforma_invoice",
+    "pri": "return_proforma_invoice",
     "invoice": "commercial_invoice",
     "commercial_invoice_required": "commercial_invoice",
     "invoice_correction": "corrected_invoice",
@@ -723,6 +729,15 @@ def all_requested_data_sources(row):
     return values
 
 
+def regex_requested_data_sources(row):
+    values = []
+    for column in ["regex_requested_data", "regex_request_types"]:
+        for item in normalize_requested_data_with_aliases(row.get(column)):
+            if item not in values:
+                values.append(item)
+    return values
+
+
 def has_embedded_rpi_contact_fields(row):
     return bool(set(all_requested_data_sources(row)) & RPI_EMBEDDED_CONTACT_REQUESTED_DATA)
 
@@ -808,6 +823,13 @@ def requested_data_for_response(row):
 
     requested_data = normalize_requested_data_with_aliases(row.get("requested_data"))
     requested_data = collapse_embedded_document_fields(row, requested_data)
+    requested_data = expand_first_returns_customs_clearance_bundle(
+        requested_data,
+        ticket_category=row.get("ticket_category"),
+        request_number=row.get("request_number", 1),
+        requester_email=row.get("requester_email"),
+        trigger_requested_data=regex_requested_data_sources(row) or requested_data,
+    )
     requested_data = [
         data_key
         for data_key in requested_data
