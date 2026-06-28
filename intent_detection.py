@@ -37,6 +37,7 @@ from customs_rules import (
     UNKNOWN_REQUEST,
     clean_latest_request_text,
     collapse_document_embedded_requested_data,
+    expand_first_returns_customs_clearance_bundle,
     detect_language_with_dictionary,
     is_no_action_carrier_notification,
     is_request_number_3_or_higher,
@@ -450,6 +451,20 @@ def build_llm_output_row(source_row, result):
         requester_email=source_row.get("requester_email"),
         request_text=source_text_for_llm(source_row),
     )
+    collapsed_regex_requested_data = expand_first_returns_customs_clearance_bundle(
+        collapsed_regex_requested_data,
+        ticket_category=source_row.get("ticket_category"),
+        request_number=source_row.get("request_number", 1),
+        requester_email=source_row.get("requester_email"),
+        trigger_requested_data=collapsed_regex_requested_data,
+    )
+    requested_data = expand_first_returns_customs_clearance_bundle(
+        requested_data,
+        ticket_category=source_row.get("ticket_category"),
+        request_number=source_row.get("request_number", 1),
+        requester_email=source_row.get("requester_email"),
+        trigger_requested_data=collapsed_regex_requested_data,
+    ) or requested_data
     regex_candidates = requested_data_set(collapsed_regex_requested_data)
     llm_candidates = requested_data_set(requested_data)
     llm_human_intervention_draft_response = str(
