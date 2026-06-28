@@ -5,24 +5,42 @@ Agent pipeline that fetches active Zendesk customs-clearance tickets, detects th
 
 ## Zendesk ticket fetch and category classification
 
-`ticket_fetcher.py` retrieves Zendesk mail tickets with API-level status filters for exactly `new`, `open`, and `pending`. The generated Zendesk Search Export queries include `status:new status:open status:pending via:mail`, so `hold`, `solved`, and `closed` tickets are not intentionally fetched and then filtered out. A defensive local status check is still kept in case Zendesk ever returns an unexpected result.
+`ticket_fetcher.py` retrieves Zendesk mail tickets with API-level status filters for exactly `new`, `open`, and `pending`. The default Zendesk Search Export query is:
 
-The fetcher intentionally uses `/api/v2/search/export.json` instead of regular `/api/v2/search.json`. Regular Zendesk search is offset-paginated and fails after the first 1,000 results/page 10 for broad queries; Search Export is cursor-paginated and can continue past that limit. To reduce runtime, the fetcher no longer starts from every active mail ticket. It builds narrow queries in two groups:
+```text
+status:new status:open status:pending via:mail
+```
 
-1. Exact configured carrier requesters from `tlg-business-intelligence-prd.til.log_one_tool_army_config`, batched into `requester:<email>` terms. This preserves the historical configured-email flow.
-2. Carrier-domain terms for `ups.com`, `dhl.com`, and `fedex.com`, which catch active UPS/DHL/FedEx senders that are not present in the config table. Subdomains are still accepted by the local email guardrail, for example `mail.fedex.com`.
+So `hold`, `solved`, and `closed` tickets are not intentionally fetched and then filtered out. A defensive local status check is still kept in case Zendesk ever returns an unexpected result.
+
+The fetcher intentionally uses `/api/v2/search/export.json` instead of regular `/api/v2/search.json`. Regular Zendesk search is offset-paginated and fails after the first 1,000 results/page 10 for broad queries; Search Export is cursor-paginated and can continue past that limit.
+
+The active-ticket fetch now follows the same performance pattern as the standalone historical export script:
+
+1. Run one active-mail Search Export query by default.
+2. Batch-load requester users with `/api/v2/users/show_many.json` instead of calling `/users/{id}.json` one ticket at a time.
+3. Filter requester emails locally to `ups.com`, `dhl.com`, and `fedex.com`, including accepted subdomains through the shared carrier-domain guardrail.
+4. Fetch comments concurrently only for the carrier-domain tickets that survived the requester-email filter.
+5. Build active requests from the latest public requester message block only.
 
 Useful optional environment variables:
 
 ```text
-ZENDESK_SEARCH_EXPORT_PAGE_SIZE=100
+ZENDESK_FETCH_STRATEGY=broad_active
+ZENDESK_SEARCH_EXPORT_PAGE_SIZE=500
+ZENDESK_USER_FETCH_BATCH_SIZE=100
+ZENDESK_COMMENT_FETCH_WORKERS=20
+ZENDESK_MAX_RETRIES=5
+```
+
+`ZENDESK_FETCH_STRATEGY=broad_active` is the recommended default. It avoids several repeated domain/full-text searches and is usually faster because user lookup is batched and comments are fetched only after domain filtering. For diagnostics only, `ZENDESK_FETCH_STRATEGY=narrow` restores the older configured-requester/domain-term query behavior. When using the narrow diagnostic mode, these legacy switches are still available:
+
+```text
 ZENDESK_CONFIG_REQUESTER_QUERY_BATCH_SIZE=45
 ZENDESK_FETCH_CONFIGURED_REQUESTERS=true
 ZENDESK_FETCH_CARRIER_DOMAIN_TERMS=true
 ZENDESK_BROAD_ACTIVE_MAIL_FALLBACK=false
 ```
-
-Leave `ZENDESK_BROAD_ACTIVE_MAIL_FALLBACK=false` for the efficient default. Set it to `true` only as a temporary safety check if you ever suspect Zendesk is not indexing carrier-domain terms as expected.
 
 The config table still remains authoritative for classification:
 
