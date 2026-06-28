@@ -173,6 +173,13 @@ Additional response guardrails:
 
 - If the ticket request body contains `sdoganamento`, `export_tracking_number` is included in the response data so the draft and final public response mention the export tracking number.
 - If `shipment_order_number` / `shipmentOrderNumber` starts with `SC`, the row is routed to human intervention by default.
+- Informational carrier notices, delivery/pickup notifications, import/export document receipts, automatic billing/case updates, acknowledgement-only replies, and customs-cleared/status-only messages are excluded from processing. They receive an internal `draft_response` reason and never produce a public Zendesk `final_response`.
+- `noreply*` requester emails remain human-intervention rows with no public Zendesk reply. If the message is also a status/no-action notification, the draft summary says that no actionable data request was detected instead of listing misleading requested-data labels.
+- UPS UK import-clearance instruction emails asking for customs procedure, commodity code, EORI, DAN/deferment approval, UPS credit-account usage, or possible extra charges are routed to human intervention and skipped for GET_FULL_ORDER/document generation.
+- Cost/penalty/abandonment requests, including Spanish requests to accept generated expenses or sanctions and authorization-of-expenses letters, are routed to human intervention.
+- Invoice/value/MRN/import-export discrepancies and requests for corrected return invoices or corrected values are routed to human intervention instead of sending a normal generated RPI/commercial-invoice reply.
+- BigQuery repeated-field JSON strings such as `{"v":[{"v":"customer_email"}]}` are flattened before response generation, so drafts use real requested-data labels rather than the raw JSON object.
+- DHL `DATA / FROM / OGGETTO` current-message headers are preserved during cleaning so actionable Italian requests such as missing return invoice or HAWB/AWB export requests are not discarded as quoted history.
 
 ## Response data extractor script
 
