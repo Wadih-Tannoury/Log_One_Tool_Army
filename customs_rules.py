@@ -11,7 +11,15 @@ import re
 import unicodedata
 from typing import Dict, List, Tuple
 
+ORDER_CUSTOMS_CLEARANCE = "Order Customs Clearance"
+PENDING_ORDER_RELEASE = "Pending Order Release"
 RETURNS_CUSTOMS_CLEARANCE = "Returns Customs Clearance"
+VALID_TICKET_CATEGORIES = (
+    ORDER_CUSTOMS_CLEARANCE,
+    PENDING_ORDER_RELEASE,
+    RETURNS_CUSTOMS_CLEARANCE,
+)
+CARRIER_EMAIL_DOMAINS = ("ups.com", "dhl.com", "fedex.com")
 PLACEHOLDER = "[TO BE RETRIEVED]"
 HUMAN_INTERVENTION_REQUIRED = "human_intervention_required"
 UNKNOWN_REQUEST = "unknown_request"
@@ -306,6 +314,106 @@ EXPLICIT_UPS_ACCOUNT_REQUEST_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+NO_ACTION_CARRIER_NOTIFICATION_RE = re.compile(
+    r"(?:"
+    r"please\s+do\s+not\s+(?:respond|reply)|"
+    r"do\s+not\s+reply|non\s+rispondere|"
+    r"siete\s+pregati\s+di\s+non\s+rispondere|"
+    r"(?:e-?mail|messaggio)\s+automatic[ao]|automated\s+message|"
+    r"unmonitored\s+mailbox|ups\s+will\s+not\s+receive\s+your\s+reply|"
+    r"allegato\s+mrn\s+relativo|"
+    r"documento\s+di\s+notifica\s+di\s+esportazione|"
+    r"import\s+data\s+summary[\s\S]{0,260}"
+    r"(?:not\s+required\s+to\s+take\s+any\s+action|for\s+your\s+information)|"
+    r"we\s+received\s+your\s+(?:inquiry|claim)|"
+    r"thank\s+you\s+for\s+contacting\s+ups|"
+    r"we(?:'|’|\s+)?re\s+(?:reviewing|currently\s+researching)\s+your\s+(?:claim|inquiry)|"
+    r"claim\s+(?:has\s+not\s+been\s+approved|submitted|closed)|"
+    r"unable\s+to\s+notify\s+your\s+customer|"
+    r"your\s+shipment[\s\S]{0,180}"
+    r"(?:out\s+for\s+delivery|on\s+the\s+way|has\s+been\s+delivered|is\s+delivered|"
+    r"was\s+delivered|scheduled\s+delivery\s+date)|"
+    r"tracking\s+details[\s\S]{0,220}"
+    r"(?:please\s+do\s+not\s+(?:respond|reply)|do\s+not\s+reply)|"
+    r"unpaid\s+shipment\s+charges[\s\S]{0,220}"
+    r"(?:unmonitored\s+mailbox|please\s+do\s+not\s+reply)|"
+    r"la\s+tua\s+ultima\s+fattura\s+dhl[\s\S]{0,220}messaggio\s+automatico"
+    r")",
+    re.IGNORECASE,
+)
+
+
+STRONG_NO_ACTION_CARRIER_NOTIFICATION_RE = re.compile(
+    r"(?:"
+    r"allegato\s+mrn\s+relativo|"
+    r"documento\s+di\s+notifica\s+di\s+esportazione|"
+    r"import\s+data\s+summary[\s\S]{0,260}"
+    r"(?:not\s+required\s+to\s+take\s+any\s+action|for\s+your\s+information)|"
+    r"we\s+received\s+your\s+(?:inquiry|claim)|"
+    r"thank\s+you\s+for\s+contacting\s+ups|"
+    r"we(?:'|’|\s+)?re\s+(?:reviewing|currently\s+researching)\s+your\s+(?:claim|inquiry)|"
+    r"claim\s+(?:has\s+not\s+been\s+approved|submitted|closed)|"
+    r"unable\s+to\s+notify\s+your\s+customer|"
+    r"your\s+shipment[\s\S]{0,180}"
+    r"(?:out\s+for\s+delivery|on\s+the\s+way|has\s+been\s+delivered|is\s+delivered|"
+    r"was\s+delivered|scheduled\s+delivery\s+date)|"
+    r"tracking\s+details[\s\S]{0,220}"
+    r"(?:please\s+do\s+not\s+(?:respond|reply)|do\s+not\s+reply)|"
+    r"unpaid\s+shipment\s+charges[\s\S]{0,220}"
+    r"(?:unmonitored\s+mailbox|please\s+do\s+not\s+reply)|"
+    r"la\s+tua\s+ultima\s+fattura\s+dhl[\s\S]{0,220}messaggio\s+automatico"
+    r")",
+    re.IGNORECASE,
+)
+
+RETURN_CATEGORY_RE = re.compile(
+    r"(?:"
+    r"\b(?:rpi|pri)\b|return\s+proforma|return\s+invoice|"
+    r"fattura\s+(?:di\s+)?reso|proforma\s+(?:di\s+)?reso|"
+    r"reintroduzione\s+in\s+franchigia|"
+    r"(?:merce|articoli|goods|items)[\s\S]{0,100}(?:rientr|return(?:ed|ing))|"
+    r"(?:rientr|return(?:ed|ing))[\s\S]{0,100}(?:merce|articoli|goods|items)|"
+    r"gb\s+returns?|evidence\s+of\s+export|proof\s+of\s+export|"
+    r"(?:trk|tracking|awb|lettera\s+di\s+vettura)[\s\S]{0,60}(?:export|andata)|"
+    r"(?:export|andata)[\s\S]{0,60}(?:trk|tracking|awb|lettera\s+di\s+vettura)|"
+    r"return\s+to\s+shipper|\brts\b"
+    r")",
+    re.IGNORECASE,
+)
+
+PENDING_ORDER_RELEASE_CATEGORY_RE = re.compile(
+    r"(?:"
+    r"fedex\s+support\s+hub|"
+    r"(?:indirizzo|address)[\s\S]{0,120}(?:sconosciut|unknown|incomplete|mancante|missing|incorrect|non\s+corretto)|"
+    r"numero\s+civico|street\s+number|"
+    r"(?:telefono|phone|telephone)[\s\S]{0,120}(?:non\s+(?:e|è)\s+raggiungibile|unreachable|not\s+reachable)|"
+    r"(?:destinatario|consignee|receiver|recipient)[\s\S]{0,100}(?:assente|irreperibile|not\s+available|absent|refus(?:ed|al)|rifiutat[oa])|"
+    r"delivery\s+instructions|delivery\s+address|shipping\s+address|"
+    r"authorization\s+letter|lettera\s+di\s+autorizzazione|"
+    r"notifica\s+di\s+giacenza|avviso\s+di\s+giacenza|\bgiacenza\b"
+    r")",
+    re.IGNORECASE,
+)
+
+ORDER_CUSTOMS_CLEARANCE_CATEGORY_RE = re.compile(
+    r"(?:"
+    r"commercial\s*/?\s*proforma\s+invoice|commercial\s+invoice|"
+    r"copy\s+of\s+(?:commercial\s*/?\s*proforma\s+)?invoice|"
+    r"fattura\s+(?:commerciale|export|doganale)|"
+    r"invoice\s+(?:is\s+)?(?:missing|mancante)|fattura\s+(?:mancante|non\s+presente)|"
+    r"customs\s+clearance|sdoganamento|importazione|export\s+customs\s+data\s+formalities|"
+    r"detailed\s+description|description\s+of\s+(?:the\s+)?(?:goods|contents)|"
+    r"what\s+(?:it|the\s+item|the\s+goods)\s+is|made\s+of|material\s+composition|"
+    r"country\s+of\s+origin|paese\s+di\s+origine|"
+    r"power\s+of\s+attorney|\bpoa\b|procura|lettera\s+di\s+delega|"
+    r"aes\s+filing|electronic\s+export\s+information|"
+    r"shipper\s+export\s+declaration|\bsed\b|\bsli\b|"
+    r"exporter\s+ein|employer\s+identification\s+number|\beori\b"
+    r")",
+    re.IGNORECASE,
+)
+
 DOCUMENT_EMBEDDED_REQUESTED_DATA = {
     "tax_information",
     "country_of_origin",
@@ -533,20 +641,112 @@ def is_ups_account_boilerplate_context(text: object) -> bool:
     return bool(UPS_ACCOUNT_BOILERPLATE_CONTEXT_RE.search(normalize_whitespace(text)))
 
 
+def email_domain(email: object) -> str:
+    normalized = normalize_email(email)
+    if "@" not in normalized:
+        return ""
+    return normalized.rsplit("@", 1)[-1]
+
+
+def email_matches_domain(email: object, domain: str) -> bool:
+    current_domain = email_domain(email)
+    wanted_domain = str(domain or "").strip().lower().lstrip("@")
+    return bool(
+        current_domain
+        and wanted_domain
+        and (current_domain == wanted_domain or current_domain.endswith("." + wanted_domain))
+    )
+
+
+def email_matches_any_carrier_domain(email: object) -> bool:
+    return any(email_matches_domain(email, domain) for domain in CARRIER_EMAIL_DOMAINS)
+
+
+def carrier_code_from_email(email: object) -> str:
+    if email_matches_domain(email, "ups.com"):
+        return "UPS"
+    if email_matches_domain(email, "dhl.com"):
+        return "DHL"
+    if email_matches_domain(email, "fedex.com"):
+        return "FEDEX"
+    return ""
+
+
 def is_ups_requester_email(email: object) -> bool:
     normalized = normalize_email(email)
-    return normalized in UPS_BROKERAGE_EMAILS or normalized.endswith("@ups.com")
+    return normalized in UPS_BROKERAGE_EMAILS or email_matches_domain(email, "ups.com")
 
 
 def is_fedex_requester_email(email: object) -> bool:
     normalized = normalize_email(email)
-    return normalized == FEDEX_BROKERAGE_EMAIL or "fedex" in normalized
+    return normalized == FEDEX_BROKERAGE_EMAIL or email_matches_domain(email, "fedex.com")
 
 
 def is_dhl_requester_email(email: object) -> bool:
     normalized = normalize_email(email)
-    return normalized == DHL_BROKERAGE_EMAIL or normalized.endswith("@dhl.com")
+    return normalized == DHL_BROKERAGE_EMAIL or email_matches_domain(email, "dhl.com")
 
+
+
+
+def is_no_action_carrier_notification(text: object) -> bool:
+    """Return True for carrier-domain notifications that historically needed no reply."""
+    cleaned = normalize_whitespace(text)
+    if not cleaned:
+        return False
+
+    # FedEx Support Hub messages are not reply-safe notifications: they require
+    # a human to act in the portal, so they must pass through the human guardrail.
+    if is_platform_handoff_request(cleaned):
+        return False
+
+    if STRONG_NO_ACTION_CARRIER_NOTIFICATION_RE.search(cleaned):
+        return True
+
+    if not NO_ACTION_CARRIER_NOTIFICATION_RE.search(cleaned):
+        return False
+
+    # Many actionable carrier emails include a generic no-reply footer. Do not
+    # suppress them when the actual latest message asks for customs/order data.
+    has_customs_request = bool(
+        REQUEST_LANGUAGE_RE.search(cleaned) and CUSTOMS_KEYWORD_RE.search(cleaned)
+    )
+    return not has_customs_request
+
+
+def classify_ticket_category_from_content(
+    subject: object = "",
+    request_body: object = "",
+    requester_email: object = "",
+) -> str:
+    """
+    Infer ticket_category for carrier-domain emails that are not present in the
+    BigQuery requester configuration table.
+
+    Configured emails still use their BigQuery category. This fallback keeps the
+    category in the same three-value taxonomy used by the existing workflow.
+    """
+    text = normalize_whitespace(f"{subject or ''}\n{request_body or ''}")
+
+    if RETURN_CATEGORY_RE.search(text):
+        return RETURNS_CUSTOMS_CLEARANCE
+
+    pending_match = bool(PENDING_ORDER_RELEASE_CATEGORY_RE.search(text))
+    order_match = bool(ORDER_CUSTOMS_CLEARANCE_CATEGORY_RE.search(text))
+
+    if pending_match and not order_match:
+        return PENDING_ORDER_RELEASE
+
+    if order_match:
+        return ORDER_CUSTOMS_CLEARANCE
+
+    if pending_match:
+        return PENDING_ORDER_RELEASE
+
+    # Carrier-domain customs tickets are safest under the generic order-customs
+    # branch when the category is not explicit. Unknown requested_data still goes
+    # to the LLM/human guardrails later in the pipeline.
+    return ORDER_CUSTOMS_CLEARANCE
 
 def is_request_number_3_or_higher(request_number: object) -> bool:
     return normalize_request_number(request_number) >= 3
