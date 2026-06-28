@@ -22,6 +22,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote
+from urllib.parse import urlencode
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -1163,21 +1165,32 @@ def extract_tracking_number(subject, description, carrier_code):
     return next(iter(dict.fromkeys(values)), "N/A")
 
 
-def _active_zendesk_search_query() -> str:
+def _active_zendesk_search_query(*, include_type_term: bool = False) -> str:
     """Build the Zendesk query for active mail tickets.
 
     By default this intentionally does not constrain requester emails or dates:
     the Python layer then filters requester emails to carrier domains. Set
     ZENDESK_ACTIVE_TICKET_LOOKBACK_DAYS only if the Zendesk instance needs an
     operational safety window.
+
+    The main fetch path uses Zendesk's cursor-based Search Export endpoint.
+    That endpoint requires the object type in the separate filter[type]
+    parameter and rejects type:ticket inside the query string, so the default
+    query excludes the type term.  include_type_term exists only for backward-
+    compatible tests/debugging against the regular search endpoint.
     """
 
-    search_terms = [
-        "type:ticket",
-        "-status:closed",
-        "-status:solved",
-        "via:mail",
-    ]
+    search_terms = []
+    if include_type_term:
+        search_terms.append("type:ticket")
+
+    search_terms.extend(
+        [
+            "-status:closed",
+            "-status:solved",
+            "via:mail",
+        ]
+    )
 
     lookback_days_raw = str(os.getenv("ZENDESK_ACTIVE_TICKET_LOOKBACK_DAYS", "") or "").strip()
     if lookback_days_raw:
@@ -1192,6 +1205,106 @@ def _active_zendesk_search_query() -> str:
             search_terms.append(f"created>={start_date.strftime('%Y-%m-%d')}")
 
     return " ".join(search_terms)
+
+
+def _zendesk_search_export_url(
+    base_url: str,
+    query: str,
+    *,
+    after_cursor: str | None = None,
+) -> str:
+    """Return a cursor-paginated Search Export URL for tickets."""
+
+    page_size_raw = str(os.getenv("ZENDESK_SEARCH_EXPORT_PAGE_SIZE", "100") or "100").strip()
+    try:
+        page_size = int(page_size_raw)
+    except ValueError as exc:
+        raise ValueError("ZENDESK_SEARCH_EXPORT_PAGE_SIZE must be an integer") from exc
+
+    # Zendesk allows up to 1000 records per page on this endpoint, but its own
+    # docs recommend 100 for stability with large datasets.
+    page_size = min(max(page_size, 1), 1000)
+
+    params = {
+        "query": query,
+        "filter[type]": "ticket",
+        "page[size]": str(page_size),
+    }
+    if after_cursor:
+        params["page[after]"] = after_cursor
+
+    return f"{base_url}/search/export.json?{urlencode(params)}"
+
+
+def _zendesk_meta_has_more(meta: Mapping[str, Any]) -> bool:
+    value = meta.get("has_more")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _absolute_zendesk_url(base_url: str, url: str) -> str:
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    if url.startswith("/"):
+        parsed_base = urlparse(base_url)
+        if parsed_base.scheme and parsed_base.netloc:
+            return f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
+    return url
+
+
+def iter_zendesk_search_export_tickets(
+    *,
+    auth,
+    base_url: str,
+    query: str,
+) -> Iterable[list[dict[str, Any]]]:
+    """Yield pages from Zendesk's cursor-paginated Search Export endpoint.
+
+    The regular /search.json endpoint is offset-paginated and fails with HTTP
+    422 when page 11 is requested at 100 results/page. Search Export avoids
+    that 1,000-result ceiling and is the safer way to fetch all active mail
+    tickets before applying the UPS/DHL/FedEx requester-domain filter locally.
+    """
+
+    base_url = base_url.rstrip("/")
+    url = _zendesk_search_export_url(base_url, query)
+    page = 1
+
+    while url:
+        response = requests.get(url, auth=auth, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+
+        tickets = payload.get("results", [])
+        print(
+            f"Found {len(tickets)} active mail tickets on Zendesk search export "
+            f"page {page}."
+        )
+        yield tickets
+
+        links = payload.get("links") or {}
+        meta = payload.get("meta") or {}
+        next_url = links.get("next")
+        if _zendesk_meta_has_more(meta):
+            if next_url:
+                url = _absolute_zendesk_url(base_url, str(next_url))
+            elif meta.get("after_cursor"):
+                url = _zendesk_search_export_url(
+                    base_url,
+                    query,
+                    after_cursor=str(meta["after_cursor"]),
+                )
+            else:
+                raise RuntimeError(
+                    "Zendesk Search Export indicated more results but did not "
+                    "return links.next or meta.after_cursor."
+                )
+            page += 1
+        else:
+            url = None
 
 
 def fetch_ticket_rows(
@@ -1211,8 +1324,6 @@ def fetch_ticket_rows(
 
     rows: list[dict[str, Any]] = []
     query = _active_zendesk_search_query()
-    url = f"{base_url}/search.json?query={quote(query)}&per_page=100"
-    page = 1
     seen_ticket_ids: set[int] = set()
     user_email_cache: dict[int, str] = {}
     skipped_non_carrier = 0
@@ -1221,15 +1332,16 @@ def fetch_ticket_rows(
         "Fetching active Zendesk mail tickets for requester domains: "
         + ", ".join(CARRIER_EMAIL_DOMAINS)
     )
+    print(
+        "Using Zendesk Search Export cursor pagination to avoid the "
+        "regular Search API 1,000-result/page-10 limit."
+    )
 
-    while url:
-        response = requests.get(url, auth=auth, timeout=60)
-        response.raise_for_status()
-
-        payload = response.json()
-        tickets = payload.get("results", [])
-        print(f"Found {len(tickets)} active mail tickets on Zendesk search page {page}.")
-
+    for tickets in iter_zendesk_search_export_tickets(
+        auth=auth,
+        base_url=base_url,
+        query=query,
+    ):
         for ticket in tickets:
             try:
                 ticket_id = int(ticket["id"])
@@ -1344,9 +1456,6 @@ def fetch_ticket_rows(
 
             except Exception as exc:
                 print(f"Error processing ticket {ticket.get('id')}: {str(exc)}")
-
-        url = payload.get("next_page")
-        page += 1
 
     print(
         f"Fetched {len(rows)} active requester message(s) from carrier-domain tickets; "
