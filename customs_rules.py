@@ -115,7 +115,12 @@ ACTIONABLE_QUOTED_CONTEXT_RE = re.compile(
     r"please\s+(?:provide|send|forward|attach)|"
     r"we\s+(?:need|require)|customer\s+to\s+resolve|"
     r"shipment(?:s)?\s+on\s+hold|pending\s+customer\s+resolution|"
-    r"return\s+to\s+shipper\s+deadline|customs\s+compliance|clear\s+customs"
+    r"return\s+to\s+shipper\s+deadline|customs\s+compliance|clear\s+customs|"
+    r"(?:ti|la|vi)\s+preghiamo\s+di\s+(?:inviar|fornir)|"
+    r"priva\s+di\s+fattura|fattura\s+di\s+reso|"
+    r"restiamo\s+in\s+attesa\s+di\s+ricevere|"
+    r"(?:h)?awb\s+di\s+export|"
+    r"per\s+poter\s+procedere\s+allo\s+sdoganamento"
     r")\b",
     re.IGNORECASE,
 )
@@ -127,7 +132,11 @@ ACTIONABLE_QUOTED_CONTEXT_START_RE = re.compile(
     r"please\s+(?:provide|send|forward|attach)|"
     r"we\s+(?:need|require)|"
     r"the\s+shipment\s+details\s+and\s+deadline|"
-    r"customer\s+to\s+resolve|shipment(?:s)?\s+on\s+hold"
+    r"customer\s+to\s+resolve|shipment(?:s)?\s+on\s+hold|"
+    r"(?:ti|la|vi)\s+preghiamo\s+di\s+(?:inviar|fornir)|"
+    r"priva\s+di\s+fattura|fattura\s+di\s+reso|"
+    r"restiamo\s+in\s+attesa\s+di\s+ricevere|"
+    r"(?:h)?awb\s+di\s+export"
     r")",
     re.IGNORECASE,
 )
@@ -208,10 +217,23 @@ COMMERCIAL_INVOICE_BOILERPLATE_FIELDS = [
 ]
 
 CORRECTION_OR_DISCREPANCY_RE = re.compile(
-    r"\b(?:"
-    r"discrepancy|mismatch|wrong|incorrect|corrected|correction|revised|updated|"
-    r"discrepanza|non\s+corrispond|non\s+coincid|errat[oa]|corrett[oa]|rettificat[oa]"
-    r")\b",
+    r"(?:"
+    # English explicit invoice/value/document mismatch or correction.
+    r"\b(?:invoice|value|amount|mrn|document|documents|export\s+documents?|import\s+documents?)"
+    r"[\s\S]{0,120}\b(?:discrepanc(?:y|ies)|mismatch|wrong|incorrect|corrected|correction|revised|updated|do\s+not\s+match|don['’]?t\s+match)\b|"
+    r"\b(?:discrepanc(?:y|ies)|mismatch|wrong|incorrect|corrected|correction|revised|updated)"
+    r"[\s\S]{0,120}\b(?:invoice|value|amount|mrn|document|documents|export\s+documents?|import\s+documents?)\b|"
+    # Italian invoice/value/document mismatch or requested corrected invoice/value.
+    r"\b(?:fattur[ae]|fattura\s+di\s+ritorno|fattura\s+di\s+reso|valore|valori|importi|mrn|documenti?)"
+    r"[\s\S]{0,120}\b(?:non\s+(?:corrispond\w*|coincid\w*|combac\w*)|corrett[oaie]|rettificat[oaie]|errat[oaie]|discrepanza)\b|"
+    r"\b(?:non\s+(?:corrispond\w*|coincid\w*|combac\w*)|discrepanza)"
+    r"[\s\S]{0,120}\b(?:fattur[ae]|valore|valori|importi|mrn|documenti?)\b|"
+    # Spanish invoice/value/document mismatch or correction.
+    r"\b(?:factura|valor(?:es)?|importe(?:s)?|documentos?|documentos\s+de\s+exportaci[oó]n|documentos\s+de\s+importaci[oó]n|mrn)"
+    r"[\s\S]{0,120}\b(?:no\s+(?:coincid\w*|correspond\w*|concuerd\w*)|incorrect[oa]s?|corregid[oa]s?|correct[oa]s?|discrepancia)\b|"
+    r"\b(?:no\s+(?:coincid\w*|correspond\w*|concuerd\w*)|discrepancia)"
+    r"[\s\S]{0,120}\b(?:factura|valor(?:es)?|importe(?:s)?|documentos?|mrn)\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -242,7 +264,14 @@ UNPAID_EXTRA_CHARGES_RE = re.compile(
     r"oneri|costi|spese|supplementi|dazi|diritti|addebiti)"
     r"[\s\S]{0,120}"
     r"(?:did\s+not\s+pay|didn['’]?t\s+pay|has\s+not\s+paid|not\s+paid|"
-    r"non\s+ha\s+(?:ancora\s+)?pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)"
+    r"non\s+ha\s+(?:ancora\s+)?pagato|non\s+paga|mancato\s+pagamento|pagamento\s+mancante)|"
+    r"(?:aceptar|asumir)\s+(?:todos\s+los\s+)?gastos(?:\s+generados|\s+incurridos)?|"
+    r"(?:carta\s+de\s+autorizaci[oó]n\s+de\s+ga?s?tos)|"
+    r"sanci[oó]n\s+de\s+\d+|fuera\s+de\s+plazo|estado\s+de\s+abandono|"
+    r"(?:accept|approve|authorize)\s+(?:all\s+)?(?:charges?|fees?|costs?|penalt(?:y|ies))|"
+    r"(?:extra\s+charges?|processing\s+fee|storage\s+fees?|deferment\s+fee|ups\s+dan|fee\s+of\s+\d)|"
+    r"(?:accettare|autorizzare|approvare)\s+(?:tutti\s+)?(?:i\s+)?(?:costi|oneri|spese|addebiti|dazi)|"
+    r"(?:costi|oneri|spese|addebiti|dazi)[\s\S]{0,120}(?:accettare|autorizzare|approvare)"
     r")",
     re.IGNORECASE,
 )
@@ -253,7 +282,9 @@ INFORMATIVE_STATUS_UPDATE_RE = re.compile(
     r"\bsubmitted\s+for\s+release\s+with\s+customs\b|"
     r"\bdesideriamo\s+informarla\b[\s\S]{0,180}\bawb\s+di\s+ritorno\b|"
     r"\bawb\s+di\s+ritorno\s+(?:e|è)\s+il\s+seguente\b|"
-    r"\bspedizione\s+(?:e|è)\s+attualmente\s+in\s+transito\s+verso\s+il\s+mittente\b"
+    r"\bspedizione\s+(?:e|è)\s+attualmente\s+in\s+transito\s+verso\s+il\s+mittente\b|"
+    r"\bpaquete[\s\S]{0,140}a[uú]n\s+se\s+encuentra\s+en\s+tr[aá]nsito\b|"
+    r"\bpackage[\s\S]{0,140}(?:still|currently)\s+in\s+transit\b"
     r")",
     re.IGNORECASE,
 )
@@ -312,10 +343,10 @@ MISSING_INVOICE_REQUEST_RE = re.compile(
 
 UPS_UK_IMPORT_CLEARANCE_INSTRUCTIONS_RE = re.compile(
     r"(?:"
-    r"ups\s+brokerage\s+at\s+east\s+midlands\s+airport[\s\S]{0,600}"
-    r"import\s+customs\s+clearance\s+instructions|"
-    r"please\s+provide\s+import\s+customs\s+clearance\s+instructions[\s\S]{0,500}"
-    r"(?:customs\s+procedure|commodity\s+code|eori|vat\s+number|deferment)"
+    r"ups\s+brokerage\s+at\s+east\s+midlands\s+airport[\s\S]{0,2000}"
+    r"(?:clearance\s+instructions|customs\s+procedure|commodity\s+code|eori|deferment\s+account|\bdan\b|extra\s+charges?)|"
+    r"please\s+provide(?:\s+us\s+with)?\s+(?:your\s+)?(?:import\s+customs\s+)?clearance\s+instructions[\s\S]{0,1200}"
+    r"(?:customs\s+procedure|commodity\s+code|eori|vat\s+number|deferment|\bdan\b|ups\s+credit\s+account)"
     r")",
     re.IGNORECASE,
 )
@@ -390,6 +421,52 @@ NO_ACTION_CARRIER_NOTIFICATION_RE = re.compile(
     r"(?:please\s+do\s+not\s+(?:respond|reply)|do\s+not\s+reply)|"
     r"unpaid\s+shipment\s+charges[\s\S]{0,220}"
     r"(?:unmonitored\s+mailbox|please\s+do\s+not\s+reply)|"
+
+    r"we\s+have\s+(?:enclosed|attached)[\s\S]{0,220}"
+    r"(?:for\s+your\s+information|not\s+required\s+to\s+take\s+any\s+action)|"
+    r"following\s+your\s+recent\s+export[\s\S]{0,260}"
+    r"(?:for\s+your\s+information|not\s+required\s+to\s+take\s+any\s+action)|"
+    r"export\s+data\s+summary[\s\S]{0,260}"
+    r"(?:commercial\s+invoice|not\s+required\s+to\s+take\s+any\s+action)|"
+    r"export\s+cleared[\s\S]{0,120}\bmrn\b|"
+    r"in\s+allegato\s+trasmettiamo\s+la\s+documentazione\s+relativa\s+alla\s+dichiarazione\s+di\s+importazione|"
+    r"please\s+find\s+(?:here\s+)?attached\s+the\s+documentation\s+of\s+the\s+import\s+declaration|"
+    r"adjunto\s+reciba\s+dua\s+de\s+importaci[oó]n|"
+    r"\bdua\s+importaci[oó]n\b|"
+    r"paquete[\s\S]{0,160}a[uú]n\s+se\s+encuentra\s+en\s+tr[aá]nsito|"
+    r"la\s+informeremo\s+quando\s+la\s+spedizione[\s\S]{0,120}disponibile\s+per\s+il\s+ritiro|"
+    r"spedizione\s+(?:e|è)\s+disponibile\s+per\s+il\s+ritiro|"
+    r"abbiamo\s+ricevuto\s+la\s+sua\s+richiesta\s+di\s+consegna\s+presso\s+un\s+nostro\s+punto\s+di\s+ritiro|"
+    r"uw\s+zending\s+is\s+afgeleverd|"
+    r"foto\s+als\s+bewijs\s+van\s+aflevering|"
+    r"your\s+shipment\s+has\s+been\s+delivered|"
+    r"proof\s+of\s+delivery|"
+    r"sorry\s+we\s+missed\s+you|"
+    r"we\s+(?:attempted\s+to\s+deliver|couldn['’]?t\s+deliver)[\s\S]{0,160}your\s+shipment|"
+    r"purtroppo\s+il\s+destinatario\s+era\s+assente|"
+    r"nous\s+sommes\s+d[eé]sol[eé]s\s+de\s+vous\s+avoir\s+manqu[eé]|"
+    r"leider\s+haben\s+wir\s+sie\s+verpasst|"
+    r"mums\s+neizdev[aā]s\s+pieg[aā]d[aā]t|"
+    r"olemme\s+vastaanottaneet\s+pyynt[oö]si[\s\S]{0,140}noutoa\s+varten|"
+    r"przesyłka\s+czeka\s+na\s+ciebie\s+w\s+punkcie\s+odbioru|"
+    r"lähetyksesi\s+on\s+toimitettu|"
+    r"kuvallinen\s+toimitustodistus|"
+    r"din\s+försändelse\s+har\s+levererats|"
+    r"leveransbevis|"
+    r"il\s+caso[\s\S]{0,160}(?:è|e')\s+stato\s+chiuso|"
+    r"reclamo\s+(?:è|e')\s+stato\s+accolto|"
+    r"caso[\s\S]{0,160}(?:preso\s+in\s+carico|creato)|"
+    r"sar[aà]\s+nostra\s+cura\s+contattarvi|"
+    r"questo\s+(?:è|e')\s+un\s+messaggio\s+automatico[\s\S]{0,180}non\s+rispondere|"
+    r"your\s+copy\s+invoice[\s\S]{0,140}requested\s+paperwork|"
+    r"reminder:\s+new\s+eu\s+import\s+rules|"
+    r"thank\s+you\s+for\s+the\s+information[\s\S]{0,160}(?:forwarded|sent)\s+the\s+details\s+to\s+our\s+local\s+office|"
+    r"grazie\s+per\s+le\s+informazioni[\s\S]{0,160}(?:inoltrato|inviato)[\s\S]{0,80}dettagli|"
+    r"solution\s+transport\s+à\s+l['’]?international|"
+    r"ya\s+ha\s+sido\s+despachad[oa]\s+por\s+aduanas|"
+    r"recibida[;,.]?[\s\S]{0,80}despachad[oa]\s+por\s+aduanas|"
+    r"ho\s+dovuto\s+coinvolgere\s+i\s+responsabili[\s\S]{0,180}le\s+aggiorno\s+appena\s+ricevo\s+riscontro|"
+    r"package\s+has\s+not\s+shown\s+any\s+movement[\s\S]{0,220}initiate\s+an\s+investigation|"
     r"la\s+tua\s+ultima\s+fattura\s+dhl[\s\S]{0,220}messaggio\s+automatico"
     r")",
     re.IGNORECASE,
@@ -414,6 +491,52 @@ STRONG_NO_ACTION_CARRIER_NOTIFICATION_RE = re.compile(
     r"(?:please\s+do\s+not\s+(?:respond|reply)|do\s+not\s+reply)|"
     r"unpaid\s+shipment\s+charges[\s\S]{0,220}"
     r"(?:unmonitored\s+mailbox|please\s+do\s+not\s+reply)|"
+
+    r"we\s+have\s+(?:enclosed|attached)[\s\S]{0,220}"
+    r"(?:for\s+your\s+information|not\s+required\s+to\s+take\s+any\s+action)|"
+    r"following\s+your\s+recent\s+export[\s\S]{0,260}"
+    r"(?:for\s+your\s+information|not\s+required\s+to\s+take\s+any\s+action)|"
+    r"export\s+data\s+summary[\s\S]{0,260}"
+    r"(?:commercial\s+invoice|not\s+required\s+to\s+take\s+any\s+action)|"
+    r"export\s+cleared[\s\S]{0,120}\bmrn\b|"
+    r"in\s+allegato\s+trasmettiamo\s+la\s+documentazione\s+relativa\s+alla\s+dichiarazione\s+di\s+importazione|"
+    r"please\s+find\s+(?:here\s+)?attached\s+the\s+documentation\s+of\s+the\s+import\s+declaration|"
+    r"adjunto\s+reciba\s+dua\s+de\s+importaci[oó]n|"
+    r"\bdua\s+importaci[oó]n\b|"
+    r"paquete[\s\S]{0,160}a[uú]n\s+se\s+encuentra\s+en\s+tr[aá]nsito|"
+    r"la\s+informeremo\s+quando\s+la\s+spedizione[\s\S]{0,120}disponibile\s+per\s+il\s+ritiro|"
+    r"spedizione\s+(?:e|è)\s+disponibile\s+per\s+il\s+ritiro|"
+    r"abbiamo\s+ricevuto\s+la\s+sua\s+richiesta\s+di\s+consegna\s+presso\s+un\s+nostro\s+punto\s+di\s+ritiro|"
+    r"uw\s+zending\s+is\s+afgeleverd|"
+    r"foto\s+als\s+bewijs\s+van\s+aflevering|"
+    r"your\s+shipment\s+has\s+been\s+delivered|"
+    r"proof\s+of\s+delivery|"
+    r"sorry\s+we\s+missed\s+you|"
+    r"we\s+(?:attempted\s+to\s+deliver|couldn['’]?t\s+deliver)[\s\S]{0,160}your\s+shipment|"
+    r"purtroppo\s+il\s+destinatario\s+era\s+assente|"
+    r"nous\s+sommes\s+d[eé]sol[eé]s\s+de\s+vous\s+avoir\s+manqu[eé]|"
+    r"leider\s+haben\s+wir\s+sie\s+verpasst|"
+    r"mums\s+neizdev[aā]s\s+pieg[aā]d[aā]t|"
+    r"olemme\s+vastaanottaneet\s+pyynt[oö]si[\s\S]{0,140}noutoa\s+varten|"
+    r"przesyłka\s+czeka\s+na\s+ciebie\s+w\s+punkcie\s+odbioru|"
+    r"lähetyksesi\s+on\s+toimitettu|"
+    r"kuvallinen\s+toimitustodistus|"
+    r"din\s+försändelse\s+har\s+levererats|"
+    r"leveransbevis|"
+    r"il\s+caso[\s\S]{0,160}(?:è|e')\s+stato\s+chiuso|"
+    r"reclamo\s+(?:è|e')\s+stato\s+accolto|"
+    r"caso[\s\S]{0,160}(?:preso\s+in\s+carico|creato)|"
+    r"sar[aà]\s+nostra\s+cura\s+contattarvi|"
+    r"questo\s+(?:è|e')\s+un\s+messaggio\s+automatico[\s\S]{0,180}non\s+rispondere|"
+    r"your\s+copy\s+invoice[\s\S]{0,140}requested\s+paperwork|"
+    r"reminder:\s+new\s+eu\s+import\s+rules|"
+    r"thank\s+you\s+for\s+the\s+information[\s\S]{0,160}(?:forwarded|sent)\s+the\s+details\s+to\s+our\s+local\s+office|"
+    r"grazie\s+per\s+le\s+informazioni[\s\S]{0,160}(?:inoltrato|inviato)[\s\S]{0,80}dettagli|"
+    r"solution\s+transport\s+à\s+l['’]?international|"
+    r"ya\s+ha\s+sido\s+despachad[oa]\s+por\s+aduanas|"
+    r"recibida[;,.]?[\s\S]{0,80}despachad[oa]\s+por\s+aduanas|"
+    r"ho\s+dovuto\s+coinvolgere\s+i\s+responsabili[\s\S]{0,180}le\s+aggiorno\s+appena\s+ricevo\s+riscontro|"
+    r"package\s+has\s+not\s+shown\s+any\s+movement[\s\S]{0,220}initiate\s+an\s+investigation|"
     r"la\s+tua\s+ultima\s+fattura\s+dhl[\s\S]{0,220}messaggio\s+automatico"
     r")",
     re.IGNORECASE,
@@ -535,6 +658,19 @@ def split_quoted_history(text: object) -> Tuple[str, str, bool]:
 
     marker_match = QUOTE_HISTORY_MARKER_RE.search(normalized)
     if marker_match:
+        # Some carrier templates begin with header-like lines such as
+        # "DATA ... FROM ... OGGETTO ...".  Those are the actual current
+        # request, not quoted history.  Do not discard the actionable body when
+        # a quote-looking marker appears at the very beginning of the message.
+        if marker_match.start() <= 80:
+            early_tail = normalized[marker_match.start() : marker_match.start() + 1200]
+            if not re.search(
+                r"original\s+message|messaggio\s+originale|ha\s+scritto|wrote:",
+                early_tail,
+                re.IGNORECASE,
+            ):
+                return normalized, "", False
+
         return (
             normalized[: marker_match.start()].strip(),
             normalized[marker_match.start():].strip(),
@@ -1226,28 +1362,62 @@ def _is_missing(value: object) -> bool:
     return False
 
 
-def normalize_requested_data(value: object) -> List[str]:
-    """Normalize a requested_data value from Python, Excel, or CSV formats."""
+def _flatten_requested_data_values(value: object) -> List[object]:
+    """Flatten nested requested_data values, including BigQuery JSON exports.
+
+    BigQuery CSV exports may serialize repeated fields as values like
+    {"v":[{"v":"customer_email"},{"v":"customer_phone"}]}. Older code
+    treated the whole JSON object as one requested-data key, which produced
+    unusable drafts such as '- {"V":[...]}: [TO BE RETRIEVED]'.
+    """
     if _is_missing(value):
         return []
 
+    if isinstance(value, dict):
+        raw_values: List[object] = []
+        # BigQuery repeated/record export shape.
+        for key in ("v", "V", "requested_data", "request_types", "value", "name"):
+            if key in value:
+                raw_values.extend(_flatten_requested_data_values(value.get(key)))
+        if raw_values:
+            return raw_values
+        for nested_value in value.values():
+            raw_values.extend(_flatten_requested_data_values(nested_value))
+        return raw_values
+
     if isinstance(value, (list, tuple, set)):
-        raw_values = list(value)
-    elif isinstance(value, str):
+        raw_values = []
+        for item in value:
+            raw_values.extend(_flatten_requested_data_values(item))
+        return raw_values
+
+    return [value]
+
+
+def normalize_requested_data(value: object) -> List[str]:
+    """Normalize a requested_data value from Python, Excel, CSV, or BigQuery JSON."""
+    if _is_missing(value):
+        return []
+
+    if isinstance(value, str):
         text = value.strip()
         if not text:
             return []
 
+        parsed = None
+        parsed_ok = False
         try:
             parsed = ast.literal_eval(text)
-            if isinstance(parsed, (list, tuple, set)):
-                raw_values = list(parsed)
-            else:
-                raw_values = [text]
+            parsed_ok = True
         except Exception:
+            parsed_ok = False
+
+        if parsed_ok and isinstance(parsed, (list, tuple, set, dict)):
+            raw_values = _flatten_requested_data_values(parsed)
+        else:
             raw_values = [item.strip() for item in text.split(",")]
     else:
-        raw_values = [value]
+        raw_values = _flatten_requested_data_values(value)
 
     cleaned = []
     for item in raw_values:
