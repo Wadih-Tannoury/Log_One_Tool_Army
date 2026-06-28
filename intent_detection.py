@@ -47,6 +47,11 @@ from customs_rules import (
 
 PROMPT_PATH = "prompts/requested_data_extractor.md"
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+FALLBACK_MODEL = os.getenv(
+    "GEMINI_RATE_LIMIT_FALLBACK_MODEL",
+    os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite"),
+)
+FALLBACK_MODEL_RATE_LIMIT_ATTEMPTS = int(os.getenv("GEMINI_FALLBACK_RATE_LIMIT_ATTEMPTS", "3"))
 BATCH_SIZE = int(os.getenv("LLM_BATCH_SIZE", "20"))
 LLM_CONFIDENCE_MIN = float(os.getenv("LLM_CONFIDENCE_MIN", "0.85"))
 
@@ -92,6 +97,35 @@ DEPRECATED_DOCUMENT_FIELD_KEYS = {
 }
 
 
+def is_rate_limit_error(exc):
+    text = str(exc or "").lower()
+    return (
+        "429" in text
+        or "resource_exhausted" in text
+        or "quota exceeded" in text
+        or "quota_exceeded" in text
+        or "rate limit" in text
+        or "rate_limit" in text
+    )
+
+
+def normalized_model_name(model):
+    return str(model or "").strip().lower().rsplit("/", 1)[-1]
+
+
+def is_gemini_25_flash_model(model):
+    return normalized_model_name(model) == "gemini-2.5-flash"
+
+
+def summarize_model_attempts(attempted_models):
+    summary = []
+    for model in attempted_models:
+        model = str(model or "").strip()
+        if model and model not in summary:
+            summary.append(model)
+    return " -> ".join(summary)
+
+
 class GeminiJsonHelper:
 
     @staticmethod
@@ -127,14 +161,17 @@ class GeminiJsonHelper:
 
 class RequestedDataDetector:
 
-    def __init__(self, model=DEFAULT_MODEL):
+    def __init__(self, model=DEFAULT_MODEL, fallback_model=FALLBACK_MODEL):
         api_key = os.getenv("GEMINI_API_KEY")
 
         if not api_key:
             raise ValueError("Missing GEMINI_API_KEY")
 
         self.client = genai.Client(api_key=api_key)
-        self.model = model
+        self.model = str(model or DEFAULT_MODEL).strip()
+        self.fallback_model = str(fallback_model or "").strip()
+        self.last_model_used = ""
+        self.last_model_attempts = ""
         self.system_prompt = self._load_prompt(PROMPT_PATH)
 
     @staticmethod
@@ -160,6 +197,72 @@ class RequestedDataDetector:
                 cleaned.append(value)
 
         return cleaned or [UNKNOWN_REQUEST]
+
+    def _normalize_results(self, results, model_used, attempted_models):
+        self.last_model_used = str(model_used or "").strip()
+        self.last_model_attempts = summarize_model_attempts(attempted_models)
+
+        for result in results:
+            result["requested_data"] = self._normalize_requested_data(
+                result.get("requested_data", [])
+            )
+
+            if "confidence" not in result:
+                result["confidence"] = 0.0
+
+            if "notes" not in result:
+                result["notes"] = ""
+
+            result["human_intervention_draft_response"] = str(
+                result.get("human_intervention_draft_response", "") or ""
+            ).strip()
+            result["llm_model_used"] = self.last_model_used
+            result["llm_model_attempts"] = self.last_model_attempts
+
+        return results
+
+    def _generate_with_retries(
+        self,
+        *,
+        model,
+        prompt,
+        max_attempts,
+        attempted_models,
+        wait_on_rate_limit,
+    ):
+        last_error = None
+
+        for attempt in range(max_attempts):
+            attempted_models.append(model)
+            try:
+                return GeminiJsonHelper.generate_json_list(
+                    self.client,
+                    model,
+                    prompt,
+                )
+            except Exception as exc:
+                last_error = exc
+
+                if not is_rate_limit_error(exc):
+                    raise
+
+                if wait_on_rate_limit and attempt < max_attempts - 1:
+                    wait_seconds = 30 * (attempt + 1)
+                    print(
+                        f"Rate limit reached for {model}. "
+                        f"Waiting {wait_seconds}s before retry."
+                    )
+                    time.sleep(wait_seconds)
+
+        raise last_error
+
+    def _should_fallback_after_rate_limit(self, exc, model):
+        return (
+            is_rate_limit_error(exc)
+            and is_gemini_25_flash_model(model)
+            and bool(self.fallback_model)
+            and normalized_model_name(self.fallback_model) != normalized_model_name(model)
+        )
 
     def detect_batch(self, batch_payload):
         prompt = f"""
@@ -188,44 +291,52 @@ REQUESTS:
 {json.dumps(batch_payload, ensure_ascii=False, indent=2)}
 """
 
-        last_error = None
+        attempted_models = []
+        self.last_model_used = ""
+        self.last_model_attempts = ""
+        primary_has_fallback = (
+            is_gemini_25_flash_model(self.model)
+            and self.fallback_model
+            and normalized_model_name(self.fallback_model) != normalized_model_name(self.model)
+        )
+        primary_attempts = 1 if primary_has_fallback else 3
 
-        for attempt in range(3):
+        try:
+            results = self._generate_with_retries(
+                model=self.model,
+                prompt=prompt,
+                max_attempts=primary_attempts,
+                attempted_models=attempted_models,
+                wait_on_rate_limit=primary_attempts > 1,
+            )
+            return self._normalize_results(results, self.model, attempted_models)
+        except Exception as exc:
+            self.last_model_attempts = summarize_model_attempts(attempted_models)
+
+            if not self._should_fallback_after_rate_limit(exc, self.model):
+                raise
+
+            print(
+                f"Rate limit reached for {self.model}; "
+                f"switching to fallback model {self.fallback_model}."
+            )
+
             try:
-                results = GeminiJsonHelper.generate_json_list(
-                    self.client,
-                    self.model,
-                    prompt,
+                results = self._generate_with_retries(
+                    model=self.fallback_model,
+                    prompt=prompt,
+                    max_attempts=max(1, FALLBACK_MODEL_RATE_LIMIT_ATTEMPTS),
+                    attempted_models=attempted_models,
+                    wait_on_rate_limit=True,
                 )
-
-                for result in results:
-                    result["requested_data"] = self._normalize_requested_data(
-                        result.get("requested_data", [])
-                    )
-
-                    if "confidence" not in result:
-                        result["confidence"] = 0.0
-
-                    if "notes" not in result:
-                        result["notes"] = ""
-
-                    result["human_intervention_draft_response"] = str(
-                        result.get("human_intervention_draft_response", "") or ""
-                    ).strip()
-
-                return results
-
-            except Exception as exc:
-                last_error = exc
-
-                if "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc):
-                    wait_seconds = 30 * (attempt + 1)
-                    print(f"Rate limit reached. Waiting {wait_seconds}s")
-                    time.sleep(wait_seconds)
-                else:
-                    raise
-
-        raise last_error
+                return self._normalize_results(
+                    results,
+                    self.fallback_model,
+                    attempted_models,
+                )
+            except Exception:
+                self.last_model_attempts = summarize_model_attempts(attempted_models)
+                raise
 
 
 def build_source_id(row):
@@ -353,6 +464,8 @@ def build_human_output_row(source_row, reason, engine="human_guardrail"):
             "notes": reason,
             "human_intervention_required": True,
             "llm_was_used": False,
+            "llm_model_used": "",
+            "llm_model_attempts": "",
         }
     )
     return output
@@ -372,6 +485,8 @@ def build_exclude_output_row(source_row, reason, engine="no_action_guardrail"):
             "notes": reason,
             "human_intervention_required": False,
             "llm_was_used": False,
+            "llm_model_used": "",
+            "llm_model_attempts": "",
         }
     )
     return output
@@ -470,6 +585,8 @@ def build_llm_output_row(source_row, result):
     llm_human_intervention_draft_response = str(
         result.get("human_intervention_draft_response", "") or ""
     ).strip()
+    llm_model_used = str(result.get("llm_model_used", "") or "").strip()
+    llm_model_attempts = str(result.get("llm_model_attempts", "") or "").strip()
 
     if is_tracking_lookup_not_found(source_row):
         engine = "llm_tracking_lookup_not_found_guard"
@@ -570,6 +687,8 @@ def build_llm_output_row(source_row, result):
             "notes": notes,
             "human_intervention_required": human_intervention_required,
             "llm_was_used": True,
+            "llm_model_used": llm_model_used,
+            "llm_model_attempts": llm_model_attempts,
             "llm_human_intervention_draft_response": llm_human_intervention_draft_response,
         }
     )
@@ -690,6 +809,8 @@ def main():
                     "requested_data": [UNKNOWN_REQUEST],
                     "confidence": 0.0,
                     "notes": f"LLM batch failed: {exc}",
+                    "llm_model_used": detector.last_model_used,
+                    "llm_model_attempts": detector.last_model_attempts,
                 }
                 for payload in batch_payload
             ]
