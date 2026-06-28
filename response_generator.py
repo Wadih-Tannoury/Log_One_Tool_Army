@@ -52,6 +52,7 @@ from customs_rules import (
     extract_ups_code,
     first_available_value,
     is_customer_refused_return_request,
+    is_noreply_requester_email,
     is_returns_customs_clearance,
     normalize_email,
     normalize_language,
@@ -61,6 +62,7 @@ from customs_rules import (
 
 INPUT_PATH = REQUEST_INTENT_RESULTS_PATH
 AUTO_ADD_UPS_MIN_CONFIDENCE = float(os.getenv("AUTO_ADD_UPS_MIN_CONFIDENCE", "0.90"))
+NOREPLY_REQUEST_EXCERPT_MAX_CHARS = int(os.getenv("NOREPLY_REQUEST_EXCERPT_MAX_CHARS", "1200"))
 
 DHL_BROKERAGE_EMAIL = os.getenv("DHL_BROKERAGE_EMAIL", "kamil.it@dhl.com")
 SUPPRESSED_RESPONSE_DATA_KEYS = {"previously_requested_documentation"}
@@ -304,6 +306,22 @@ def label_for(data_key, language):
     return labels.get(data_key, data_key.replace("_", " ").title())
 
 
+def truncated_text(value, max_chars):
+    text = normalize_text(value)
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def unique_nonempty_strings(values):
+    result = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text.lower() not in {"nan", "none", "null"} and text not in result:
+            result.append(text)
+    return result
+
+
 def full_order_column_for_data_key(data_key):
     return FULL_ORDER_RESPONSE_COLUMNS.get(data_key)
 
@@ -439,6 +457,133 @@ def is_tracking_lookup_not_found(row):
     return (
         as_bool(row.get("tracking_not_found_in_shipping_platform_shipments"))
         or engine == "llm_tracking_lookup_not_found_guard"
+    )
+
+
+def row_has_request_type(row, request_type):
+    wanted = str(request_type or "").strip()
+    if not wanted:
+        return False
+    for column in ("request_types", "regex_request_types"):
+        if wanted in normalize_requested_data(row.get(column)):
+            return True
+    return False
+
+
+def is_excluded_from_processing(row):
+    if as_bool(row.get("excluded")):
+        return True
+
+    requested_data = normalize_requested_data(row.get("requested_data"))
+    request_types = normalize_requested_data(row.get("request_types"))
+    return (
+        "exclude_from_processing" in request_types
+        and not requested_data
+        and not as_bool(row.get("human_intervention_required"))
+    )
+
+
+def build_exclude_from_processing_draft(row):
+    notes = normalize_text(row.get("notes", ""))
+    if not notes:
+        matched_spans = normalize_text(row.get("matched_spans", ""))
+        if matched_spans:
+            notes = f"Matched exclude_from_processing regex evidence: {matched_spans[:500]}"
+    if not notes:
+        notes = "Regex classified this message as exclude_from_processing."
+
+    return (
+        "Excluded from processing - no Zendesk reply should be sent. "
+        f"Reason: {notes}"
+    )
+
+
+def detected_request_summary(row, requested_data=None):
+    language = row_language(row)
+    requested_data = requested_data if requested_data is not None else requested_data_for_response(row)
+
+    data_keys = [
+        key
+        for key in requested_data
+        if key not in {UNKNOWN_REQUEST, HUMAN_INTERVENTION_REQUIRED}
+    ]
+    if not data_keys:
+        data_keys = [
+            key
+            for key in all_requested_data_sources(row)
+            if key not in {UNKNOWN_REQUEST, HUMAN_INTERVENTION_REQUIRED, "exclude_from_processing"}
+        ]
+
+    lines = []
+
+    subject = truncated_text(row.get("subject", ""), 220)
+    if subject:
+        lines.append(f"- Subject: {subject}")
+
+    refs = unique_nonempty_strings(
+        [
+            row.get("extracted_tracking_number"),
+            row.get("shipment_tracking_number"),
+            row.get("return_tracking_number"),
+            row.get("shipment_order_number"),
+            row.get("shipmentOrderNumber"),
+        ]
+    )
+    if refs:
+        lines.append("- Tracking/order reference(s): " + ", ".join(refs))
+
+    if data_keys:
+        labels = unique_nonempty_strings(label_for(key, language) for key in data_keys)
+        if labels:
+            lines.append("- Detected requested data: " + ", ".join(labels))
+
+    request_types = unique_nonempty_strings(
+        item
+        for column in ("regex_request_types", "request_types")
+        for item in normalize_requested_data(row.get(column))
+        if item not in {UNKNOWN_REQUEST, HUMAN_INTERVENTION_REQUIRED, "exclude_from_processing"}
+    )
+    if request_types:
+        lines.append("- Detected request type(s): " + ", ".join(request_types))
+
+    notes = truncated_text(row.get("notes", ""), 500)
+    if notes:
+        lines.append(f"- Detection notes: {notes}")
+
+    excerpt = truncated_text(
+        first_available_value(
+            row.get("cleaned_request_body"),
+            row.get("request_body"),
+            default="",
+        ),
+        NOREPLY_REQUEST_EXCERPT_MAX_CHARS,
+    )
+    if excerpt:
+        lines.append("- Request excerpt:\n" + excerpt)
+
+    if not lines:
+        lines.append("- The request could not be summarized automatically; review the Zendesk ticket manually.")
+
+    return "\n".join(lines)
+
+
+def build_noreply_human_intervention_note(row, requested_data=None):
+    ticket_id = row.get("zendesk_ticket_id", "")
+    request_number = row.get("request_number", "")
+    requester = normalize_email(row.get("requester_email"))
+    summary = detected_request_summary(row, requested_data)
+
+    return (
+        "HUMAN INTERVENTION REQUIRED\n\n"
+        "Do not send an automatic Zendesk reply. The requester email starts "
+        "with noreply, so no public ticket response should be made by the agent.\n\n"
+        "What the request appears to be about:\n"
+        f"{summary}\n\n"
+        "---\n"
+        "Reason: requester_email starts with noreply; human intervention is required.\n"
+        f"Requester: {requester}\n"
+        f"Ticket: {ticket_id}\n"
+        f"Request number: {request_number}"
     )
 
 
@@ -669,6 +814,9 @@ def requested_data_for_response(row):
 
 
 def row_needs_full_order_lookup(row, requested_data=None):
+    if is_noreply_requester_email(row.get("requester_email")):
+        return False
+
     requested_data = requested_data if requested_data is not None else requested_data_for_response(row)
     requested_set = set(requested_data)
 
@@ -1100,6 +1248,13 @@ def should_force_human_intervention(row, requested_data):
     request_text = row_request_text(row)
     raw_requested_data = normalize_requested_data_with_aliases(row.get("requested_data"))
 
+    if is_noreply_requester_email(row.get("requester_email")):
+        return (
+            True,
+            "Requester email starts with noreply. No automatic Zendesk reply "
+            "should be sent; human intervention is required.",
+        )
+
     if is_request_number_3_or_higher(row.get("request_number")):
         return True, "Request number is 3 or higher. Human intervention is required by automation policy."
 
@@ -1198,6 +1353,12 @@ def build_response(row):
     request_text = row_request_text(row)
     requested_data = requested_data_for_response(row)
 
+    if is_noreply_requester_email(requester_email):
+        return build_noreply_human_intervention_note(row, requested_data)
+
+    if is_excluded_from_processing(row):
+        return build_exclude_from_processing_draft(row)
+
     force_human, reason = should_force_human_intervention(row, requested_data)
     if force_human:
         return build_human_intervention_note(row, reason)
@@ -1261,6 +1422,9 @@ def document_data_keys_for_response(row, requested_data=None):
 
 
 def document_attachment_paths_for_response(row, requested_data=None):
+    if is_noreply_requester_email(row.get("requester_email")):
+        return []
+
     paths = []
     for data_key in document_data_keys_for_response(row, requested_data):
         column = DOCUMENT_RESPONSE_COLUMNS.get(data_key)
@@ -1319,6 +1483,12 @@ def _remove_document_values_from_response(response_text, document_values):
 
 
 def build_final_response(row):
+    if is_noreply_requester_email(row.get("requester_email")):
+        return ""
+
+    if is_excluded_from_processing(row):
+        return ""
+
     if requires_human_intervention(row):
         return ""
 
