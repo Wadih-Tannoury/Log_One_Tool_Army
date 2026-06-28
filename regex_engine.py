@@ -565,25 +565,33 @@ class RegexEngine:
             )
 
         if is_ups_uk_import_clearance_instructions_request(cleaned_text):
-            request_types = [
-                request_type
-                for request_type in request_types
-                if request_type in {"return_proforma_invoice", "tracking_number", "ups_account"}
-            ]
-            for request_type in [
-                "tracking_number",
-                "ups_account",
-                "return_proforma_invoice",
-            ]:
-                if request_type not in request_types:
-                    request_types.append(request_type)
-            matched_spans.append(
-                {
-                    "request_type": "return_proforma_invoice",
-                    "span": "UPS UK import clearance instruction template",
-                    "start": 0,
-                    "end_pos": 0,
-                }
+            return self._as_output(
+                matched=True,
+                excluded=False,
+                request_types=[HUMAN_INTERVENTION_REQUIRED],
+                requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[
+                    {
+                        "request_type": HUMAN_INTERVENTION_REQUIRED,
+                        "span": "UPS UK import clearance instruction template",
+                        "start": 0,
+                        "end_pos": 0,
+                    }
+                ],
+                confidence=HIGH_CONFIDENCE,
+                notes=(
+                    "UPS UK import-clearance instruction request asks for customs "
+                    "procedure, EORI/DAN/deferment approval, commodity details, or "
+                    "possible extra charges. Human intervention is required instead "
+                    "of sending a partial RPI/UPS-account reply."
+                ),
+                force_human_intervention=True,
+                human_intervention_required=True,
+                regex_request_types=[HUMAN_INTERVENTION_REQUIRED],
+                regex_requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
             )
 
         if HUMAN_INTERVENTION_REQUIRED in request_types:
@@ -806,28 +814,15 @@ class RegexEngine:
             )
             force_human = True
 
-        first_request_invoice_or_value_as_rpi = (
-            normalize_request_number(request_number) == 1
-            and (
-                "invoice_correction" in real_request_types
-                or "value_confirmation" in real_request_types
-            )
-        )
-
         if contains_correction_or_discrepancy(cleaned_text) and (
-            "invoice_correction" in real_request_types
-            or "value_confirmation" in real_request_types
+            {"invoice", "invoice_correction", "value_confirmation", "return_proforma_invoice"}
+            & set(real_request_types)
         ):
-            if first_request_invoice_or_value_as_rpi:
-                audit_notes.append(
-                    "Treated first-request invoice correction/value confirmation "
-                    "as part of the return proforma invoice package."
-                )
-            else:
-                review_reasons.append(
-                    "Correction/discrepancy language detected. Manual verification is required."
-                )
-                force_human = True
+            review_reasons.append(
+                "Correction/discrepancy language detected for invoice/value data. "
+                "Manual verification is required instead of treating it as a normal RPI package."
+            )
+            force_human = True
 
         if not requested_data:
             review_reasons.append(
