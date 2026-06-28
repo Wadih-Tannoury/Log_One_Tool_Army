@@ -187,21 +187,48 @@ class GetFullOrderClient:
         return self.credentials is not None
 
     def order_url(self, shipment_order_number: object) -> str:
+        """Return the first GET_FULL_ORDER URL attempted for a shipment order."""
+        return self.order_urls(shipment_order_number)[0]
+
+    def order_urls(self, shipment_order_number: object) -> list[str]:
+        """Return GET_FULL_ORDER URL candidates in the order they should be tried."""
         brand = brand_from_shipment_order_number(shipment_order_number)
-        order_number = order_number_from_shipment_order_number(shipment_order_number)
-        if not brand or not order_number:
+        order_numbers = order_number_candidates_from_shipment_order_number(
+            shipment_order_number
+        )
+        if not brand or not order_numbers:
             raise ValueError(f"Invalid shipment_order_number: {shipment_order_number!r}")
 
-        return (
+        return [
             f"{self.base_url}/brands/{quote(brand, safe='')}/orders/"
             f"{quote(order_number, safe='')}"
-        )
+            for order_number in order_numbers
+        ]
 
     def get_order_payload(self, shipment_order_number: object) -> dict[str, Any]:
         if not self.credentials:
             raise RuntimeError(f"Missing {CREDENTIALS_ENV}")
 
-        url = self.order_url(shipment_order_number)
+        urls = self.order_urls(shipment_order_number)
+        last_not_found_error: requests.HTTPError | None = None
+
+        for position, url in enumerate(urls):
+            try:
+                return self._get_order_payload_from_url(url)
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                has_fallback_url = position < len(urls) - 1
+                if status_code == 404 and has_fallback_url:
+                    last_not_found_error = exc
+                    continue
+                raise
+
+        if last_not_found_error is not None:
+            raise last_not_found_error
+
+        raise RuntimeError("No usable GET_FULL_ORDER URL was available")
+
+    def _get_order_payload_from_url(self, url: str) -> dict[str, Any]:
         last_auth_error: requests.HTTPError | None = None
 
         for request_kwargs in self._auth_request_kwargs():
@@ -687,47 +714,64 @@ def brand_from_shipment_order_number(shipment_order_number: object) -> str:
     return value[:2] if len(value) >= 2 else ""
 
 
-def order_number_from_shipment_order_number(shipment_order_number: object) -> str:
+def _looks_like_brand_prefixed_shipment_order(value: str) -> bool:
+    return bool(re.match(r"^[A-Z0-9]{2}-.{3,}$", value))
+
+
+def _has_euf_or_usf_market_code(value: str) -> bool:
+    """Return True only when EUF/USF is the market code after the brand prefix."""
+    return bool(re.match(r"^[A-Z0-9]{2}-(?:EUF|USF).+$", value))
+
+
+def _replace_sixth_character_with_dash(value: str) -> str:
+    """Return the GET_FULL_ORDER URL shape by replacing character 6 with '-'."""
+    if not _looks_like_brand_prefixed_shipment_order(value):
+        return value
+    # The string is 1-indexed in the business rule: XX-US?..., so character 6
+    # is index 5 in Python. Existing XX-US-... / XX-EU-... values stay the same.
+    return f"{value[:5]}-{value[6:]}" if len(value) >= 6 else value
+
+
+def order_number_candidates_from_shipment_order_number(
+    shipment_order_number: object,
+) -> list[str]:
     """
-    Convert a shipment_order_number into the order number used by GET_FULL_ORDER.
+    Convert a shipment_order_number into GET_FULL_ORDER URL candidates.
+
+    The API order URL must use the shipment order number with the 6th
+    character replaced by '-'. The only exception is EUF/USF market-code values:
+    try those exact values first, then retry with EU-/US- if the exact URL is not
+    found.
 
     Examples:
-        DG-EUA01663254 -> DG-EU-01663254
-        DG-EUB01614772 -> DG-EU-01614772
-        DG-EUC01669099 -> DG-EU-01669099
-        DG-USA11590412 -> DG-US-11590412
-        DG-USB11591156 -> DG-US-11591156
-        DG-USC11589641 -> DG-US-11589641
-        DG-EU-01663254 -> DG-EU-01663254
-        DG-US-11590412 -> DG-US-11590412
-        DG-EUF01663254 -> DG-EUF01663254
-        DG-USF11590412 -> DG-USF11590412
+        DG-EUA01663254 -> [DG-EU-01663254]
+        DG-EUB01614772 -> [DG-EU-01614772]
+        DG-EUC01669099 -> [DG-EU-01669099]
+        DG-USA11590412 -> [DG-US-11590412]
+        DG-USB11591156 -> [DG-US-11591156]
+        DG-USC11589641 -> [DG-US-11589641]
+        DG-EU-01663254 -> [DG-EU-01663254]
+        DG-US-11590412 -> [DG-US-11590412]
+        DG-EUF01663254 -> [DG-EUF01663254, DG-EU-01663254]
+        DG-USF11590412 -> [DG-USF11590412, DG-US-11590412]
     """
 
     value = _normalize_shipment_order_number(shipment_order_number)
     if not value:
-        return value
+        return []
 
-    # Already in the GET_FULL_ORDER URL shape: keep it unchanged.
-    if "-EU-" in value or "-US-" in value:
-        return value
+    normalized_for_url = _replace_sixth_character_with_dash(value)
+    if _has_euf_or_usf_market_code(value):
+        return list(dict.fromkeys([value, normalized_for_url]))
+    return [normalized_for_url]
 
-    # EUF/USF are distinct order-number families and must not be rewritten to
-    # EU-/US-. Match them only as the market code immediately after the brand
-    # prefix, so values such as USB/USC/EUB/EUC still go through conversion.
-    if re.match(r"^[A-Z0-9]{2}-(?:EUF|USF).+$", value):
-        return value
 
-    # Historical shipping-platform values use EU?/US? in the shipment block but
-    # GET_FULL_ORDER expects EU-/US- in the order URL. Only EUF/USF bypass this
-    # rewrite; for example USB, USC, EUB, and EUC all become US-/EU-.
-    match = re.match(r"^([A-Z0-9]{2}-(?:EU|US))([A-Z])(.+)$", value)
-    if match:
-        region_prefix, family_code, suffix = match.groups()
-        if family_code != "F":
-            return f"{region_prefix}-{suffix}"
-
-    return value
+def order_number_from_shipment_order_number(shipment_order_number: object) -> str:
+    """Return the first GET_FULL_ORDER order-number candidate."""
+    candidates = order_number_candidates_from_shipment_order_number(
+        shipment_order_number
+    )
+    return candidates[0] if candidates else ""
 
 
 def shipment_order_number_for_shipment_block_lookup(shipment_order_number: object) -> str:
@@ -738,6 +782,21 @@ def shipment_order_number_for_shipment_block_lookup(shipment_order_number: objec
     if "-US-" in value:
         return value.replace("-US-", "-USA", 1)
     return value
+
+
+def shipment_order_number_lookup_candidates(shipment_order_number: object) -> list[str]:
+    """Return possible shipment-block identifiers for the current payload."""
+    value = _normalize_shipment_order_number(shipment_order_number)
+    if not value:
+        return []
+
+    candidates = [shipment_order_number_for_shipment_block_lookup(value)]
+    if _has_euf_or_usf_market_code(value):
+        fallback_order_number = _replace_sixth_character_with_dash(value)
+        candidates.append(shipment_order_number_for_shipment_block_lookup(fallback_order_number))
+        candidates.append(fallback_order_number)
+
+    return [candidate for candidate in dict.fromkeys(candidates) if candidate]
 
 
 def _truthy(value: object) -> bool:
@@ -812,15 +871,17 @@ def shipment_block_from_order_payload(
     payload: Mapping[str, Any],
     shipment_order_number: object,
 ) -> Mapping[str, Any] | None:
-    wanted = shipment_order_number_for_shipment_block_lookup(shipment_order_number)
-    if not wanted:
+    wanted_candidates = set(
+        shipment_order_number_lookup_candidates(shipment_order_number)
+    )
+    if not wanted_candidates:
         return None
 
     for shipment in _shipments_from_payload(payload):
-        current = shipment_order_number_for_shipment_block_lookup(
-            _shipment_order_value(shipment)
+        current_candidates = set(
+            shipment_order_number_lookup_candidates(_shipment_order_value(shipment))
         )
-        if current == wanted:
+        if current_candidates & wanted_candidates:
             return shipment
 
     return None
