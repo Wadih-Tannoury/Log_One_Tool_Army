@@ -36,7 +36,9 @@ from customs_rules import (
     extract_ups_code,
     collapse_document_embedded_requested_data,
     first_available_value,
+    is_no_action_carrier_notification,
     is_noreply_requester_email,
+    is_ups_uk_import_clearance_instructions_request,
     normalize_email,
     normalize_requested_data,
 )
@@ -408,6 +410,12 @@ def row_needs_full_order_lookup(
     if is_noreply_requester_email(row.get("requester_email")):
         return False
 
+    request_text = _row_request_text(row)
+    if is_no_action_carrier_notification(request_text):
+        return False
+    if is_ups_uk_import_clearance_instructions_request(request_text):
+        return False
+
     requested_data = requested_data if requested_data is not None else requested_data_keys_from_row(row)
     requested_set = set(requested_data)
 
@@ -424,6 +432,12 @@ def row_needs_document_generation(
     requested_data: list[str] | None = None,
 ) -> bool:
     if is_noreply_requester_email(row.get("requester_email")):
+        return False
+
+    request_text = _row_request_text(row)
+    if is_no_action_carrier_notification(request_text):
+        return False
+    if is_ups_uk_import_clearance_instructions_request(request_text):
         return False
 
     requested_data = requested_data if requested_data is not None else requested_data_keys_from_row(row)
