@@ -621,6 +621,55 @@ def llm_human_intervention_draft(row):
     return normalize_text(row.get("llm_human_intervention_draft_response", ""))
 
 
+def llm_model_used_for_draft(row):
+    if not as_bool(row.get("llm_was_used")):
+        return ""
+
+    for column in ("llm_model_used", "gemini_model_used", "model_used"):
+        value = row.get(column)
+        if not is_blank(value):
+            return str(value).strip()
+
+    return "unknown"
+
+
+def llm_model_attempts_for_draft(row):
+    if not as_bool(row.get("llm_was_used")):
+        return ""
+
+    for column in ("llm_model_attempts", "gemini_model_attempts", "model_attempts"):
+        value = row.get(column)
+        if not is_blank(value):
+            return str(value).strip()
+
+    return ""
+
+
+def add_llm_model_note_to_draft(row, draft_response):
+    model_used = llm_model_used_for_draft(row)
+    if not model_used:
+        return normalize_text(draft_response)
+
+    draft_response = normalize_text(draft_response)
+    model_note = f"LLM analysis model: {model_used}"
+    model_attempts = llm_model_attempts_for_draft(row)
+    if model_attempts and model_attempts != model_used:
+        model_note += f" (attempts: {model_attempts})"
+    model_note += "."
+
+    if (
+        draft_response.startswith(model_note)
+        or "LLM model used:" in draft_response[:300]
+        or "LLM analysis model:" in draft_response[:300]
+    ):
+        return draft_response
+
+    if draft_response:
+        return normalize_text(f"{model_note}\n\n{draft_response}")
+
+    return model_note
+
+
 def normalize_data_key(value):
     value = str(value or "").strip()
     return REQUESTED_DATA_ALIASES.get(value, value)
@@ -1632,6 +1681,17 @@ def _document_display_values_for_response(row, requested_data=None, *, attached_
     return values
 
 
+def strip_internal_draft_metadata_from_public_response(text):
+    sanitized = str(text or "")
+    sanitized = re.sub(
+        r"\A\s*LLM (?:model used|analysis model):\s*[^\n]*(?:\n\s*\n)?",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    return normalize_text(sanitized)
+
+
 def _strip_public_links_from_final_response(text):
     """Remove markdown/raw links from public final_response text.
 
@@ -1708,6 +1768,8 @@ def build_final_response(row):
     if is_blank(draft_response):
         return ""
 
+    draft_response = strip_internal_draft_metadata_from_public_response(draft_response)
+
     requested_data = requested_data_for_response(row)
     document_values = _document_display_values_for_response(
         row,
@@ -1754,6 +1816,12 @@ def main():
     df["draft_response"] = df.apply(build_response, axis=1)
     df["human_intervention_required"] = df.apply(requires_human_intervention, axis=1)
     df["final_response"] = df.apply(build_final_response, axis=1)
+    # Add internal LLM model metadata only after final_response is built, so the
+    # public Zendesk response never exposes internal model-routing details.
+    df["draft_response"] = df.apply(
+        lambda row: add_llm_model_note_to_draft(row, row.get("draft_response")),
+        axis=1,
+    )
     df["zendesk_attachment_paths"] = df.apply(
         lambda row: document_attachment_paths_for_response(
             row,
