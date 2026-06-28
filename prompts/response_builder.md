@@ -20,6 +20,11 @@ FedEx Support Hub handoff requests are classified as human intervention because 
 
 If a Returns Customs Clearance first-request response depends on comparing export and return `carrier_code` values, but the comparison cannot be determined from `tlg-business-intelligence-prd.bi.shipping_platform_shipments`, do not draft two alternatives. Create a human-intervention note.
 
+
+Carrier-domain tickets from requester emails not present in the BigQuery config can still be processed. In that case, `ticket_category` was inferred from the current request body and subject by deterministic rules. Use the supplied `ticket_category` normally, but keep all existing human-intervention guardrails.
+
+Carrier notification/status emails that were classified as `exclude_from_processing` should not receive a Zendesk reply. Examples include carrier no-reply delivery notifications, Import Data Summary information-only messages, UPS MRN automatic notices, UPS claim/inquiry acknowledgements, and billing/no-reply notices.
+
 ## Tracking Not Found in Shipments Table Rule
 
 When the tracking number extracted from the ticket is not found in `tlg-business-intelligence-prd.bi.shipping_platform_shipments`, the regex layer must not process the request. The row must be sent only to the LLM.
