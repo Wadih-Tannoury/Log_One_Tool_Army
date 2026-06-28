@@ -119,7 +119,9 @@ Compare the `carrier_code` for the row where `is_return = true` with the `carrie
 
 ## UPS Returns Customs Clearance First Request
 
-For UPS Returns Customs Clearance request number `1`, when the detected requested data includes both `ups_account_number` and `return_proforma_invoice`, draft one response when the carrier comparison is available.
+For UPS Returns Customs Clearance request number `1`, treat `export_tracking_number`, `return_proforma_invoice`, `ups_account_number`, and `returned_items_confirmation` as one required first-request bundle. If regex/effective requested-data detection finds at least one of those values, expand the response data to include all four before enrichment, document generation, and response building.
+
+When the detected requested data includes both `ups_account_number` and `return_proforma_invoice`, draft one response when the carrier comparison is available.
 
 If `carrier_code` is the same for the return row and the export row, draft:
 
