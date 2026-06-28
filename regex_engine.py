@@ -38,6 +38,7 @@ from customs_rules import (
     UNKNOWN_REQUEST,
     clean_latest_request_text,
     collapse_document_embedded_requested_data,
+    classify_ticket_category_from_content,
     contains_correction_or_discrepancy,
     get_standard_reply_requested_data,
     has_actionable_request_language,
@@ -47,6 +48,7 @@ from customs_rules import (
     is_explicit_ups_account_request,
     is_informative_status_update_only,
     is_missing_invoice_request,
+    is_no_action_carrier_notification,
     is_acknowledgement_only,
     is_platform_handoff_request,
     is_request_number_3_or_higher,
@@ -198,11 +200,16 @@ class RegexEngine:
 
         for ticket in tickets:
             request_text = ticket["request_body"] or ""
+            ticket_category = ticket["ticket_category"] or classify_ticket_category_from_content(
+                subject=ticket.get("subject", ""),
+                request_body=request_text,
+                requester_email=ticket.get("requester_email", ""),
+            )
             result = self.detect(
                 request_text,
                 requester_email=ticket["requester_email"],
                 request_number=ticket["request_number"],
-                ticket_category=ticket["ticket_category"],
+                ticket_category=ticket_category,
                 tracking_not_found_in_shipping_platform_shipments=ticket.get(
                     "tracking_not_found_in_shipping_platform_shipments"
                 ),
@@ -218,7 +225,7 @@ class RegexEngine:
                 "subject": ticket["subject"],
                 "request_body": request_text,
                 "cleaned_request_body": result.pop("cleaned_request_text", ""),
-                "ticket_category": ticket["ticket_category"],
+                "ticket_category": ticket_category,
                 "extracted_tracking_number": ticket["extracted_tracking_number"],
                 "shipment_order_number": ticket["shipment_order_number"],
                 "shipment_tracking_number": ticket["shipment_tracking_number"],
@@ -340,6 +347,32 @@ class RegexEngine:
         tracking_not_found = str(
             tracking_not_found_in_shipping_platform_shipments or ""
         ).strip().lower() in {"true", "1", "yes", "y"}
+
+        if is_no_action_carrier_notification(cleaned_text):
+            return self._as_output(
+                matched=True,
+                excluded=True,
+                request_types=["exclude_from_processing"],
+                requested_data=[],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[
+                    {
+                        "request_type": "exclude_from_processing",
+                        "span": "carrier notification/no-reply status message",
+                        "start": 0,
+                        "end_pos": 0,
+                    }
+                ],
+                confidence=HIGH_CONFIDENCE,
+                notes=(
+                    "Carrier-domain notification/status message historically required "
+                    "no customer-facing reply. Excluded before tracking-number guardrails."
+                ),
+                regex_request_types=["exclude_from_processing"],
+                regex_requested_data=[],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
 
         if tracking_not_found:
             return self._as_output(
@@ -880,7 +913,7 @@ if __name__ == "__main__":
 
     print(f"Regex high-confidence matched: {len(matched_results)}")
     print(f"Regex unmatched/review-needed: {len(unmatched_tickets)}")
-    print(f"Regex excluded acknowledgement-only: {excluded_count}")
+    print(f"Regex excluded no-reply/acknowledgement-only: {excluded_count}")
     print("Files written:")
     print(REGEX_MATCHES_PATH)
     print(UNMATCHED_TICKETS_PATH)
