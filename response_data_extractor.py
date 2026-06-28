@@ -36,6 +36,7 @@ from customs_rules import (
     extract_ups_code,
     collapse_document_embedded_requested_data,
     first_available_value,
+    is_noreply_requester_email,
     normalize_email,
     normalize_requested_data,
 )
@@ -404,6 +405,9 @@ def row_needs_full_order_lookup(
     row: Mapping[str, Any],
     requested_data: list[str] | None = None,
 ) -> bool:
+    if is_noreply_requester_email(row.get("requester_email")):
+        return False
+
     requested_data = requested_data if requested_data is not None else requested_data_keys_from_row(row)
     requested_set = set(requested_data)
 
@@ -419,6 +423,9 @@ def row_needs_document_generation(
     row: Mapping[str, Any],
     requested_data: list[str] | None = None,
 ) -> bool:
+    if is_noreply_requester_email(row.get("requester_email")):
+        return False
+
     requested_data = requested_data if requested_data is not None else requested_data_keys_from_row(row)
     requested_set = set(requested_data)
 
@@ -657,22 +664,57 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Response data extraction completed for {len(df)} row(s). Wrote {args.output}.")
 
 
+def _normalize_shipment_order_number(shipment_order_number: object) -> str:
+    return str(shipment_order_number or "").strip().upper()
+
+
 def brand_from_shipment_order_number(shipment_order_number: object) -> str:
-    value = str(shipment_order_number or "").strip().upper()
+    value = _normalize_shipment_order_number(shipment_order_number)
     return value[:2] if len(value) >= 2 else ""
 
 
 def order_number_from_shipment_order_number(shipment_order_number: object) -> str:
     """
-    Convert a shipment_order_number into the order number used by the API.
+    Convert a shipment_order_number into the order number used by GET_FULL_ORDER.
 
-    Example:
+    Examples:
         DG-EUA01663254 -> DG-EU-01663254
+        DG-USA11590412 -> DG-US-11590412
+        DG-EU-01663254 -> DG-EU-01663254
+        DG-US-11590412 -> DG-US-11590412
+        DG-EUF01663254 -> DG-EUF01663254
+        DG-USF11590412 -> DG-USF11590412
     """
 
-    value = str(shipment_order_number or "").strip().upper()
-    if len(value) >= 6:
-        return f"{value[:5]}-{value[6:]}"
+    value = _normalize_shipment_order_number(shipment_order_number)
+    if not value:
+        return value
+
+    # Already in the GET_FULL_ORDER URL shape: keep it unchanged.
+    if "-EU-" in value or "-US-" in value:
+        return value
+
+    # EUF/USF are distinct order-number families and must not be rewritten to
+    # EU-/US-.
+    if "EUF" in value or "USF" in value:
+        return value
+
+    # Historical shipping-platform values use EUA/USA in the shipment block but
+    # GET_FULL_ORDER expects EU-/US- in the order URL.
+    match = re.match(r"^([A-Z0-9]{2}-(?:EU|US))A(.+)$", value)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+
+    return value
+
+
+def shipment_order_number_for_shipment_block_lookup(shipment_order_number: object) -> str:
+    """Return the shipmentOrderNumber shape used inside GET_FULL_ORDER payloads."""
+    value = _normalize_shipment_order_number(shipment_order_number)
+    if "-EU-" in value:
+        return value.replace("-EU-", "-EUA", 1)
+    if "-US-" in value:
+        return value.replace("-US-", "-USA", 1)
     return value
 
 
@@ -748,12 +790,15 @@ def shipment_block_from_order_payload(
     payload: Mapping[str, Any],
     shipment_order_number: object,
 ) -> Mapping[str, Any] | None:
-    wanted = str(shipment_order_number or "").strip().upper()
+    wanted = shipment_order_number_for_shipment_block_lookup(shipment_order_number)
     if not wanted:
         return None
 
     for shipment in _shipments_from_payload(payload):
-        if _shipment_order_value(shipment) == wanted:
+        current = shipment_order_number_for_shipment_block_lookup(
+            _shipment_order_value(shipment)
+        )
+        if current == wanted:
             return shipment
 
     return None
