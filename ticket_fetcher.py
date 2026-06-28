@@ -928,6 +928,39 @@ def _normalize_comment_body(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").replace("\r\n", "\n")).strip()
 
 
+def strip_links_from_public_response(value: Any) -> str:
+    """Defense-in-depth guard: public Zendesk replies must not contain links."""
+
+    sanitized = str(value or "")
+    sanitized = re.sub(
+        r":\s*\[[^\]\n]+\]\([^\)\n]+\)",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    sanitized = re.sub(
+        r":\s*(?:https?://\S+|generated_documents/\S+|/[^\s:]+/generated_documents/\S+)",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    sanitized = re.sub(
+        r"\[[^\]\n]+\]\([^\)\n]+\)",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    sanitized = re.sub(r"https?://\S+", "", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(
+        r"(?:generated_documents/\S+|/[^\s:]+/generated_documents/\S+)",
+        "",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    lines = [re.sub(r"[ \t]+$", "", line) for line in sanitized.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
 def zendesk_public_comment_exists(
     ticket_id: int,
     body: str,
@@ -1048,7 +1081,7 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
         )
         if is_no_action_carrier_notification(request_text):
             continue
-        final_response = row.get("final_response")
+        final_response = strip_links_from_public_response(row.get("final_response"))
         if _response_is_blank(final_response):
             continue
         ticket_id = _to_int(row.get("zendesk_ticket_id"))
