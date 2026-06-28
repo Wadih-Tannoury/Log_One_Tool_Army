@@ -283,7 +283,8 @@ For a `shipment_order_number` such as `DG-EUA01663254`:
 
 Special cases:
 
-- If the `shipment_order_number` contains `EUF` or `USF`, keep it unchanged when building the GET_FULL_ORDER URL.
+- If the `shipment_order_number` contains the `EUF` or `USF` market code immediately after the brand prefix, keep it unchanged when building the GET_FULL_ORDER URL.
+- Do not keep other `EU?` / `US?` market codes unchanged. Convert values such as `EUB`, `EUC`, `USB`, and `USC` to `EU-` / `US-` in the GET_FULL_ORDER URL.
 - If the `shipment_order_number` already contains `EU-` or `US-`, keep that value unchanged in the GET_FULL_ORDER URL, then use the `EUA` / `USA` version to find the matching `shipmentOrderNumber` block inside the payload.
 
 The API credentials come from the `GET_FULL_ORDER_API_CREDENTIALS` repository secret, with this JSON shape:
