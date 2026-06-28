@@ -271,6 +271,23 @@ Procura / delega: [TO BE RETRIEVED]
 Cordiali saluti,
 ```
 
+
+## No-action, human-review, and cleaning guardrails
+
+Do not create a public customer-facing reply for informational carrier/status notifications. This includes delivery or pickup notices, customs-cleared/MRN confirmations, import declaration document receipts, carrier billing/copy-invoice emails, case-created/case-closed acknowledgements, and messages that explicitly say no action is required. These rows should be excluded from processing and the draft should explain the no-action reason.
+
+Requester emails starting with `noreply` must never receive a public Zendesk reply. Keep a human-intervention draft explaining what the message appears to be about. For status-only `noreply` notifications, say that no actionable data request was detected instead of listing false requested-data fields.
+
+Route these cases to human intervention rather than sending a partial automatic answer:
+
+- UPS UK import-clearance instruction templates asking for customs procedure, commodity code/plain description, EORI, UPS credit account, DAN/deferment approval, or warning about extra charges.
+- Requests to accept/authorize costs, expenses, penalties, sanctions, abandonment recovery, storage/deferment fees, or other charge responsibility.
+- Invoice/value/MRN/import-export discrepancies, requests for corrected return invoices, or requests for an invoice/value that must match a specific export document amount.
+
+When reading `requested_data` or `request_types`, flatten BigQuery repeated-field JSON export values such as `{"v":[{"v":"return_proforma_invoice"}]}` before deciding what to answer. Never render that raw JSON object in a draft.
+
+For DHL-style bodies that begin with `DATA`, `FROM`, and `OGGETTO`, treat those lines as the current request header, not quoted history. Preserve the following actionable body, especially Italian requests mentioning missing invoice, `fattura di reso`, `HAWB di export`, or `AWB di export`.
+
 ## GET_FULL_ORDER API Data Enrichment
 
 After `requested_data` has been finalized, `response_generator.py` uses `response_data_extractor.py` to enrich rows that need order-backed data through the GET_FULL_ORDER API.
