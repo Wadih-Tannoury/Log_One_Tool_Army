@@ -38,6 +38,7 @@ from customs_rules import (
     clean_latest_request_text,
     collapse_document_embedded_requested_data,
     detect_language_with_dictionary,
+    is_no_action_carrier_notification,
     is_request_number_3_or_higher,
     normalize_requested_data,
     requested_data_already_answered_by_first_reply,
@@ -356,6 +357,25 @@ def build_human_output_row(source_row, reason, engine="human_guardrail"):
     return output
 
 
+def build_exclude_output_row(source_row, reason, engine="no_action_guardrail"):
+    output = base_output_row(source_row)
+    output.update(
+        {
+            "engine": engine,
+            "matched": True,
+            "excluded": True,
+            "request_types": ["exclude_from_processing"],
+            "requested_data": [],
+            "confidence": 0.99,
+            "llm_confidence": None,
+            "notes": reason,
+            "human_intervention_required": False,
+            "llm_was_used": False,
+        }
+    )
+    return output
+
+
 def is_tracking_lookup_not_found(row) -> bool:
     return as_bool(row.get("tracking_not_found_in_shipping_platform_shipments"))
 
@@ -585,6 +605,13 @@ def main():
             # shipping_platform_shipments, bypass regex/hard guards and let the
             # LLM summarize what it understood before routing to human review.
             rows_for_llm.append(row)
+        elif is_no_action_carrier_notification(source_text_for_llm(row)):
+            llm_results.append(
+                build_exclude_output_row(
+                    row,
+                    "Carrier notification/status message only; no actionable customer-data request was detected.",
+                )
+            )
         elif is_request_number_3_or_higher(row.get("request_number")):
             llm_results.append(
                 build_human_output_row(
