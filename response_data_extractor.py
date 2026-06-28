@@ -679,7 +679,11 @@ def order_number_from_shipment_order_number(shipment_order_number: object) -> st
 
     Examples:
         DG-EUA01663254 -> DG-EU-01663254
+        DG-EUB01614772 -> DG-EU-01614772
+        DG-EUC01669099 -> DG-EU-01669099
         DG-USA11590412 -> DG-US-11590412
+        DG-USB11591156 -> DG-US-11591156
+        DG-USC11589641 -> DG-US-11589641
         DG-EU-01663254 -> DG-EU-01663254
         DG-US-11590412 -> DG-US-11590412
         DG-EUF01663254 -> DG-EUF01663254
@@ -695,15 +699,19 @@ def order_number_from_shipment_order_number(shipment_order_number: object) -> st
         return value
 
     # EUF/USF are distinct order-number families and must not be rewritten to
-    # EU-/US-.
-    if "EUF" in value or "USF" in value:
+    # EU-/US-. Match them only as the market code immediately after the brand
+    # prefix, so values such as USB/USC/EUB/EUC still go through conversion.
+    if re.match(r"^[A-Z0-9]{2}-(?:EUF|USF).+$", value):
         return value
 
-    # Historical shipping-platform values use EUA/USA in the shipment block but
-    # GET_FULL_ORDER expects EU-/US- in the order URL.
-    match = re.match(r"^([A-Z0-9]{2}-(?:EU|US))A(.+)$", value)
+    # Historical shipping-platform values use EU?/US? in the shipment block but
+    # GET_FULL_ORDER expects EU-/US- in the order URL. Only EUF/USF bypass this
+    # rewrite; for example USB, USC, EUB, and EUC all become US-/EU-.
+    match = re.match(r"^([A-Z0-9]{2}-(?:EU|US))([A-Z])(.+)$", value)
     if match:
-        return f"{match.group(1)}-{match.group(2)}"
+        region_prefix, family_code, suffix = match.groups()
+        if family_code != "F":
+            return f"{region_prefix}-{suffix}"
 
     return value
 
