@@ -25,6 +25,8 @@ Carrier-domain tickets from requester emails not present in the BigQuery config 
 
 Carrier notification/status emails that were classified as `exclude_from_processing` should not receive a Zendesk reply. Examples include carrier no-reply delivery notifications, Import Data Summary information-only messages, UPS MRN automatic notices, UPS claim/inquiry acknowledgements, and billing/no-reply notices.
 
+If `requester_email` starts with `noreply`, do not create a public Zendesk reply regardless of the detected requested data. Create a `HUMAN INTERVENTION REQUIRED` draft that summarizes what the request appears to be about, keep `final_response` empty, and mark the row as human intervention required. Do not run GET_FULL_ORDER or document generation only for a `noreply*` sender because no automatic response will be sent.
+
 ## Tracking Not Found in Shipments Table Rule
 
 When the tracking number extracted from the ticket is not found in `tlg-business-intelligence-prd.bi.shipping_platform_shipments`, the regex layer must not process the request. The row must be sent only to the LLM.
@@ -276,8 +278,13 @@ After `requested_data` has been finalized, `response_generator.py` uses `respons
 For a `shipment_order_number` such as `DG-EUA01663254`:
 
 - brand path segment: first two characters, `DG`;
-- order path segment: replace the 6th character with `-`, producing `DG-EU-01663254`;
+- order path segment: convert `EUA` / `USA` to `EU-` / `US-`, producing `DG-EU-01663254`;
 - final URL shape: `https://zelda.thelevelgroup.com/return/api/v1/brands/DG/orders/DG-EU-01663254`.
+
+Special cases:
+
+- If the `shipment_order_number` contains `EUF` or `USF`, keep it unchanged when building the GET_FULL_ORDER URL.
+- If the `shipment_order_number` already contains `EU-` or `US-`, keep that value unchanged in the GET_FULL_ORDER URL, then use the `EUA` / `USA` version to find the matching `shipmentOrderNumber` block inside the payload.
 
 The API credentials come from the `GET_FULL_ORDER_API_CREDENTIALS` repository secret, with this JSON shape:
 
@@ -288,7 +295,7 @@ The API credentials come from the `GET_FULL_ORDER_API_CREDENTIALS` repository se
 }
 ```
 
-The full order payload can contain several shipments. The response generator must use only the shipment block where `shipmentOrderNumber` equals the current `shipment_order_number`.
+The full order payload can contain several shipments. The response generator must use only the shipment block where `shipmentOrderNumber` equals the current `shipment_order_number` after applying the payload lookup normalization above (`EU-` -> `EUA`, `US-` -> `USA`).
 
 From that shipment block:
 
