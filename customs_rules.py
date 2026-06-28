@@ -80,8 +80,7 @@ QUOTE_HISTORY_MARKER_RE = re.compile(
     r"(?im)^\s*(?:"
     r"-----\s*original\s+message\s*-----|"
     r"---------------\s*original\s+message\s*---------------|"
-    r"from:|sent:|subject:|to:|cc:|"
-    r"da:|inviato:|oggetto:|a:|"
+    r"\*{0,2}\s*(?:from|sent|subject|to|cc|da|inviato|oggetto|a)\s*:\*{0,2}|"
     r"on\s+.+?\s+wrote:|"
     r"il\s+.+?\s+ha\s+scritto:"
     r")"
@@ -94,6 +93,58 @@ SIGNATURE_MARKER_RE = re.compile(
     r"cordiali\s+saluti|distinti\s+saluti|saluti"
     r")\s*[,.-]*\s*$"
 )
+
+FOLLOW_UP_CONTEXT_RE = re.compile(
+    r"\b(?:"
+    r"follow(?:ing)?\s+up|follow-?up|reminder|circling\s+back|"
+    r"as\s+per\s+(?:the\s+)?(?:below|previous)|previous(?:ly)?\s+requested|"
+    r"communication\s+from|resolve\s+this\s+(?:export\s+)?shipment|"
+    r"return\s+(?:process\s+date|to\s+shipper\s+deadline)|"
+    r"without\s+a\s+resolution|pending\s+customer\s+resolution"
+    r")\b",
+    re.IGNORECASE,
+)
+
+ACTIONABLE_QUOTED_CONTEXT_RE = re.compile(
+    r"\b(?:"
+    r"required\s+action(?:/information)?(?:\s+from\s+customer)?|"
+    r"action/information\s+listed\s+(?:above|below)|"
+    r"commercial\s+invoice\s+is\s+required|"
+    r"required\s+to\s+meet\s+customs\s+compliance|"
+    r"please\s+respond\s+to\s+this\s+email\s+with\s+the\s+invoice\s+attached|"
+    r"please\s+(?:provide|send|forward|attach)|"
+    r"we\s+(?:need|require)|customer\s+to\s+resolve|"
+    r"shipment(?:s)?\s+on\s+hold|pending\s+customer\s+resolution|"
+    r"return\s+to\s+shipper\s+deadline|customs\s+compliance|clear\s+customs"
+    r")\b",
+    re.IGNORECASE,
+)
+
+ACTIONABLE_QUOTED_CONTEXT_START_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"required\s+action(?:/information)?(?:\s+from\s+customer)?|"
+    r"a\s+commercial\s+invoice\s+is\s+required|"
+    r"please\s+(?:provide|send|forward|attach)|"
+    r"we\s+(?:need|require)|"
+    r"the\s+shipment\s+details\s+and\s+deadline|"
+    r"customer\s+to\s+resolve|shipment(?:s)?\s+on\s+hold"
+    r")",
+    re.IGNORECASE,
+)
+
+QUOTED_CONTEXT_END_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"tracking\s+number\s*/\s*reference\s+information|"
+    r"return\s+to\s+shipper\s+deadline|reply\s+all\s+to\s+this\s+email|"
+    r"work\s+email\s*:|cer\s+team\s+email\s*:|phone\s+number\s*:|"
+    r"my\s+office\s+hours\s*:|ups\s+customer\s+support\s+numbers|"
+    r"preferred\s+customer\s*:|enroll\s+in\s+ups|"
+    r"[A-Z][a-z]+\s+[A-Z][a-z]+\s*$"
+    r")",
+    re.IGNORECASE,
+)
+
+MAX_RETAINED_QUOTED_CONTEXT_CHARS = 5000
 
 ACKNOWLEDGEMENT_ONLY_RE = re.compile(
     r"^\s*(?:"
@@ -141,6 +192,7 @@ CUSTOMS_KEYWORD_RE = re.compile(
 
 COMMERCIAL_INVOICE_BOILERPLATE_MARKERS = [
     re.compile(r"commercial\s+invoice\s+(?:must|should)\s+include", re.IGNORECASE),
+    re.compile(r"commercial\s+invoice\s+must\s+identify", re.IGNORECASE),
     re.compile(r"commercial\s+invoice\s+requirements", re.IGNORECASE),
     re.compile(r"invoice\s+must\s+include\s+the\s+following", re.IGNORECASE),
     re.compile(r"copy\s+of\s+commercial/proforma\s+invoice", re.IGNORECASE),
@@ -475,17 +527,27 @@ def normalize_whitespace(text: object) -> str:
     return text.strip()
 
 
-def strip_quoted_history(text: object) -> Tuple[str, bool]:
-    """Return text before forwarded/quoted email markers."""
+def split_quoted_history(text: object) -> Tuple[str, str, bool]:
+    """Return latest text, quoted-history text, and whether a quote marker was found."""
     normalized = normalize_whitespace(text)
     if not normalized:
-        return "", False
+        return "", "", False
 
     marker_match = QUOTE_HISTORY_MARKER_RE.search(normalized)
     if marker_match:
-        return normalized[: marker_match.start()].strip(), True
+        return (
+            normalized[: marker_match.start()].strip(),
+            normalized[marker_match.start():].strip(),
+            True,
+        )
 
-    return normalized, False
+    return normalized, "", False
+
+
+def strip_quoted_history(text: object) -> Tuple[str, bool]:
+    """Return text before forwarded/quoted email markers."""
+    latest_text, _, quoted_history_removed = split_quoted_history(text)
+    return latest_text, quoted_history_removed
 
 
 def strip_signature(text: object) -> Tuple[str, bool]:
@@ -501,6 +563,52 @@ def strip_signature(text: object) -> Tuple[str, bool]:
     return normalized, False
 
 
+def extract_actionable_quoted_context(quoted_history: object) -> str:
+    """Return useful request details from quoted history when it is clearly actionable."""
+    quoted_text = normalize_whitespace(quoted_history)
+    if not quoted_text or not ACTIONABLE_QUOTED_CONTEXT_RE.search(quoted_text):
+        return ""
+
+    start_match = ACTIONABLE_QUOTED_CONTEXT_START_RE.search(quoted_text)
+    start = start_match.start() if start_match else 0
+    context = quoted_text[start:].strip()
+
+    end_match = QUOTED_CONTEXT_END_RE.search(context)
+    if end_match and end_match.start() > 0:
+        context = context[: end_match.start()].strip()
+
+    if len(context) > MAX_RETAINED_QUOTED_CONTEXT_CHARS:
+        context = context[:MAX_RETAINED_QUOTED_CONTEXT_CHARS].rstrip()
+
+    return context
+
+
+def append_useful_quoted_context(cleaned_latest_text: object, quoted_history: object) -> str:
+    """Append actionable quoted context for follow-up/reminder emails.
+
+    The default cleaner still removes quoted threads to avoid stale false positives.
+    A carrier follow-up/reminder, however, often says only "following up" in the
+    latest message while the actual requested data remains in the quoted original
+    email.  In that narrow case, keep the actionable quoted excerpt so regex and
+    LLM stages can see what is being requested.
+    """
+    latest_text = normalize_whitespace(cleaned_latest_text)
+    if not latest_text or not FOLLOW_UP_CONTEXT_RE.search(latest_text):
+        return latest_text
+
+    quoted_context = extract_actionable_quoted_context(quoted_history)
+    if not quoted_context:
+        return latest_text
+
+    if quoted_context.lower() in latest_text.lower():
+        return latest_text
+
+    return normalize_whitespace(
+        f"{latest_text}\n\nRelevant quoted context retained for request classification:\n"
+        f"{quoted_context}"
+    )
+
+
 def clean_latest_request_text(text: object) -> Dict[str, object]:
     """
     Clean an email body for intent detection.
@@ -508,9 +616,9 @@ def clean_latest_request_text(text: object) -> Dict[str, object]:
     Returns a dictionary so callers can keep audit metadata in output files.
     """
     raw_text = normalize_whitespace(text)
-    without_history, quoted_history_removed = strip_quoted_history(raw_text)
+    without_history, quoted_history, quoted_history_removed = split_quoted_history(raw_text)
     without_signature, signature_removed = strip_signature(without_history)
-    cleaned_text = normalize_whitespace(without_signature)
+    cleaned_text = append_useful_quoted_context(without_signature, quoted_history)
 
     return {
         "raw_request_text": raw_text,
@@ -1042,6 +1150,27 @@ ENGLISH_LANGUAGE_MARKERS: Dict[str, int] = {
 
 def normalize_email(email: object) -> str:
     return str(email or "").strip().lower()
+
+
+def is_noreply_requester_email(email: object) -> bool:
+    """Return True when the requester/sender email starts with ``noreply``.
+
+    Zendesk normally stores requester_email as a bare address, but this helper
+    also tolerates display-name strings such as ``Name <noreply@example.com>``.
+    """
+    normalized = normalize_email(email)
+    if not normalized:
+        return False
+
+    if normalized.startswith("noreply"):
+        return True
+
+    for match in re.finditer(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+", normalized):
+        local_part = match.group(0).split("@", 1)[0]
+        if local_part.startswith("noreply"):
+            return True
+
+    return False
 
 
 def normalize_request_number(value: object) -> int:
