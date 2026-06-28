@@ -100,9 +100,9 @@ https://zelda.thelevelgroup.com/return/api/v1/brands/DG/orders/DG-EU-01663254
 
 Special cases:
 
-- Only `EUF` and `USF` market-code order numbers are passed to GET_FULL_ORDER unchanged, for example `DG-USF11591616`.
-- Other `EU?` / `US?` market-code values such as `EUB`, `EUC`, `USB`, and `USC` are converted to `EU-` / `US-` for the GET_FULL_ORDER URL, for example `DG-USB11591156` becomes `DG-US-11591156`.
-- `EU-` and `US-` order numbers are also passed to GET_FULL_ORDER unchanged, but the shipment block lookup normalizes them to `EUA` / `USA`.
+- For GET_FULL_ORDER URLs, the 6th character of the `shipment_order_number` is replaced with `-`. For example `DG-USB11591156` becomes `DG-US-11591156`, `DG-USC11589641` becomes `DG-US-11589641`, and `DG-EUB01614772` becomes `DG-EU-01614772`.
+- Existing `EU-` and `US-` order numbers are already in the URL shape, so this replacement leaves them unchanged. Shipment-block lookup still normalizes those URL-shaped values to `EUA` / `USA`.
+- `EUF` and `USF` market-code order numbers are the only exception. The client first tries the exact value, for example `DG-USF11591616`; if that URL returns 404 Not Found, it retries with the 6th character replaced by `-`, for example `DG-US-11591616`.
 
 The client supports these optional environment variables:
 
@@ -133,7 +133,7 @@ generated_documents/power_of_attorney/<extracted_tracking_number>.pdf
 generated_documents/invoice/<invoice_filename_from_document_link>.pdf
 ```
 
-When `return_proforma_invoice` or `commercial_invoice` is requested, the extractor keeps the source link from `erpDocuments.invoiceDocuments[].documentLink`, downloads the PDF with a browser-style request, resolves DocOpen-style HTML wrappers, ASP.NET `__doPostBack` download buttons, and JavaScript/meta-refresh redirects when present, saves the final PDF under `generated_documents/invoice`, and the draft response points to that saved copy. The downloader does not rewrite `DocOpen.aspx?link=<file>.pdf` into a bare `/<file>.pdf` URL. If a local PDF cannot be produced but the GET_FULL_ORDER `documentLink` exists, the response uses that source link instead of routing the ticket to human intervention for a missing `*_pdf` value.
+When `return_proforma_invoice` or `commercial_invoice` is requested, the extractor keeps the source link from `erpDocuments.invoiceDocuments[].documentLink`, downloads the PDF with a browser-style request, resolves DocOpen-style HTML wrappers, ASP.NET `__doPostBack` download buttons, and JavaScript/meta-refresh redirects when present, and saves the final PDF under `generated_documents/invoice`. The draft response can include the saved local document reference, and human-intervention drafts can include source `documentLink` references for reviewer use. The downloader does not rewrite `DocOpen.aspx?link=<file>.pdf` into a bare `/<file>.pdf` URL. A local PDF is required before an automatic public Zendesk reply can be sent for invoice/RPI documents; source links are internal-only and are not used as public-response fallbacks.
 
 The GitHub Actions workflow always uploads `generated_documents` as the `generated-customs-documents` artifact. Committing those files back into the repository is optional and controlled by the manual `workflow_dispatch` input `persist_generated_documents`, which defaults to `false`.
 
@@ -146,7 +146,7 @@ The GitHub Actions workflow always uploads `generated_documents` as the `generat
 - `draft_response`: the internal/audit draft, which may still include generated-document references;
 - `final_response`: the exact public Zendesk comment body.
 
-For rows that require human intervention, `final_response` is intentionally empty and no Zendesk comment is submitted. This includes `noreply*` requester emails, where the draft is an internal human-review summary rather than a customer-facing response. For automatic rows, generated PDFs are uploaded to Zendesk as ticket attachments and attached-document links are removed from `final_response`; the body only lists the data/documents being provided, for example `- RPI` instead of a GitHub URL. If an invoice/RPI is available only as a GET_FULL_ORDER source link, that link stays in `final_response` because there is no local attachment to upload.
+For rows that require human intervention, `final_response` is intentionally empty and no Zendesk comment is submitted. This includes `noreply*` requester emails, where the draft is an internal human-review summary rather than a customer-facing response. For automatic rows, generated PDFs are uploaded to Zendesk as ticket attachments and attached-document links are removed from `final_response`; the public body only lists the data/document labels being provided, for example `- RPI`, `- Commercial invoice`, or `LOA`, never a GitHub URL, GET_FULL_ORDER source URL, RPI/invoice link, or local document path. If an invoice/RPI source link exists but no local PDF attachment can be produced, the row is routed to human intervention and the source link remains available only in `draft_response` for internal review.
 
 The BigQuery history table is migrated additively at runtime with:
 
