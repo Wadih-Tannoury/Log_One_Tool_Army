@@ -49,11 +49,15 @@ from customs_rules import (
     UNKNOWN_REQUEST,
     UPS_BROKERAGE_EMAIL,
     detect_language_with_dictionary,
+    contains_correction_or_discrepancy,
     extract_ups_code,
     first_available_value,
     is_customer_refused_return_request,
+    is_no_action_carrier_notification,
     is_noreply_requester_email,
     is_returns_customs_clearance,
+    is_unpaid_extra_charges_request as rules_is_unpaid_extra_charges_request,
+    is_ups_uk_import_clearance_instructions_request,
     normalize_email,
     normalize_language,
     normalize_request_number,
@@ -474,6 +478,12 @@ def is_excluded_from_processing(row):
     if as_bool(row.get("excluded")):
         return True
 
+    if (
+        not is_noreply_requester_email(row.get("requester_email"))
+        and is_no_action_carrier_notification(row_request_text(row))
+    ):
+        return True
+
     requested_data = normalize_requested_data(row.get("requested_data"))
     request_types = normalize_requested_data(row.get("request_types"))
     return (
@@ -485,6 +495,11 @@ def is_excluded_from_processing(row):
 
 def build_exclude_from_processing_draft(row):
     notes = normalize_text(row.get("notes", ""))
+    if is_no_action_carrier_notification(row_request_text(row)):
+        notes = (
+            "Carrier notification/status message only; no actionable customer-data "
+            "request was detected."
+        )
     if not notes:
         matched_spans = normalize_text(row.get("matched_spans", ""))
         if matched_spans:
@@ -514,6 +529,10 @@ def detected_request_summary(row, requested_data=None):
             if key not in {UNKNOWN_REQUEST, HUMAN_INTERVENTION_REQUIRED, "exclude_from_processing"}
         ]
 
+    no_action_notification = is_no_action_carrier_notification(row_request_text(row))
+    if no_action_notification:
+        data_keys = []
+
     lines = []
 
     subject = truncated_text(row.get("subject", ""), 220)
@@ -532,7 +551,12 @@ def detected_request_summary(row, requested_data=None):
     if refs:
         lines.append("- Tracking/order reference(s): " + ", ".join(refs))
 
-    if data_keys:
+    if no_action_notification:
+        lines.append(
+            "- Carrier notification/status: no actionable data request detected; "
+            "no public reply expected."
+        )
+    elif data_keys:
         labels = unique_nonempty_strings(label_for(key, language) for key in data_keys)
         if labels:
             lines.append("- Detected requested data: " + ", ".join(labels))
@@ -543,7 +567,7 @@ def detected_request_summary(row, requested_data=None):
         for item in normalize_requested_data(row.get(column))
         if item not in {UNKNOWN_REQUEST, HUMAN_INTERVENTION_REQUIRED, "exclude_from_processing"}
     )
-    if request_types:
+    if request_types and not no_action_notification:
         lines.append("- Detected request type(s): " + ", ".join(request_types))
 
     notes = truncated_text(row.get("notes", ""), 500)
@@ -641,7 +665,10 @@ def is_platform_handoff_request(text):
 
 
 def is_unpaid_extra_charges_request(text):
-    return bool(UNPAID_EXTRA_CHARGES_RE.search(normalize_text(text)))
+    return (
+        rules_is_unpaid_extra_charges_request(text)
+        or bool(UNPAID_EXTRA_CHARGES_RE.search(normalize_text(text)))
+    )
 
 
 def email_domain(email):
@@ -815,6 +842,12 @@ def requested_data_for_response(row):
 
 def row_needs_full_order_lookup(row, requested_data=None):
     if is_noreply_requester_email(row.get("requester_email")):
+        return False
+
+    request_text = row_request_text(row)
+    if is_no_action_carrier_notification(request_text):
+        return False
+    if is_ups_uk_import_clearance_instructions_request(request_text):
         return False
 
     requested_data = requested_data if requested_data is not None else requested_data_for_response(row)
@@ -1264,6 +1297,30 @@ def should_force_human_intervention(row, requested_data):
     if is_platform_handoff_request(request_text):
         return True, "FedEx Support Hub handoff request. A human must handle the external portal."
 
+    if is_ups_uk_import_clearance_instructions_request(request_text):
+        return (
+            True,
+            "UPS UK import-clearance instruction request asks for customs procedure, "
+            "EORI/DAN/deferment approval, commodity details, or possible extra charges. "
+            "Human intervention is required instead of sending a partial RPI/UPS-account reply.",
+        )
+
+    if contains_correction_or_discrepancy(request_text) and (
+        {
+            "corrected_invoice",
+            "invoice_correction",
+            "value_confirmation",
+            "commercial_invoice",
+            "return_proforma_invoice",
+        }
+        & set(all_requested_data_sources(row))
+    ):
+        return (
+            True,
+            "Correction/discrepancy language detected for invoice/value data. "
+            "Manual verification is required before replying.",
+        )
+
     if is_tracking_lookup_not_found(row):
         return (
             True,
@@ -1399,6 +1456,12 @@ def build_response(row):
 
 
 def requires_human_intervention(row):
+    if (
+        not is_noreply_requester_email(row.get("requester_email"))
+        and is_excluded_from_processing(row)
+    ):
+        return False
+
     requested_data = requested_data_for_response(row)
     force_human, _ = should_force_human_intervention(row, requested_data)
     return force_human
