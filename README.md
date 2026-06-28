@@ -100,7 +100,8 @@ https://zelda.thelevelgroup.com/return/api/v1/brands/DG/orders/DG-EU-01663254
 
 Special cases:
 
-- `EUF` and `USF` order numbers are passed to GET_FULL_ORDER unchanged.
+- Only `EUF` and `USF` market-code order numbers are passed to GET_FULL_ORDER unchanged, for example `DG-USF11591616`.
+- Other `EU?` / `US?` market-code values such as `EUB`, `EUC`, `USB`, and `USC` are converted to `EU-` / `US-` for the GET_FULL_ORDER URL, for example `DG-USB11591156` becomes `DG-US-11591156`.
 - `EU-` and `US-` order numbers are also passed to GET_FULL_ORDER unchanged, but the shipment block lookup normalizes them to `EUA` / `USA`.
 
 The client supports these optional environment variables:
