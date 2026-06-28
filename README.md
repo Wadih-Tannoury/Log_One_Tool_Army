@@ -52,6 +52,8 @@ The config table still remains authoritative for classification:
 
 Carrier-domain notification emails that historically did not need a customer-facing response are excluded before the tracking-number guardrail. This covers high-volume patterns such as FedEx delivery notifications, FedEx Import Data Summary informational messages, UPS MRN/document automatic emails, UPS claim/inquiry status notifications, and carrier billing/no-reply notices. Actionable FedEx Support Hub requests are not excluded; they continue to route to human intervention.
 
+Requester emails whose address starts with `noreply` are never answered automatically. They still get a `draft_response` that summarizes the detected request, `human_intervention_required=true`, an empty `final_response`, and no GET_FULL_ORDER/document-generation work. This keeps the request visible to a human without creating a Zendesk public reply to an automated mailbox.
+
 The reviewed regex table generated from the historical-ticket analysis is included in:
 
 ```text
@@ -96,6 +98,11 @@ For a `shipment_order_number` such as `DG-EUA01663254`, the API URL becomes:
 https://zelda.thelevelgroup.com/return/api/v1/brands/DG/orders/DG-EU-01663254
 ```
 
+Special cases:
+
+- `EUF` and `USF` order numbers are passed to GET_FULL_ORDER unchanged.
+- `EU-` and `US-` order numbers are also passed to GET_FULL_ORDER unchanged, but the shipment block lookup normalizes them to `EUA` / `USA`.
+
 The client supports these optional environment variables:
 
 - `GET_FULL_ORDER_API_BASE_URL` to override the base URL;
@@ -138,7 +145,7 @@ The GitHub Actions workflow always uploads `generated_documents` as the `generat
 - `draft_response`: the internal/audit draft, which may still include generated-document references;
 - `final_response`: the exact public Zendesk comment body.
 
-For rows that require human intervention, `final_response` is intentionally empty and no Zendesk comment is submitted. For automatic rows, generated PDFs are uploaded to Zendesk as ticket attachments and attached-document links are removed from `final_response`; the body only lists the data/documents being provided, for example `- RPI` instead of a GitHub URL. If an invoice/RPI is available only as a GET_FULL_ORDER source link, that link stays in `final_response` because there is no local attachment to upload.
+For rows that require human intervention, `final_response` is intentionally empty and no Zendesk comment is submitted. This includes `noreply*` requester emails, where the draft is an internal human-review summary rather than a customer-facing response. For automatic rows, generated PDFs are uploaded to Zendesk as ticket attachments and attached-document links are removed from `final_response`; the body only lists the data/documents being provided, for example `- RPI` instead of a GitHub URL. If an invoice/RPI is available only as a GET_FULL_ORDER source link, that link stays in `final_response` because there is no local attachment to upload.
 
 The BigQuery history table is migrated additively at runtime with:
 
