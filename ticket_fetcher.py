@@ -17,7 +17,9 @@ import json
 import math
 import os
 import re
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -141,6 +143,16 @@ ZENDESK_FETCH_CARRIER_DOMAIN_TERMS_ENV = "ZENDESK_FETCH_CARRIER_DOMAIN_TERMS"
 ZENDESK_BROAD_ACTIVE_MAIL_FALLBACK_ENV = "ZENDESK_BROAD_ACTIVE_MAIL_FALLBACK"
 ZENDESK_CONFIG_REQUESTER_QUERY_BATCH_SIZE_ENV = "ZENDESK_CONFIG_REQUESTER_QUERY_BATCH_SIZE"
 DEFAULT_ZENDESK_CONFIG_REQUESTER_QUERY_BATCH_SIZE = 45
+ZENDESK_FETCH_STRATEGY_ENV = "ZENDESK_FETCH_STRATEGY"
+DEFAULT_ZENDESK_FETCH_STRATEGY = "broad_active"
+ZENDESK_SEARCH_EXPORT_PAGE_SIZE_ENV = "ZENDESK_SEARCH_EXPORT_PAGE_SIZE"
+DEFAULT_ZENDESK_SEARCH_EXPORT_PAGE_SIZE = 500
+ZENDESK_USER_FETCH_BATCH_SIZE_ENV = "ZENDESK_USER_FETCH_BATCH_SIZE"
+DEFAULT_ZENDESK_USER_FETCH_BATCH_SIZE = 100
+ZENDESK_COMMENT_FETCH_WORKERS_ENV = "ZENDESK_COMMENT_FETCH_WORKERS"
+DEFAULT_ZENDESK_COMMENT_FETCH_WORKERS = 20
+ZENDESK_MAX_RETRIES_ENV = "ZENDESK_MAX_RETRIES"
+DEFAULT_ZENDESK_MAX_RETRIES = 5
 
 LLM_ENGINE_PREFIXES = ("llm",)
 LLM_ENGINE_NAMES = {
@@ -753,6 +765,84 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: int | None = None,
+) -> int:
+    raw = str(os.getenv(name, str(default)) or "").strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+    value = max(value, minimum)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
+
+
+def zendesk_get(
+    url: str,
+    *,
+    auth,
+    session: requests.Session | None = None,
+    params: Mapping[str, Any] | None = None,
+    timeout: int = 60,
+) -> requests.Response:
+    """GET wrapper with retry handling for Zendesk rate limits/errors."""
+
+    http = session or requests
+    max_retries = _env_int(
+        ZENDESK_MAX_RETRIES_ENV,
+        DEFAULT_ZENDESK_MAX_RETRIES,
+        minimum=1,
+        maximum=10,
+    )
+    last_response: requests.Response | None = None
+
+    for attempt in range(1, max_retries + 1):
+        response = http.get(
+            url,
+            auth=auth,
+            params=params,
+            timeout=timeout,
+        )
+        last_response = response
+
+        if response.status_code == 429 and attempt < max_retries:
+            retry_after_raw = response.headers.get("Retry-After", "60")
+            try:
+                retry_after = int(float(retry_after_raw))
+            except ValueError:
+                retry_after = 60
+            sleep_seconds = max(retry_after + 1, 1)
+            print(
+                "Rate limited by Zendesk. "
+                f"Sleeping for {sleep_seconds} seconds before retrying."
+            )
+            time.sleep(sleep_seconds)
+            continue
+
+        if response.status_code in {500, 502, 503, 504} and attempt < max_retries:
+            sleep_seconds = min(2 ** attempt, 30)
+            print(
+                f"Transient Zendesk error {response.status_code}. "
+                f"Retrying in {sleep_seconds} seconds."
+            )
+            time.sleep(sleep_seconds)
+            continue
+
+        response.raise_for_status()
+        return response
+
+    if last_response is not None:
+        last_response.raise_for_status()
+    raise RuntimeError("Zendesk request failed without a response.")
+
+
 def zendesk_response_submission_enabled() -> bool:
     """Return True only when public Zendesk replies are explicitly enabled."""
 
@@ -1055,11 +1145,9 @@ def get_ticket_comments(
 
     comments: list[dict[str, Any]] = []
     url = f"{base_url}/tickets/{ticket_id}/comments.json"
-    http = session or requests
 
     while url:
-        response = http.get(url, auth=auth, timeout=60)
-        response.raise_for_status()
+        response = zendesk_get(url, auth=auth, session=session, timeout=60)
 
         payload = response.json()
         comments.extend(payload.get("comments", []))
@@ -1089,13 +1177,12 @@ def get_zendesk_user_email(
     if cache is not None and user_id_int in cache:
         return cache[user_id_int]
 
-    http = session or requests
-    response = http.get(
+    response = zendesk_get(
         f"{base_url}/users/{user_id_int}.json",
         auth=auth,
+        session=session,
         timeout=60,
     )
-    response.raise_for_status()
     requester_email = normalize_email(response.json().get("user", {}).get("email"))
 
     if cache is not None:
@@ -1139,6 +1226,128 @@ def requester_email_from_ticket(
         return requester_email
 
     return via_email
+
+
+def _zendesk_user_fetch_batch_size() -> int:
+    return _env_int(
+        ZENDESK_USER_FETCH_BATCH_SIZE_ENV,
+        DEFAULT_ZENDESK_USER_FETCH_BATCH_SIZE,
+        minimum=1,
+        maximum=100,
+    )
+
+
+def get_zendesk_users_by_ids(
+    user_ids: Iterable[object],
+    *,
+    auth,
+    base_url: str,
+    cache: dict[int, str],
+    session: requests.Session | None = None,
+) -> dict[int, str]:
+    """Batch-load Zendesk requester emails into cache using users/show_many."""
+
+    clean_user_ids: list[int] = []
+    for user_id in user_ids:
+        try:
+            user_id_int = int(user_id)
+        except (TypeError, ValueError):
+            continue
+        if user_id_int not in cache and user_id_int not in clean_user_ids:
+            clean_user_ids.append(user_id_int)
+
+    if not clean_user_ids:
+        return cache
+
+    base_url = base_url.rstrip("/")
+    batch_size = _zendesk_user_fetch_batch_size()
+
+    for batch in _chunked(clean_user_ids, batch_size):
+        response = zendesk_get(
+            f"{base_url}/users/show_many.json",
+            auth=auth,
+            session=session,
+            params={"ids": ",".join(str(user_id) for user_id in batch)},
+            timeout=60,
+        )
+        payload = response.json()
+        returned_ids: set[int] = set()
+
+        for user in payload.get("users", []):
+            try:
+                user_id_int = int(user.get("id"))
+            except (TypeError, ValueError):
+                continue
+            returned_ids.add(user_id_int)
+            cache[user_id_int] = normalize_email(user.get("email"))
+
+        for missing_user_id in set(batch) - returned_ids:
+            cache.setdefault(missing_user_id, "")
+
+    return cache
+
+
+def _ticket_via_source_email(ticket: Mapping[str, Any]) -> str:
+    return normalize_email(
+        ticket.get("via", {})
+        .get("source", {})
+        .get("from", {})
+        .get("address", "")
+    )
+
+
+def requester_email_from_ticket_cache(
+    ticket: Mapping[str, Any],
+    *,
+    user_email_cache: Mapping[int, str],
+) -> str:
+    """Return requester email from via.source first, then batched user cache."""
+
+    via_email = _ticket_via_source_email(ticket)
+    if email_matches_any_carrier_domain(via_email):
+        return via_email
+
+    try:
+        requester_id = int(ticket.get("requester_id"))
+    except (TypeError, ValueError):
+        requester_id = None
+
+    requester_email = user_email_cache.get(requester_id, "") if requester_id else ""
+    return requester_email or via_email
+
+
+def _zendesk_comment_fetch_workers(ticket_count: int) -> int:
+    if ticket_count <= 0:
+        return 0
+    configured = _env_int(
+        ZENDESK_COMMENT_FETCH_WORKERS_ENV,
+        DEFAULT_ZENDESK_COMMENT_FETCH_WORKERS,
+        minimum=1,
+        maximum=50,
+    )
+    return min(configured, ticket_count)
+
+
+def get_comments_for_ticket(
+    ticket: Mapping[str, Any],
+    *,
+    auth,
+    base_url: str,
+) -> dict[str, Any]:
+    """Fetch comments for one ticket; safe for ThreadPoolExecutor workers."""
+
+    ticket_id = ticket.get("id")
+    try:
+        with requests.Session() as session:
+            comments = get_ticket_comments(
+                ticket_id,
+                auth=auth,
+                base_url=base_url,
+                session=session,
+            )
+        return {"ticket_id": int(ticket_id), "comments": comments, "error": None}
+    except Exception as exc:
+        return {"ticket_id": ticket_id, "comments": [], "error": str(exc)}
 
 
 def extract_tracking_number(subject, description, carrier_code):
@@ -1199,7 +1408,7 @@ def _dedupe_preserve_order(values: Iterable[str]) -> list[str]:
     return result
 
 
-def _chunked(values: list[str], size: int) -> Iterable[list[str]]:
+def _chunked(values: list[Any], size: int) -> Iterable[list[Any]]:
     for start in range(0, len(values), size):
         yield values[start : start + size]
 
@@ -1308,14 +1517,36 @@ def _active_zendesk_search_query(
 def _zendesk_fetch_query_specs(
     email_to_category: Mapping[str, str],
 ) -> list[tuple[str, str]]:
-    """Build the minimal Zendesk Search Export queries for this run.
+    """Build Zendesk Search Export queries for this run.
 
-    The fetcher no longer starts from every active mail ticket. It first asks
-    Zendesk for exact configured carrier requesters, then asks for carrier
-    domain terms to catch unconfigured UPS/DHL/FedEx senders. Local requester
-    email and status checks remain as guardrails, but solved/closed tickets are
-    not intentionally retrieved.
+    Default strategy is one broad active-mail query:
+    ``status:new status:open status:pending via:mail``. It is normally faster
+    than several domain/full-text searches because requester emails are loaded
+    in batched ``users/show_many`` calls and comments are fetched only for the
+    matching carrier-domain tickets.
+
+    Set ``ZENDESK_FETCH_STRATEGY=narrow`` only for diagnostics if you need the
+    older configured-requester/domain-term search behavior.
     """
+
+    strategy = str(
+        os.getenv(ZENDESK_FETCH_STRATEGY_ENV, DEFAULT_ZENDESK_FETCH_STRATEGY)
+        or DEFAULT_ZENDESK_FETCH_STRATEGY
+    ).strip().lower()
+
+    if strategy in {"", "broad", "broad_active", "single", "single_active"}:
+        return [
+            (
+                "active mail tickets",
+                _active_zendesk_search_query(),
+            )
+        ]
+
+    if strategy not in {"narrow", "domain", "domain_terms"}:
+        raise ValueError(
+            f"Unsupported {ZENDESK_FETCH_STRATEGY_ENV}={strategy!r}; "
+            "use broad_active or narrow"
+        )
 
     specs: list[tuple[str, str]] = []
 
@@ -1380,15 +1611,16 @@ def _zendesk_search_export_url(
 ) -> str:
     """Return a cursor-paginated Search Export URL for tickets."""
 
-    page_size_raw = str(os.getenv("ZENDESK_SEARCH_EXPORT_PAGE_SIZE", "100") or "100").strip()
-    try:
-        page_size = int(page_size_raw)
-    except ValueError as exc:
-        raise ValueError("ZENDESK_SEARCH_EXPORT_PAGE_SIZE must be an integer") from exc
+    page_size = _env_int(
+        ZENDESK_SEARCH_EXPORT_PAGE_SIZE_ENV,
+        DEFAULT_ZENDESK_SEARCH_EXPORT_PAGE_SIZE,
+        minimum=1,
+        maximum=1000,
+    )
 
-    # Zendesk allows up to 1000 records per page on this endpoint, but its own
-    # docs recommend 100 for stability with large datasets.
-    page_size = min(max(page_size, 1), 1000)
+    # Zendesk allows up to 1000 records per page. Active-ticket searches are not
+    # archived-ticket exports, so the workflow defaults to 500 to reduce page
+    # round trips while keeping an env override available.
 
     params = {
         "query": query,
@@ -1440,12 +1672,10 @@ def iter_zendesk_search_export_tickets(
     base_url = base_url.rstrip("/")
     url = _zendesk_search_export_url(base_url, query)
     page = 1
-    http = session or requests
     query_label = label or query
 
     while url:
-        response = http.get(url, auth=auth, timeout=60)
-        response.raise_for_status()
+        response = zendesk_get(url, auth=auth, session=session, timeout=60)
         payload = response.json()
 
         tickets = payload.get("results", [])
@@ -1487,9 +1717,12 @@ def fetch_ticket_rows(
 ) -> list[dict[str, Any]]:
     """Fetch new/open/pending Zendesk tickets from UPS/DHL/FedEx domains.
 
-    Exact requester emails found in the BigQuery config table keep their
-    configured ticket_category. Carrier-domain requester emails not in config
-    are classified from the current requester message content.
+    The slow network operations are deliberately batched/parallelized:
+    requester users are loaded with users/show_many, and comments are fetched
+    concurrently only for tickets whose requester email matches a carrier
+    domain. Exact requester emails found in BigQuery keep their configured
+    ticket_category; unconfigured carrier-domain requesters are classified from
+    the current requester message.
     """
 
     rows: list[dict[str, Any]] = []
@@ -1497,6 +1730,7 @@ def fetch_ticket_rows(
     user_email_cache: dict[int, str] = {}
     skipped_non_carrier = 0
     skipped_unexpected_status = 0
+    comment_error_count = 0
 
     query_specs = _zendesk_fetch_query_specs(email_to_category)
 
@@ -1505,11 +1739,15 @@ def fetch_ticket_rows(
         + ", ".join(ACTIVE_ZENDESK_STATUSES)
     )
     print(
-        "Zendesk queries are narrowed by exact configured carrier requesters "
-        "and carrier domain terms before local validation. Carrier domains: "
+        "Default fetch strategy uses a single active-mail Zendesk query, then "
+        "batch-loads requester users and filters carrier domains locally: "
         + ", ".join(CARRIER_EMAIL_DOMAINS)
     )
-    print(f"Prepared {len(query_specs)} narrow Zendesk Search Export query/queries.")
+    print(
+        f"Prepared {len(query_specs)} Zendesk Search Export query/queries "
+        f"using {ZENDESK_FETCH_STRATEGY_ENV}="
+        f"{os.getenv(ZENDESK_FETCH_STRATEGY_ENV, DEFAULT_ZENDESK_FETCH_STRATEGY)}."
+    )
 
     with requests.Session() as session:
         for query_label, query in query_specs:
@@ -1522,40 +1760,129 @@ def fetch_ticket_rows(
                 label=query_label,
                 session=session,
             ):
+                candidate_tickets: list[dict[str, Any]] = []
+
                 for ticket in tickets:
                     try:
                         ticket_id = int(ticket["id"])
-                        if ticket_id in seen_ticket_ids:
-                            continue
-                        seen_ticket_ids.add(ticket_id)
+                    except Exception:
+                        print(f"Skipped Zendesk result without numeric id: {ticket!r}")
+                        continue
 
-                        ticket_status = str(ticket.get("status") or "").strip().lower()
-                        if ticket_status not in ACTIVE_ZENDESK_STATUSES:
-                            skipped_unexpected_status += 1
-                            continue
+                    if ticket_id in seen_ticket_ids:
+                        continue
+                    seen_ticket_ids.add(ticket_id)
 
-                        requester_id = ticket.get("requester_id")
-                        requester_email = requester_email_from_ticket(
+                    ticket_status = str(ticket.get("status") or "").strip().lower()
+                    if ticket_status not in ACTIVE_ZENDESK_STATUSES:
+                        skipped_unexpected_status += 1
+                        continue
+
+                    candidate_tickets.append(ticket)
+
+                if not candidate_tickets:
+                    continue
+
+                # Zendesk search results normally have requester_id but not a
+                # normalized requester email. Batch-load only the user records
+                # needed for tickets whose via.source email is not already a
+                # carrier-domain address.
+                user_ids_to_load = []
+                for ticket in candidate_tickets:
+                    if email_matches_any_carrier_domain(_ticket_via_source_email(ticket)):
+                        continue
+                    requester_id = ticket.get("requester_id")
+                    try:
+                        requester_id_int = int(requester_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if requester_id_int not in user_email_cache:
+                        user_ids_to_load.append(requester_id_int)
+
+                get_zendesk_users_by_ids(
+                    user_ids_to_load,
+                    auth=auth,
+                    base_url=base_url,
+                    cache=user_email_cache,
+                    session=session,
+                )
+
+                matching_tickets: list[dict[str, Any]] = []
+                requester_email_by_ticket_id: dict[int, str] = {}
+
+                for ticket in candidate_tickets:
+                    ticket_id = int(ticket["id"])
+                    requester_email = requester_email_from_ticket_cache(
+                        ticket,
+                        user_email_cache=user_email_cache,
+                    )
+                    if not email_matches_any_carrier_domain(requester_email):
+                        skipped_non_carrier += 1
+                        continue
+
+                    matching_tickets.append(ticket)
+                    requester_email_by_ticket_id[ticket_id] = requester_email
+
+                print(
+                    f"Matched {len(matching_tickets)} carrier-domain ticket(s) "
+                    f"from {len(candidate_tickets)} active candidate ticket(s) "
+                    "on this page."
+                )
+
+                if not matching_tickets:
+                    continue
+
+                ticket_comment_map: dict[int, list[dict[str, Any]]] = {}
+                workers = _zendesk_comment_fetch_workers(len(matching_tickets))
+
+                if workers <= 1:
+                    comment_results = [
+                        get_comments_for_ticket(
                             ticket,
                             auth=auth,
                             base_url=base_url,
-                            user_email_cache=user_email_cache,
-                            session=session,
                         )
+                        for ticket in matching_tickets
+                    ]
+                else:
+                    comment_results = []
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = [
+                            executor.submit(
+                                get_comments_for_ticket,
+                                ticket,
+                                auth=auth,
+                                base_url=base_url,
+                            )
+                            for ticket in matching_tickets
+                        ]
+                        for future in as_completed(futures):
+                            comment_results.append(future.result())
 
-                        if not email_matches_any_carrier_domain(requester_email):
-                            skipped_non_carrier += 1
-                            continue
+                for result in comment_results:
+                    if result.get("error"):
+                        comment_error_count += 1
+                        print(
+                            f"Error fetching comments for ticket "
+                            f"{result.get('ticket_id')}: {result.get('error')}"
+                        )
+                        continue
+                    try:
+                        result_ticket_id = int(result["ticket_id"])
+                    except (TypeError, ValueError):
+                        continue
+                    ticket_comment_map[result_ticket_id] = result.get("comments", [])
 
+                for ticket in matching_tickets:
+                    try:
+                        ticket_id = int(ticket["id"])
+                        requester_id = ticket.get("requester_id")
+                        requester_email = requester_email_by_ticket_id.get(ticket_id, "")
                         configured_category = email_to_category.get(requester_email)
                         carrier = carrier_code_from_email(requester_email)
-
-                        comments = get_ticket_comments(
-                            ticket_id,
-                            auth=auth,
-                            base_url=base_url,
-                            session=session,
-                        )
+                        comments = ticket_comment_map.get(ticket_id, [])
+                        if not comments:
+                            continue
 
                         requester_comment_counter = 0
                         requester_requests = []
@@ -1646,8 +1973,9 @@ def fetch_ticket_rows(
 
     print(
         f"Fetched {len(rows)} active requester message(s) from carrier-domain tickets; "
-        f"skipped {skipped_non_carrier} non-carrier ticket(s) and "
-        f"{skipped_unexpected_status} ticket(s) with unexpected statuses."
+        f"skipped {skipped_non_carrier} non-carrier ticket(s), "
+        f"{skipped_unexpected_status} ticket(s) with unexpected statuses, and "
+        f"{comment_error_count} ticket(s) with comment-fetch errors."
     )
     return rows
 
