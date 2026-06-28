@@ -5,9 +5,9 @@ Agent pipeline that fetches active Zendesk customs-clearance tickets, detects th
 
 ## Zendesk ticket fetch and category classification
 
-`ticket_fetcher.py` now retrieves active Zendesk mail tickets with Zendesk Search Export cursor pagination, then filters them in Python to requester emails whose domain is `ups.com`, `dhl.com`, or `fedex.com`. Subdomains are included, for example `mail.fedex.com`. The BigQuery config table is no longer used to decide which Zendesk requester emails are fetched.
+`ticket_fetcher.py` retrieves Zendesk mail tickets with API-level status filters for exactly `new`, `open`, and `pending`. It runs one Zendesk Search Export query per status, then filters those status-filtered tickets in Python to requester emails whose domain is `ups.com`, `dhl.com`, or `fedex.com`. Subdomains are included, for example `mail.fedex.com`. The BigQuery config table is no longer used to decide which Zendesk requester emails are fetched.
 
-The fetcher intentionally uses `/api/v2/search/export.json` instead of regular `/api/v2/search.json`. Regular Zendesk search is offset-paginated and fails after the first 1,000 results/page 10 for broad active-ticket queries; Search Export is cursor-paginated and can continue past that limit. The optional `ZENDESK_SEARCH_EXPORT_PAGE_SIZE` environment variable controls the Search Export page size and defaults to `100`.
+The fetcher intentionally uses `/api/v2/search/export.json` instead of regular `/api/v2/search.json`. Regular Zendesk search is offset-paginated and fails after the first 1,000 results/page 10 for broad queries; Search Export is cursor-paginated and can continue past that limit. The query is now narrow at the API level, for example `status:new via:mail`, `status:open via:mail`, and `status:pending via:mail`, so `hold`, `solved`, and `closed` tickets are not fetched. The optional `ZENDESK_SEARCH_EXPORT_PAGE_SIZE` environment variable controls the Search Export page size and defaults to `100`.
 
 The config table still remains authoritative for classification:
 
