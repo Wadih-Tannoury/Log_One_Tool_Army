@@ -35,6 +35,7 @@ from customs_rules import (
     UPS_BROKERAGE_EMAIL,
     extract_ups_code,
     collapse_document_embedded_requested_data,
+    expand_first_returns_customs_clearance_bundle,
     first_available_value,
     is_no_action_carrier_notification,
     is_noreply_requester_email,
@@ -91,6 +92,11 @@ REQUESTED_DATA_ALIASES = {
     "ups_account": "ups_account_number",
     "ups_account_code": "ups_account_number",
     "ups_code": "ups_account_number",
+    "tracking_number": "export_tracking_number",
+    "export_tracking": "export_tracking_number",
+    "returned_items": "returned_items_confirmation",
+    "rpi": "return_proforma_invoice",
+    "pri": "return_proforma_invoice",
     "invoice": "commercial_invoice",
     "commercial_invoice_required": "commercial_invoice",
     "invoice_correction": "corrected_invoice",
@@ -403,7 +409,22 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
                 keys.append(key)
         return keys
 
-    canonical_keys = _collapsed_unique_keys(row.get("requested_data"))
+    regex_trigger_keys: list[str] = []
+    for column in ("regex_requested_data", "regex_request_types"):
+        for key in _collapsed_unique_keys(row.get(column)):
+            if key and key not in regex_trigger_keys:
+                regex_trigger_keys.append(key)
+
+    def _expanded_keys(keys: list[str]) -> list[str]:
+        return expand_first_returns_customs_clearance_bundle(
+            keys,
+            ticket_category=row.get("ticket_category", ""),
+            request_number=row.get("request_number", 1),
+            requester_email=row.get("requester_email", ""),
+            trigger_requested_data=regex_trigger_keys or keys,
+        )
+
+    canonical_keys = _expanded_keys(_collapsed_unique_keys(row.get("requested_data")))
     if canonical_keys:
         return canonical_keys
 
@@ -414,7 +435,7 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
         for key in _collapsed_unique_keys(row.get(column)):
             if key and key not in fallback_keys:
                 fallback_keys.append(key)
-    return fallback_keys
+    return _expanded_keys(fallback_keys)
 
 
 def _email_domain(email: object) -> str:
