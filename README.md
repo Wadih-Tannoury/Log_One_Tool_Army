@@ -54,6 +54,20 @@ Carrier-domain notification emails that historically did not need a customer-fac
 
 Requester emails whose address starts with `noreply` are never answered automatically. They still get a `draft_response` that summarizes the detected request, `human_intervention_required=true`, an empty `final_response`, and no GET_FULL_ORDER/document-generation work. This keeps the request visible to a human without creating a Zendesk public reply to an automated mailbox.
 
+## Gemini LLM fallback
+
+`intent_detection.py` uses `GEMINI_MODEL` as the primary model, defaulting to `gemini-2.5-flash`. If that exact primary model fails with a Gemini limit/quota error such as HTTP 429 or `RESOURCE_EXHAUSTED`, the detector immediately switches to the fallback model. The fallback defaults to `gemini-3.1-flash-lite` and can be overridden with either `GEMINI_RATE_LIMIT_FALLBACK_MODEL` or `GEMINI_FALLBACK_MODEL`.
+
+Useful optional environment variables:
+
+```text
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_RATE_LIMIT_FALLBACK_MODEL=gemini-3.1-flash-lite
+GEMINI_FALLBACK_RATE_LIMIT_ATTEMPTS=3
+```
+
+Whenever Gemini analyzes a row, `intent_detection.py` writes the successful model into `llm_model_used` and the attempted model path into `llm_model_attempts`. `response_generator.py` then prepends `LLM analysis model: <model>.` to the internal `draft_response` only, including the attempted fallback path when applicable. This metadata is added after `final_response` is built, so public Zendesk replies never expose internal model-routing details.
+
 The reviewed regex table generated from the historical-ticket analysis is included in:
 
 ```text
