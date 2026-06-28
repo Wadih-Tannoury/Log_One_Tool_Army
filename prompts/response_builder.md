@@ -55,7 +55,7 @@ When the ticket request body contains `sdoganamento`, include `export_tracking_n
 
 ## Final Zendesk response policy
 
-`draft_response` may contain internal document references. `final_response` is the exact public Zendesk answer. If human intervention is required, `final_response` must be empty and no Zendesk reply is submitted. If a generated local document is provided, remove the document URL/path from `final_response`, keep only the data/document label, and upload the actual PDF as a Zendesk attachment. If an invoice/RPI has a GET_FULL_ORDER `documentLink` but no local PDF attachment, keep the source link in `final_response`.
+`draft_response` may contain internal document references. `final_response` is the exact public Zendesk answer. If human intervention is required, `final_response` must be empty and no Zendesk reply is submitted. Public `final_response` text must never contain invoice, RPI, LOA, POA, or other document links/paths. If a generated local document is provided, remove the document URL/path from `final_response`, keep only the data/document label, and upload the actual PDF as a Zendesk attachment. If an invoice/RPI has a GET_FULL_ORDER `documentLink` but no local PDF attachment, do not put that source link in `final_response`; route the row to human intervention and keep the source link only in `draft_response` for internal review.
 
 ## Generic English Structure
 
@@ -295,14 +295,14 @@ After `requested_data` has been finalized, `response_generator.py` uses `respons
 For a `shipment_order_number` such as `DG-EUA01663254`:
 
 - brand path segment: first two characters, `DG`;
-- order path segment: convert `EUA` / `USA` to `EU-` / `US-`, producing `DG-EU-01663254`;
+- order path segment: replace the 6th character with `-`, producing `DG-EU-01663254`;
 - final URL shape: `https://zelda.thelevelgroup.com/return/api/v1/brands/DG/orders/DG-EU-01663254`.
 
 Special cases:
 
-- If the `shipment_order_number` contains the `EUF` or `USF` market code immediately after the brand prefix, keep it unchanged when building the GET_FULL_ORDER URL.
-- Do not keep other `EU?` / `US?` market codes unchanged. Convert values such as `EUB`, `EUC`, `USB`, and `USC` to `EU-` / `US-` in the GET_FULL_ORDER URL.
-- If the `shipment_order_number` already contains `EU-` or `US-`, keep that value unchanged in the GET_FULL_ORDER URL, then use the `EUA` / `USA` version to find the matching `shipmentOrderNumber` block inside the payload.
+- For GET_FULL_ORDER URLs, always replace the 6th character of the `shipment_order_number` with `-`. For example, `DG-USB11591156` becomes `DG-US-11591156`, `DG-USC11589641` becomes `DG-US-11589641`, and `DG-EUB01614772` becomes `DG-EU-01614772`.
+- If the `shipment_order_number` already contains `EU-` or `US-`, the 6th character is already `-`, so keep that value unchanged in the GET_FULL_ORDER URL, then use the `EUA` / `USA` version to find the matching `shipmentOrderNumber` block inside the payload.
+- If the `shipment_order_number` contains the `EUF` or `USF` market code immediately after the brand prefix, first try the exact value in the GET_FULL_ORDER URL. If that request returns 404 Not Found, retry with the 6th character replaced by `-`, for example `DG-USF11591616` then `DG-US-11591616`.
 
 The API credentials come from the `GET_FULL_ORDER_API_CREDENTIALS` repository secret, with this JSON shape:
 
@@ -313,7 +313,7 @@ The API credentials come from the `GET_FULL_ORDER_API_CREDENTIALS` repository se
 }
 ```
 
-The full order payload can contain several shipments. The response generator must use only the shipment block where `shipmentOrderNumber` equals the current `shipment_order_number` after applying the payload lookup normalization above (`EU-` -> `EUA`, `US-` -> `USA`).
+The full order payload can contain several shipments. The response generator must use only the shipment block where `shipmentOrderNumber` equals the current `shipment_order_number` after applying the payload lookup normalization above (`EU-` -> `EUA`, `US-` -> `USA`). For `EUF` / `USF` fallback calls, the lookup also accepts the exact `EUF` / `USF` shipment block and the fallback `EU-` / `US-` / `EUA` / `USA` shapes.
 
 From that shipment block:
 
@@ -336,7 +336,7 @@ PDF templates are stored in `templates/pdf`.
 
 Generated and downloaded copies are written under the top-level `generated_documents` folder, committed by the workflow before draft generation, and uploaded as the `generated-customs-documents` GitHub Actions artifact.
 
-When `return_proforma_invoice` or `commercial_invoice` is requested, download the selected `documentLink` PDF and save it under `generated_documents/invoice/<invoice_filename>.pdf`. Use the saved file path in the draft response. If the PDF cannot be downloaded but the selected GET_FULL_ORDER `documentLink` exists, use that source link in the draft and final response instead of marking `*_pdf` as missing.
+When `return_proforma_invoice` or `commercial_invoice` is requested, download the selected `documentLink` PDF and save it under `generated_documents/invoice/<invoice_filename>.pdf`. Use the saved file path in the draft response. If the PDF cannot be downloaded but the selected GET_FULL_ORDER `documentLink` exists, keep that source link only in the internal draft/human-review context and route the row to human intervention; never place source document links in `final_response`.
 
 For `authorization_letter` / LOA, generate `generated_documents/authorization_letter/<extracted_tracking_number>.pdf` and fill:
 
