@@ -35,6 +35,7 @@ from pipeline_io import (
 from customs_rules import (
     HUMAN_INTERVENTION_REQUIRED,
     UNKNOWN_REQUEST,
+    clean_latest_request_text,
     collapse_document_embedded_requested_data,
     detect_language_with_dictionary,
     is_request_number_3_or_higher,
@@ -275,7 +276,19 @@ def requested_data_set(value):
 
 def source_text_for_llm(row) -> str:
     cleaned = str(row.get("cleaned_request_body", "") or "").strip()
-    return cleaned or str(row.get("request_body", "") or "")
+    raw = str(row.get("request_body", "") or "").strip()
+
+    if raw:
+        refreshed_cleaned = str(
+            clean_latest_request_text(raw).get("cleaned_request_text", "") or ""
+        ).strip()
+        # Rows produced before the latest cleaner change may already have a
+        # shortened cleaned_request_body.  Rebuild from request_body and prefer
+        # the refreshed text only when it clearly restores useful context.
+        if refreshed_cleaned and (not cleaned or len(refreshed_cleaned) > len(cleaned) + 80):
+            return refreshed_cleaned
+
+    return cleaned or raw
 
 
 def base_output_row(source_row) -> Dict[str, object]:
