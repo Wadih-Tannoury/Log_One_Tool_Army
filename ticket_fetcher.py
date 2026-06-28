@@ -33,6 +33,14 @@ from pipeline_io import (
     get_workflow_run_id,
     read_dataframe,
 )
+from customs_rules import (
+    CARRIER_EMAIL_DOMAINS,
+    VALID_TICKET_CATEGORIES,
+    carrier_code_from_email,
+    classify_ticket_category_from_content,
+    email_matches_any_carrier_domain,
+    normalize_email,
+)
 
 # ============================================================================
 # CONFIGURATION
@@ -121,11 +129,7 @@ HISTORY_COLUMNS = [
     "final_response",
 ]
 
-VALID_CATEGORIES = [
-    "Order Customs Clearance",
-    "Pending Order Release",
-    "Returns Customs Clearance",
-]
+VALID_CATEGORIES = list(VALID_TICKET_CATEGORIES)
 
 LLM_ENGINE_PREFIXES = ("llm",)
 LLM_ENGINE_NAMES = {
@@ -979,15 +983,23 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
 # ============================================================================
 
 
-def load_requester_configuration(client, bigquery) -> tuple[dict[str, str], list[str]]:
-    print("Loading configuration table...")
+def load_requester_configuration(client, bigquery) -> dict[str, str]:
+    """Load exact requester-email to ticket_category overrides from BigQuery.
+
+    The fetcher no longer limits Zendesk retrieval to these emails. They are
+    still authoritative: when a carrier-domain requester exists in this config
+    table, its ticket_category is taken from BigQuery exactly as before.
+    """
+
+    print("Loading requester configuration table...")
 
     config_query = f"""
     SELECT DISTINCT
-        requester_email,
+        LOWER(TRIM(requester_email)) AS requester_email,
         ticket_category
     FROM `{CONFIG_TABLE}`
     WHERE ticket_category IN UNNEST(@categories)
+      AND requester_email IS NOT NULL
     """
 
     job_config = bigquery.QueryJobConfig(
@@ -1008,17 +1020,17 @@ def load_requester_configuration(client, bigquery) -> tuple[dict[str, str], list
     if config_df.empty:
         raise RuntimeError("No requester emails found in configuration table.")
 
-    email_to_category = dict(
-        zip(
-            config_df["requester_email"],
-            config_df["ticket_category"],
-        )
+    email_to_category: dict[str, str] = {}
+    for _, row in config_df.iterrows():
+        requester_email = normalize_email(row.get("requester_email"))
+        ticket_category = str(row.get("ticket_category") or "").strip()
+        if requester_email and ticket_category:
+            email_to_category[requester_email] = ticket_category
+
+    print(
+        f"Loaded {len(email_to_category)} exact requester-email category overrides."
     )
-
-    requester_emails = list(email_to_category.keys())
-    print(f"Loaded {len(requester_emails)} requester emails.")
-
-    return email_to_category, requester_emails
+    return email_to_category
 
 
 def get_ticket_comments(ticket_id, *, auth, base_url: str) -> list[dict[str, Any]]:
@@ -1038,43 +1050,148 @@ def get_ticket_comments(ticket_id, *, auth, base_url: str) -> list[dict[str, Any
     return comments
 
 
+def get_zendesk_user_email(
+    user_id: object,
+    *,
+    auth,
+    base_url: str,
+    cache: dict[int, str] | None = None,
+) -> str:
+    """Return a Zendesk user's normalized email address, cached per run."""
+
+    if user_id is None:
+        return ""
+
+    try:
+        user_id_int = int(user_id)
+    except (TypeError, ValueError):
+        return ""
+
+    if cache is not None and user_id_int in cache:
+        return cache[user_id_int]
+
+    response = requests.get(
+        f"{base_url}/users/{user_id_int}.json",
+        auth=auth,
+        timeout=60,
+    )
+    response.raise_for_status()
+    requester_email = normalize_email(response.json().get("user", {}).get("email"))
+
+    if cache is not None:
+        cache[user_id_int] = requester_email
+
+    return requester_email
+
+
+def requester_email_from_ticket(
+    ticket: Mapping[str, Any],
+    *,
+    auth,
+    base_url: str,
+    user_email_cache: dict[int, str],
+) -> str:
+    """Extract the requester email used for domain filtering and config lookup.
+
+    Zendesk search results sometimes expose the email in via.source.from.address;
+    when that is absent or not a carrier-domain address, fall back to the
+    requester user record.
+    """
+
+    via_email = normalize_email(
+        ticket.get("via", {})
+        .get("source", {})
+        .get("from", {})
+        .get("address", "")
+    )
+    if email_matches_any_carrier_domain(via_email):
+        return via_email
+
+    requester_email = get_zendesk_user_email(
+        ticket.get("requester_id"),
+        auth=auth,
+        base_url=base_url,
+        cache=user_email_cache,
+    )
+    if requester_email:
+        return requester_email
+
+    return via_email
+
+
 def extract_tracking_number(subject, description, carrier_code):
+    """Extract the most likely tracking/AWB number for the requester carrier."""
+
     subject = subject or ""
     description = description or ""
+    carrier_code = str(carrier_code or "").strip().upper()
 
-    fedex_express_pattern = r"\b\d{12}\b"
-    fedex_ground_pattern = r"\b\d{15}\b"
-    fedex_smartpost_pattern = r"\b\d{20}\b|\b\d{22}\b"
-
-    ups_pattern = r"\b1Z[\da-z]{16}\b"
-    ups_alt_pattern = r"W\d{10}"
-
-    dhl_pattern = r"\b\d{10}\b"
+    patterns_by_carrier = {
+        "FEDEX": [
+            r"\b\d{12}\b",
+            r"\b\d{15}\b",
+            r"\b(?:\d{20}|\d{22})\b",
+        ],
+        "UPS": [
+            r"\b1Z[0-9A-Z]{16}\b",
+            r"\bW\d{10}\b",
+        ],
+        "DHL": [
+            r"\bJJD\d{12,24}\b",
+            r"\b\d{10}\b",
+        ],
+    }
 
     def matches(pattern):
-        return (
-            re.findall(pattern, subject, flags=re.IGNORECASE)
-            or re.findall(pattern, description, flags=re.IGNORECASE)
-            or []
+        return re.findall(
+            pattern,
+            f"{subject}\n{description}",
+            flags=re.IGNORECASE,
         )
 
-    if carrier_code == "FEDEX":
-        values = (
-            matches(fedex_express_pattern)
-            + matches(fedex_ground_pattern)
-            + matches(fedex_smartpost_pattern)
-        )
+    if carrier_code in patterns_by_carrier:
+        values: list[str] = []
+        for pattern in patterns_by_carrier[carrier_code]:
+            values.extend(matches(pattern))
         return next(iter(dict.fromkeys(values)), "N/A")
 
-    if carrier_code == "UPS":
-        values = matches(ups_pattern) + matches(ups_alt_pattern)
-        return next(iter(dict.fromkeys(values)), "N/A")
+    # Conservative fallback for malformed/missing requester emails.
+    values = []
+    for patterns in patterns_by_carrier.values():
+        for pattern in patterns:
+            values.extend(matches(pattern))
+    return next(iter(dict.fromkeys(values)), "N/A")
 
-    if carrier_code == "DHL":
-        values = matches(dhl_pattern)
-        return next(iter(dict.fromkeys(values)), "N/A")
 
-    return "N/A"
+def _active_zendesk_search_query() -> str:
+    """Build the Zendesk query for active mail tickets.
+
+    By default this intentionally does not constrain requester emails or dates:
+    the Python layer then filters requester emails to carrier domains. Set
+    ZENDESK_ACTIVE_TICKET_LOOKBACK_DAYS only if the Zendesk instance needs an
+    operational safety window.
+    """
+
+    search_terms = [
+        "type:ticket",
+        "-status:closed",
+        "-status:solved",
+        "via:mail",
+    ]
+
+    lookback_days_raw = str(os.getenv("ZENDESK_ACTIVE_TICKET_LOOKBACK_DAYS", "") or "").strip()
+    if lookback_days_raw:
+        try:
+            lookback_days = int(lookback_days_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "ZENDESK_ACTIVE_TICKET_LOOKBACK_DAYS must be an integer number of days"
+            ) from exc
+        if lookback_days > 0:
+            start_date = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            search_terms.append(f"created>={start_date.strftime('%Y-%m-%d')}")
+
+    return " ".join(search_terms)
 
 
 def fetch_ticket_rows(
@@ -1084,155 +1201,157 @@ def fetch_ticket_rows(
     auth,
     base_url: str,
     email_to_category: Mapping[str, str],
-    requester_emails: Iterable[str],
 ) -> list[dict[str, Any]]:
-    end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=90)
+    """Fetch active Zendesk tickets from UPS/DHL/FedEx requester domains.
 
-    start_date_str = start_date.strftime("%Y-%m-%d")
-    end_date_str = end_date.strftime("%Y-%m-%d")
+    Exact requester emails found in the BigQuery config table keep their
+    configured ticket_category. Carrier-domain requester emails not in config
+    are classified from the current requester message content.
+    """
 
     rows: list[dict[str, Any]] = []
+    query = _active_zendesk_search_query()
+    url = f"{base_url}/search.json?query={quote(query)}&per_page=100"
+    page = 1
+    seen_ticket_ids: set[int] = set()
+    user_email_cache: dict[int, str] = {}
+    skipped_non_carrier = 0
 
-    for requester_email in requester_emails:
-        print(f"Processing requester: {requester_email}")
-        page = 1
+    print(
+        "Fetching active Zendesk mail tickets for requester domains: "
+        + ", ".join(CARRIER_EMAIL_DOMAINS)
+    )
 
-        while True:
-            search_query = (
-                f"type:ticket "
-                f"-status:closed "
-                f"-status:solved "
-                f"via:mail "
-                f"requester:{requester_email} "
-                f"created>={start_date_str} "
-                f"created<={end_date_str}"
-            )
+    while url:
+        response = requests.get(url, auth=auth, timeout=60)
+        response.raise_for_status()
 
-            url = f"{base_url}/search.json?query={quote(search_query)}&page={page}"
+        payload = response.json()
+        tickets = payload.get("results", [])
+        print(f"Found {len(tickets)} active mail tickets on Zendesk search page {page}.")
 
-            response = requests.get(url, auth=auth, timeout=60)
-            response.raise_for_status()
+        for ticket in tickets:
+            try:
+                ticket_id = int(ticket["id"])
+                if ticket_id in seen_ticket_ids:
+                    continue
+                seen_ticket_ids.add(ticket_id)
 
-            payload = response.json()
-            tickets = payload.get("results", [])
+                requester_id = ticket.get("requester_id")
+                requester_email = requester_email_from_ticket(
+                    ticket,
+                    auth=auth,
+                    base_url=base_url,
+                    user_email_cache=user_email_cache,
+                )
 
-            if not tickets:
-                break
+                if not email_matches_any_carrier_domain(requester_email):
+                    skipped_non_carrier += 1
+                    continue
 
-            print(f"Found {len(tickets)} tickets on page {page}")
+                configured_category = email_to_category.get(requester_email)
+                carrier = carrier_code_from_email(requester_email)
 
-            for ticket in tickets:
-                try:
-                    ticket_id = ticket["id"]
-                    requester_id = ticket.get("requester_id")
+                comments = get_ticket_comments(
+                    ticket_id,
+                    auth=auth,
+                    base_url=base_url,
+                )
 
-                    comments = get_ticket_comments(
-                        ticket_id,
-                        auth=auth,
-                        base_url=base_url,
-                    )
+                requester_comment_counter = 0
+                requester_requests = []
 
-                    requester_comment_counter = 0
-                    requester_requests = []
-
-                    for idx, comment in enumerate(comments):
-                        if comment["author_id"] != requester_id:
-                            continue
-
-                        requester_comment_counter += 1
-                        requester_requests.append(
-                            {
-                                "request_number": requester_comment_counter,
-                                "body": comment.get("body", ""),
-                                "comment_index": idx,
-                                "request_submission_timestamp": comment.get(
-                                    "created_at"
-                                ),
-                            }
-                        )
-
-                    active_requests = []
-
-                    for idx in range(len(comments) - 1, -1, -1):
-                        comment = comments[idx]
-
-                        # Ignore internal notes.
-                        if not comment.get("public", True):
-                            continue
-
-                        if comment["author_id"] == requester_id:
-                            request = next(
-                                (
-                                    candidate
-                                    for candidate in requester_requests
-                                    if candidate["comment_index"] == idx
-                                ),
-                                None,
-                            )
-
-                            if request:
-                                active_requests.append(request)
-                        else:
-                            # First public reply after the latest requester block.
-                            break
-
-                    active_requests.reverse()
-
-                    if not active_requests:
+                for idx, comment in enumerate(comments):
+                    if comment.get("author_id") != requester_id:
                         continue
 
-                    sender_email = (
-                        ticket.get("via", {})
-                        .get("source", {})
-                        .get("from", {})
-                        .get("address", "")
+                    requester_comment_counter += 1
+                    requester_requests.append(
+                        {
+                            "request_number": requester_comment_counter,
+                            "body": comment.get("body", ""),
+                            "comment_index": idx,
+                            "request_submission_timestamp": comment.get("created_at"),
+                        }
                     )
 
-                    carrier = ""
-                    if "@" in sender_email:
-                        carrier = sender_email.split("@")[1].split(".")[0].upper()
+                active_requests = []
 
+                for idx in range(len(comments) - 1, -1, -1):
+                    comment = comments[idx]
+
+                    # Ignore internal notes.
+                    if not comment.get("public", True):
+                        continue
+
+                    if comment.get("author_id") == requester_id:
+                        request = next(
+                            (
+                                candidate
+                                for candidate in requester_requests
+                                if candidate["comment_index"] == idx
+                            ),
+                            None,
+                        )
+
+                        if request:
+                            active_requests.append(request)
+                    else:
+                        # First public reply after the latest requester block.
+                        break
+
+                active_requests.reverse()
+
+                if not active_requests:
+                    continue
+
+                subject = ticket.get("subject", "")
+                description = ticket.get("description", "")
+
+                for request in active_requests:
+                    request_body = request["body"]
+                    ticket_category = configured_category or classify_ticket_category_from_content(
+                        subject=subject,
+                        request_body=request_body,
+                        requester_email=requester_email,
+                    )
                     tracking_number = extract_tracking_number(
-                        ticket.get("subject", ""),
-                        ticket.get("description", ""),
+                        subject,
+                        f"{description}\n{request_body}",
                         carrier,
                     )
 
-                    for request in active_requests:
-                        rows.append(
-                            {
-                                "ingestion_timestamp": datetime.now(timezone.utc),
-                                "request_id": build_request_id(
-                                    ticket_id,
-                                    request["request_number"],
-                                ),
-                                "request_submission_timestamp": request.get(
-                                    "request_submission_timestamp"
-                                ),
-                                "ticket_submission_timestamp": ticket.get(
-                                    "created_at"
-                                ),
-                                "zendesk_ticket_id": ticket_id,
-                                "requester_email": requester_email,
-                                "subject": ticket.get("subject", ""),
-                                "request_body": request["body"],
-                                "request_number": request["request_number"],
-                                "ticket_category": email_to_category[requester_email],
-                                "extracted_tracking_number": tracking_number,
-                            }
-                        )
-
-                except Exception as exc:
-                    print(
-                        f"Error processing ticket {ticket.get('id')}: {str(exc)}"
+                    rows.append(
+                        {
+                            "ingestion_timestamp": datetime.now(timezone.utc),
+                            "request_id": build_request_id(
+                                ticket_id,
+                                request["request_number"],
+                            ),
+                            "request_submission_timestamp": request.get(
+                                "request_submission_timestamp"
+                            ),
+                            "ticket_submission_timestamp": ticket.get("created_at"),
+                            "zendesk_ticket_id": ticket_id,
+                            "requester_email": requester_email,
+                            "subject": subject,
+                            "request_body": request_body,
+                            "request_number": request["request_number"],
+                            "ticket_category": ticket_category,
+                            "extracted_tracking_number": tracking_number,
+                        }
                     )
 
-            if not payload.get("next_page"):
-                break
+            except Exception as exc:
+                print(f"Error processing ticket {ticket.get('id')}: {str(exc)}")
 
-            page += 1
+        url = payload.get("next_page")
+        page += 1
 
+    print(
+        f"Fetched {len(rows)} active requester message(s) from carrier-domain tickets; "
+        f"skipped {skipped_non_carrier} non-carrier ticket(s)."
+    )
     return rows
 
 
@@ -1341,7 +1460,7 @@ def enrich_with_shipment_numbers(df: pd.DataFrame, client, bigquery) -> pd.DataF
 
 def fetch_tickets_to_active_table() -> int:
     client, bigquery = bigquery_client()
-    email_to_category, requester_emails = load_requester_configuration(
+    email_to_category = load_requester_configuration(
         client,
         bigquery,
     )
@@ -1352,7 +1471,6 @@ def fetch_tickets_to_active_table() -> int:
         auth=zendesk_auth(),
         base_url=zendesk_base_url(),
         email_to_category=email_to_category,
-        requester_emails=requester_emails,
     )
 
     if not rows:
