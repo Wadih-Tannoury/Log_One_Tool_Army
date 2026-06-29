@@ -47,6 +47,22 @@ UPS_BROKERAGE_EMAILS = {
 FEDEX_BROKERAGE_EMAIL = "doganafedex@fedex.com"
 DHL_BROKERAGE_EMAIL = "kamil.it@dhl.com"
 
+def is_missing_extracted_tracking_number(value: object) -> bool:
+    """Return True when the ticket did not contain a usable tracking/AWB number.
+
+    ticket_fetcher.extract_tracking_number uses ``N/A`` when no carrier-specific
+    tracking number is found. Treat other spreadsheet/null spellings as missing
+    too so downstream steps can stop before regex or LLM analysis.
+    """
+
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    text = str(value).strip()
+    return text.lower() in {"", "nan", "none", "null", "n/a", "na", "not found"}
+
+
 UPS_STANDARD_REPLY_REQUESTED_DATA = [
     "export_tracking_number",
     "ups_account_number",
@@ -1614,20 +1630,48 @@ def normalize_tracking_for_comparison(value: object) -> str:
     return re.sub(r"[^0-9A-Z]+", "", str(value or "").upper())
 
 
+def tracking_comparison_variants(value: object) -> List[str]:
+    """Return normalized variants for comparing tracking/order identifiers.
+
+    Shipment-order numbers are sometimes represented as ``DG-EUA01667868`` in
+    extracted text and as ``DG-EU-01667868`` in GET_FULL_ORDER payloads/links.
+    Both refer to the same EU order.  The same pattern exists for US orders.
+    Keeping the original normalized value plus the collapsed market-code variant
+    prevents invoice/RPI routing from validating the wrong document type.
+    """
+
+    normalized = normalize_tracking_for_comparison(value)
+    if not normalized:
+        return []
+
+    variants = [normalized]
+
+    # Brand + market + variant letter + digits, for example:
+    # DGEUA01667868 -> DGEU01667868 and DGUSA11590412 -> DGUS11590412.
+    match = re.match(r"^([A-Z0-9]{2})(EU|US)[A-Z](\d+)$", normalized)
+    if match:
+        collapsed = "".join(match.groups())
+        if collapsed not in variants:
+            variants.append(collapsed)
+
+    return variants
+
+
 def tracking_numbers_match(left: object, right: object) -> bool:
-    left_normalized = normalize_tracking_for_comparison(left)
-    right_normalized = normalize_tracking_for_comparison(right)
-    if not left_normalized or not right_normalized:
+    left_variants = tracking_comparison_variants(left)
+    right_variants = tracking_comparison_variants(right)
+    if not left_variants or not right_variants:
         return False
-    if left_normalized == right_normalized:
-        return True
-    return (
-        len(left_normalized) >= 8
-        and left_normalized in right_normalized
-    ) or (
-        len(right_normalized) >= 8
-        and right_normalized in left_normalized
-    )
+
+    for left_normalized in left_variants:
+        for right_normalized in right_variants:
+            if left_normalized == right_normalized:
+                return True
+            if len(left_normalized) >= 8 and left_normalized in right_normalized:
+                return True
+            if len(right_normalized) >= 8 and right_normalized in left_normalized:
+                return True
+    return False
 
 
 def extracted_tracking_number_kind(
