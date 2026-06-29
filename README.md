@@ -174,7 +174,7 @@ Zendesk submission is controlled by one explicit flag:
 ```bash
 SUBMIT_ZENDESK_RESPONSES=true   # submit public Zendesk replies and upload attachments
 SUBMIT_ZENDESK_RESPONSES=false  # log only; do not update Zendesk tickets
-ZENDESK_STATUS_AFTER_REPLY=closed  # status set when an automatic public reply is posted
+ZENDESK_STATUS_AFTER_REPLY=solved  # status set when an automatic public reply is posted; keep tickets reopenable/editable until Zendesk closes them by normal policy
 ```
 
 In GitHub Actions, this is exposed as the manual `workflow_dispatch` input `submit_zendesk_responses`. The default is `false` for safety, so a manually triggered run logs BigQuery history and builds `final_response` values without sending anything to Zendesk unless the input is deliberately switched on.
