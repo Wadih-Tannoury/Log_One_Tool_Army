@@ -33,15 +33,21 @@ from requests.auth import HTTPBasicAuth
 from customs_rules import (
     PLACEHOLDER,
     UPS_BROKERAGE_EMAIL,
+    align_invoice_requested_data_with_tracking_context,
     extract_ups_code,
     collapse_document_embedded_requested_data,
     expand_first_returns_customs_clearance_bundle,
+    filter_libera_esportazione_response_data,
     first_available_value,
+    is_atr_certificate_mandate_request,
     is_no_action_carrier_notification,
     is_noreply_requester_email,
     is_ups_uk_import_clearance_instructions_request,
     normalize_email,
     normalize_requested_data,
+    only_libera_esportazione_regex_type,
+    only_libera_esportazione_requested_data,
+    strip_libera_esportazione_requested_data,
 )
 from pipeline_io import REQUEST_INTENT_RESULTS_PATH, read_dataframe, write_dataframe
 
@@ -382,6 +388,35 @@ def _row_request_text(row: Mapping[str, Any]) -> str:
     )
 
 
+def _request_type_sources_for_tracking_alignment(row: Mapping[str, Any]) -> list[str]:
+    values: list[str] = []
+    for column in ("regex_request_types", "regex_requested_data", "request_types"):
+        for key in normalize_requested_data_with_aliases(row.get(column)):
+            if key and key not in values:
+                values.append(key)
+    return values
+
+
+def _apply_response_requested_data_overrides(
+    row: Mapping[str, Any],
+    requested_data: object,
+) -> list[str]:
+    values = filter_libera_esportazione_response_data(
+        requested_data,
+        row.get("regex_request_types"),
+    )
+    values = align_invoice_requested_data_with_tracking_context(
+        values,
+        _request_type_sources_for_tracking_alignment(row),
+        extracted_tracking_number=row.get("extracted_tracking_number"),
+        shipment_tracking_number=row.get("shipment_tracking_number"),
+        return_tracking_number=row.get("return_tracking_number"),
+    )
+    if is_atr_certificate_mandate_request(_row_request_text(row)):
+        values = [value for value in values if value != "power_of_attorney"]
+    return values
+
+
 def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
     """Return the effective requested_data keys for API/doc retrieval.
 
@@ -409,22 +444,32 @@ def requested_data_keys_from_row(row: Mapping[str, Any]) -> list[str]:
                 keys.append(key)
         return keys
 
+    if only_libera_esportazione_regex_type(row.get("regex_request_types")):
+        return []
+
     regex_trigger_keys: list[str] = []
     for column in ("regex_requested_data", "regex_request_types"):
         for key in _collapsed_unique_keys(row.get(column)):
             if key and key not in regex_trigger_keys:
                 regex_trigger_keys.append(key)
+    regex_trigger_keys = _apply_response_requested_data_overrides(row, regex_trigger_keys)
 
     def _expanded_keys(keys: list[str]) -> list[str]:
-        return expand_first_returns_customs_clearance_bundle(
+        expanded_keys = expand_first_returns_customs_clearance_bundle(
             keys,
             ticket_category=row.get("ticket_category", ""),
             request_number=row.get("request_number", 1),
             requester_email=row.get("requester_email", ""),
             trigger_requested_data=regex_trigger_keys or keys,
         )
+        return _apply_response_requested_data_overrides(row, expanded_keys)
 
-    canonical_keys = _expanded_keys(_collapsed_unique_keys(row.get("requested_data")))
+    raw_canonical_keys = normalize_requested_data_with_aliases(row.get("requested_data"))
+    if only_libera_esportazione_requested_data(raw_canonical_keys):
+        return []
+    canonical_keys = _expanded_keys(
+        _collapsed_unique_keys(strip_libera_esportazione_requested_data(raw_canonical_keys))
+    )
     if canonical_keys:
         return canonical_keys
 
