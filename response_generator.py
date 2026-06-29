@@ -48,11 +48,15 @@ from customs_rules import (
     PLACEHOLDER,
     UNKNOWN_REQUEST,
     UPS_BROKERAGE_EMAIL,
+    align_invoice_requested_data_with_tracking_context,
     detect_language_with_dictionary,
     contains_correction_or_discrepancy,
     extract_ups_code,
     expand_first_returns_customs_clearance_bundle,
+    filter_libera_esportazione_response_data,
     first_available_value,
+    has_libera_esportazione_regex_type,
+    is_atr_certificate_mandate_request,
     is_customer_refused_return_request,
     is_no_action_carrier_notification,
     is_noreply_requester_email,
@@ -63,6 +67,9 @@ from customs_rules import (
     normalize_language,
     normalize_request_number,
     normalize_requested_data,
+    only_libera_esportazione_regex_type,
+    only_libera_esportazione_requested_data,
+    strip_libera_esportazione_requested_data,
 )
 
 INPUT_PATH = REQUEST_INTENT_RESULTS_PATH
@@ -116,9 +123,7 @@ RPI_EMBEDDED_CONTACT_REQUESTED_DATA = {
     "customer_phone",
 }
 
-FIRST_REQUEST_COMMERCIAL_INVOICE_EMBEDDED_REQUESTED_DATA = {
-    "dichiarazione_di_libera_esportazione",
-}
+FIRST_REQUEST_COMMERCIAL_INVOICE_EMBEDDED_REQUESTED_DATA = set()
 
 FIRST_REQUEST_IGNORED_REQUESTED_DATA = {
     "eori_number",
@@ -775,6 +780,32 @@ def all_requested_data_sources(row):
         for item in normalize_requested_data_with_aliases(row.get(column)):
             if item not in values:
                 values.append(item)
+    return _apply_response_requested_data_overrides(row, values)
+
+
+def _request_type_sources_for_tracking_alignment(row):
+    values = []
+    for column in ["regex_request_types", "regex_requested_data", "request_types"]:
+        for item in normalize_requested_data_with_aliases(row.get(column)):
+            if item not in values:
+                values.append(item)
+    return values
+
+
+def _apply_response_requested_data_overrides(row, requested_data):
+    values = filter_libera_esportazione_response_data(
+        requested_data,
+        row.get("regex_request_types"),
+    )
+    values = align_invoice_requested_data_with_tracking_context(
+        values,
+        _request_type_sources_for_tracking_alignment(row),
+        extracted_tracking_number=row.get("extracted_tracking_number"),
+        shipment_tracking_number=row.get("shipment_tracking_number"),
+        return_tracking_number=row.get("return_tracking_number"),
+    )
+    if is_atr_certificate_mandate_request(row_request_text(row)):
+        values = [value for value in values if value != "power_of_attorney"]
     return values
 
 
@@ -784,7 +815,7 @@ def regex_requested_data_sources(row):
         for item in normalize_requested_data_with_aliases(row.get(column)):
             if item not in values:
                 values.append(item)
-    return values
+    return _apply_response_requested_data_overrides(row, values)
 
 
 def has_embedded_rpi_contact_fields(row):
@@ -813,10 +844,6 @@ def collapse_embedded_document_fields(row, requested_data):
         if first_request and data_key in FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA:
             if "return_proforma_invoice" not in result:
                 result.append("return_proforma_invoice")
-            continue
-        if first_request and data_key in FIRST_REQUEST_COMMERCIAL_INVOICE_EMBEDDED_REQUESTED_DATA:
-            if "commercial_invoice" not in result:
-                result.append("commercial_invoice")
             continue
         if first_request and data_key in FIRST_REQUEST_IGNORED_REQUESTED_DATA:
             continue
@@ -861,6 +888,10 @@ def collapse_embedded_document_fields(row, requested_data):
 
 def requested_data_for_response(row):
     request_text = row_request_text(row)
+    libera_regex_detected = has_libera_esportazione_regex_type(row.get("regex_request_types"))
+
+    if only_libera_esportazione_regex_type(row.get("regex_request_types")):
+        return []
 
     if is_customer_refused_return_request(request_text):
         return ["ups_account_number"]
@@ -871,6 +902,9 @@ def requested_data_for_response(row):
         return [HUMAN_INTERVENTION_REQUIRED]
 
     requested_data = normalize_requested_data_with_aliases(row.get("requested_data"))
+    if only_libera_esportazione_requested_data(requested_data):
+        return []
+    requested_data = strip_libera_esportazione_requested_data(requested_data)
     requested_data = collapse_embedded_document_fields(row, requested_data)
     requested_data = expand_first_returns_customs_clearance_bundle(
         requested_data,
@@ -879,6 +913,7 @@ def requested_data_for_response(row):
         requester_email=row.get("requester_email"),
         trigger_requested_data=regex_requested_data_sources(row) or requested_data,
     )
+    requested_data = _apply_response_requested_data_overrides(row, requested_data)
     requested_data = [
         data_key
         for data_key in requested_data
@@ -886,7 +921,8 @@ def requested_data_for_response(row):
     ]
 
     if (
-        request_body_mentions_sdoganamento(row)
+        not libera_regex_detected
+        and request_body_mentions_sdoganamento(row)
         and "export_tracking_number" not in requested_data
         and HUMAN_INTERVENTION_REQUIRED not in requested_data
         and UNKNOWN_REQUEST not in requested_data
@@ -1424,7 +1460,31 @@ def human_intervention_data_policy_reason(row, requested_data):
 
 def should_force_human_intervention(row, requested_data):
     request_text = row_request_text(row)
-    raw_requested_data = normalize_requested_data_with_aliases(row.get("requested_data"))
+    raw_requested_data_unfiltered = normalize_requested_data_with_aliases(row.get("requested_data"))
+    raw_source_values_unfiltered = []
+    for column in [
+        "requested_data",
+        "regex_requested_data",
+        "regex_request_types",
+        "request_types",
+        "standard_reply_requested_data",
+    ]:
+        for item in normalize_requested_data_with_aliases(row.get(column)):
+            if item not in raw_source_values_unfiltered:
+                raw_source_values_unfiltered.append(item)
+    raw_requested_data = _apply_response_requested_data_overrides(
+        row,
+        raw_requested_data_unfiltered,
+    )
+
+    if only_libera_esportazione_regex_type(row.get("regex_request_types")):
+        return False, ""
+
+    if is_atr_certificate_mandate_request(request_text) and "power_of_attorney" in set(raw_source_values_unfiltered):
+        return (
+            True,
+            "ATR certificate mandate/form request is not a power_of_attorney automation case. Human intervention is required.",
+        )
 
     if is_noreply_requester_email(row.get("requester_email")):
         return (
