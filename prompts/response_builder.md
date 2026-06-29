@@ -31,6 +31,8 @@ If `requester_email` starts with `noreply`, do not create a public Zendesk reply
 
 ## Tracking Not Found in Shipments Table Rule
 
+When no `extracted_tracking_number` is found in the ticket, the request must not be analyzed by regex or LLM. `draft_response` must be a human-intervention note saying that the tracking number was not found, and `final_response` must stay empty.
+
 When the tracking number extracted from the ticket is not found in `tlg-business-intelligence-prd.bi.shipping_platform_shipments`, the regex layer must not process the request. The row must be sent only to the LLM.
 
 The LLM must classify what it understood in `requested_data` and produce `llm_human_intervention_draft_response`, a short draft saying what it understood and that human intervention is required because the tracking number was not found in the shipment table.
