@@ -23,6 +23,21 @@ CARRIER_EMAIL_DOMAINS = ("ups.com", "dhl.com", "fedex.com")
 PLACEHOLDER = "[TO BE RETRIEVED]"
 HUMAN_INTERVENTION_REQUIRED = "human_intervention_required"
 UNKNOWN_REQUEST = "unknown_request"
+DICHIARAZIONE_DI_LIBERA_ESPORTAZIONE = "dichiarazione_di_libera_esportazione"
+LIBERA_ESPORTAZIONE_REQUEST_TYPES = {
+    DICHIARAZIONE_DI_LIBERA_ESPORTAZIONE,
+    "declaration_of_intent",
+}
+COMMERCIAL_INVOICE_REQUEST_TYPES = {
+    "invoice",
+    "commercial_invoice",
+    "commercial_invoice_required",
+}
+RETURN_PROFORMA_REQUEST_TYPES = {
+    "return_proforma_invoice",
+    "rpi",
+    "pri",
+}
 
 UPS_BROKERAGE_EMAIL = "bgybrokerage@ups.com"
 UPS_BROKERAGE_EMAILS = {
@@ -429,6 +444,18 @@ EXPLICIT_UPS_ACCOUNT_REQUEST_RE = re.compile(
     r"[\s\S]{0,90}(?:ups\s+account(?:\s+number)?|codice\s+(?:di\s+)?abbonamento\s+ups|cod\s+ups)|"
     r"(?:ups\s+account(?:\s+number)?|codice\s+(?:di\s+)?abbonamento\s+ups|cod\s+ups)"
     r"[\s\S]{0,90}(?:please|kindly|provide|send|forward|fornire|fornirci|inviare|inviarci|indicare|richiediamo|necessitiamo|prego)"
+    r")",
+    re.IGNORECASE,
+)
+
+ATR_CERTIFICATE_MANDATE_RE = re.compile(
+    r"(?:"
+    r"(?:mandato|procura|delega)"
+    r"[\s\S]{0,180}"
+    r"(?:emissione|rilascio|richiesta|certificat\w*|form\s+allegato)"
+    r"[\s\S]{0,180}\batr\b|"
+    r"\batr\b[\s\S]{0,180}"
+    r"(?:mandato|procura|delega|certificat\w*|form\s+allegato)"
     r")",
     re.IGNORECASE,
 )
@@ -1066,9 +1093,9 @@ def collapse_document_embedded_requested_data(
 
     On request number 1, invoice correction and value confirmation are also
     considered part of the return proforma invoice package for response data.
-    On request number 1, declaration-of-intent/libera-esportazione wording is
-    fulfilled by the commercial invoice, EORI is ignored, and shipment
-    instructions are fulfilled by export tracking plus UPS account data.
+    On request number 1, EORI is ignored, and shipment instructions are
+    fulfilled by export tracking plus UPS account data. Declaration-of-intent
+    / libera-esportazione wording is not converted to commercial invoice.
     """
     values = normalize_requested_data(requested_data)
     if not values:
@@ -1078,7 +1105,6 @@ def collapse_document_embedded_requested_data(
     embedded_fields_found = False
     rpi_document_fields_found = False
     first_request_rpi_response_fields_found = False
-    first_request_commercial_invoice_fields_found = False
     first_request_shipment_instructions_found = False
     first_request = normalize_request_number(request_number) == 1
     first_returns = is_first_returns_customs_request(ticket_category, request_number)
@@ -1091,9 +1117,6 @@ def collapse_document_embedded_requested_data(
             continue
         if first_request and value in FIRST_REQUEST_RPI_RESPONSE_EMBEDDED_REQUESTED_DATA:
             first_request_rpi_response_fields_found = True
-            continue
-        if first_request and value == "dichiarazione_di_libera_esportazione":
-            first_request_commercial_invoice_fields_found = True
             continue
         if first_request and value == "eori_number":
             continue
@@ -1137,9 +1160,6 @@ def collapse_document_embedded_requested_data(
     ) and "return_proforma_invoice" not in result:
         result.append("return_proforma_invoice")
 
-    if first_request_commercial_invoice_fields_found and "commercial_invoice" not in result:
-        result.append("commercial_invoice")
-
     if first_request_shipment_instructions_found:
         for value in ("ups_account_number", "export_tracking_number"):
             if value not in result:
@@ -1165,7 +1185,6 @@ def collapse_document_embedded_requested_data(
             or first_request_rpi_response_fields_found
             or field_phrase_found
         )
-        and not first_request_commercial_invoice_fields_found
     ):
         if first_request_rpi_response_fields_found:
             result = [value for value in result if value != "commercial_invoice"]
@@ -1527,6 +1546,154 @@ def normalize_requested_data(value: object) -> List[str]:
             cleaned.append(item)
 
     return cleaned
+
+
+def _normalized_requested_type_set(value: object) -> set[str]:
+    return {str(item or "").strip() for item in normalize_requested_data(value) if str(item or "").strip()}
+
+
+def has_libera_esportazione_regex_type(regex_request_types: object) -> bool:
+    values = _normalized_requested_type_set(regex_request_types)
+    return bool(values & LIBERA_ESPORTAZIONE_REQUEST_TYPES)
+
+
+def only_libera_esportazione_regex_type(regex_request_types: object) -> bool:
+    values = _normalized_requested_type_set(regex_request_types)
+    actionable_values = {
+        value
+        for value in values
+        if value not in {"exclude_from_processing", HUMAN_INTERVENTION_REQUIRED, UNKNOWN_REQUEST}
+    }
+    return bool(actionable_values) and actionable_values.issubset(
+        LIBERA_ESPORTAZIONE_REQUEST_TYPES
+    )
+
+
+def only_libera_esportazione_requested_data(requested_data: object) -> bool:
+    values = _normalized_requested_type_set(requested_data)
+    return bool(values) and values.issubset(LIBERA_ESPORTAZIONE_REQUEST_TYPES)
+
+
+def strip_libera_esportazione_requested_data(requested_data: object) -> List[str]:
+    return [
+        value
+        for value in normalize_requested_data(requested_data)
+        if value not in LIBERA_ESPORTAZIONE_REQUEST_TYPES
+    ]
+
+
+def filter_libera_esportazione_response_data(
+    requested_data: object,
+    regex_request_types: object,
+) -> List[str]:
+    """Remove libera-esportazione declarations from automatic response data.
+
+    If the declaration is the only regex-detected request type, return no
+    response data. If it appears together with other regex-detected request
+    types, keep the other response data only.
+    """
+
+    values = normalize_requested_data(requested_data)
+    if not has_libera_esportazione_regex_type(regex_request_types):
+        return values
+
+    source_values = _normalized_requested_type_set(regex_request_types)
+    keep_commercial_invoice = bool(source_values & COMMERCIAL_INVOICE_REQUEST_TYPES)
+
+    return [
+        value
+        for value in values
+        if value not in LIBERA_ESPORTAZIONE_REQUEST_TYPES
+        and (value != "commercial_invoice" or keep_commercial_invoice)
+    ]
+
+
+def normalize_tracking_for_comparison(value: object) -> str:
+    if _is_missing(value):
+        return ""
+    return re.sub(r"[^0-9A-Z]+", "", str(value or "").upper())
+
+
+def tracking_numbers_match(left: object, right: object) -> bool:
+    left_normalized = normalize_tracking_for_comparison(left)
+    right_normalized = normalize_tracking_for_comparison(right)
+    if not left_normalized or not right_normalized:
+        return False
+    if left_normalized == right_normalized:
+        return True
+    return (
+        len(left_normalized) >= 8
+        and left_normalized in right_normalized
+    ) or (
+        len(right_normalized) >= 8
+        and right_normalized in left_normalized
+    )
+
+
+def extracted_tracking_number_kind(
+    extracted_tracking_number: object,
+    shipment_tracking_number: object,
+    return_tracking_number: object,
+) -> str:
+    """Return shipment, return, or empty when the extracted TRK is ambiguous."""
+
+    return_match = tracking_numbers_match(extracted_tracking_number, return_tracking_number)
+    shipment_match = tracking_numbers_match(extracted_tracking_number, shipment_tracking_number)
+
+    if return_match and not shipment_match:
+        return "return"
+    if shipment_match and not return_match:
+        return "shipment"
+    return ""
+
+
+def align_invoice_requested_data_with_tracking_context(
+    requested_data: object,
+    request_type_sources: object = None,
+    *,
+    extracted_tracking_number: object = None,
+    shipment_tracking_number: object = None,
+    return_tracking_number: object = None,
+) -> List[str]:
+    """Swap invoice/RPI response data when regex intent conflicts with TRK role."""
+
+    values = normalize_requested_data(requested_data)
+    source_values = _normalized_requested_type_set(
+        request_type_sources if request_type_sources is not None else requested_data
+    )
+    tracking_kind = extracted_tracking_number_kind(
+        extracted_tracking_number,
+        shipment_tracking_number,
+        return_tracking_number,
+    )
+
+    if tracking_kind == "return" and source_values & COMMERCIAL_INVOICE_REQUEST_TYPES:
+        values = [
+            value
+            for value in values
+            if value not in COMMERCIAL_INVOICE_REQUEST_TYPES
+            and value != "commercial_invoice"
+        ]
+        if "return_proforma_invoice" not in values:
+            values.append("return_proforma_invoice")
+
+    elif tracking_kind == "shipment" and source_values & RETURN_PROFORMA_REQUEST_TYPES:
+        values = [
+            value
+            for value in values
+            if value not in RETURN_PROFORMA_REQUEST_TYPES
+            and value != "return_proforma_invoice"
+        ]
+        if "commercial_invoice" not in values:
+            values.append("commercial_invoice")
+
+    return values
+
+
+def is_atr_certificate_mandate_request(text: object) -> bool:
+    """True for ATR-certificate mandate/forms, which are not POA replies."""
+
+    return bool(ATR_CERTIFICATE_MANDATE_RE.search(normalize_whitespace(text)))
 
 
 def requested_data_already_answered_by_first_reply(
