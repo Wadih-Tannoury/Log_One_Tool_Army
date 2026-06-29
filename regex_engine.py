@@ -36,10 +36,13 @@ from pipeline_io import (
 from customs_rules import (
     HUMAN_INTERVENTION_REQUIRED,
     UNKNOWN_REQUEST,
+    align_invoice_requested_data_with_tracking_context,
     clean_latest_request_text,
     collapse_document_embedded_requested_data,
     expand_first_returns_customs_clearance_bundle,
     classify_ticket_category_from_content,
+    filter_libera_esportazione_response_data,
+    is_atr_certificate_mandate_request,
     contains_correction_or_discrepancy,
     get_standard_reply_requested_data,
     has_actionable_request_language,
@@ -72,7 +75,11 @@ REGEX_CONFIG_TABLE = (
 # Regex config still stores request_type.  Downstream components use requested_data.
 REQUEST_TYPE_TO_REQUESTED_DATA = {
     "invoice": ["commercial_invoice"],
+    "commercial_invoice": ["commercial_invoice"],
+    "commercial_invoice_required": ["commercial_invoice"],
     "return_proforma_invoice": ["return_proforma_invoice"],
+    "rpi": ["return_proforma_invoice"],
+    "pri": ["return_proforma_invoice"],
     "invoice_correction": ["corrected_invoice"],
     "tracking_number": ["export_tracking_number"],
     "ups_account": ["ups_account_number"],
@@ -214,6 +221,9 @@ class RegexEngine:
                 tracking_not_found_in_shipping_platform_shipments=ticket.get(
                     "tracking_not_found_in_shipping_platform_shipments"
                 ),
+                extracted_tracking_number=ticket.get("extracted_tracking_number"),
+                shipment_tracking_number=ticket.get("shipment_tracking_number"),
+                return_tracking_number=ticket.get("return_tracking_number"),
             )
 
             output_row = {
@@ -338,6 +348,9 @@ class RegexEngine:
         request_number: object = 1,
         ticket_category: object = "",
         tracking_not_found_in_shipping_platform_shipments: object = False,
+        extracted_tracking_number: object = "",
+        shipment_tracking_number: object = "",
+        return_tracking_number: object = "",
     ):
         text_details = clean_latest_request_text(request_text)
         cleaned_text = str(text_details["cleaned_request_text"] or "")
@@ -715,6 +728,30 @@ class RegexEngine:
         suppressed_types: List[str] = []
         effective_request_types = list(real_request_types)
 
+        if is_atr_certificate_mandate_request(cleaned_text) and "power_of_attorney" in effective_request_types:
+            effective_request_types = [
+                request_type
+                for request_type in effective_request_types
+                if request_type != "power_of_attorney"
+            ]
+            suppressed_types.append("power_of_attorney")
+
+        if "dichiarazione_di_libera_esportazione" in effective_request_types:
+            effective_request_types = [
+                request_type
+                for request_type in effective_request_types
+                if request_type != "dichiarazione_di_libera_esportazione"
+            ]
+            suppressed_types.append("dichiarazione_di_libera_esportazione")
+
+        if "declaration_of_intent" in effective_request_types:
+            effective_request_types = [
+                request_type
+                for request_type in effective_request_types
+                if request_type != "declaration_of_intent"
+            ]
+            suppressed_types.append("declaration_of_intent")
+
         if (
             "ups_account" in effective_request_types
             and not is_explicit_ups_account_request(cleaned_text)
@@ -791,6 +828,28 @@ class RegexEngine:
             requester_email=requester_email,
             request_text=cleaned_text,
         )
+        requested_data = filter_libera_esportazione_response_data(
+            requested_data,
+            real_request_types,
+        )
+        regex_requested_data = filter_libera_esportazione_response_data(
+            regex_requested_data,
+            real_request_types,
+        )
+        requested_data = align_invoice_requested_data_with_tracking_context(
+            requested_data,
+            real_request_types,
+            extracted_tracking_number=extracted_tracking_number,
+            shipment_tracking_number=shipment_tracking_number,
+            return_tracking_number=return_tracking_number,
+        )
+        regex_requested_data = align_invoice_requested_data_with_tracking_context(
+            regex_requested_data,
+            real_request_types,
+            extracted_tracking_number=extracted_tracking_number,
+            shipment_tracking_number=shipment_tracking_number,
+            return_tracking_number=return_tracking_number,
+        )
         requested_data_before_bundle = list(requested_data)
         regex_requested_data = expand_first_returns_customs_clearance_bundle(
             regex_requested_data,
@@ -805,6 +864,20 @@ class RegexEngine:
             request_number=request_number,
             requester_email=requester_email,
             trigger_requested_data=requested_data,
+        )
+        requested_data = align_invoice_requested_data_with_tracking_context(
+            requested_data,
+            real_request_types,
+            extracted_tracking_number=extracted_tracking_number,
+            shipment_tracking_number=shipment_tracking_number,
+            return_tracking_number=return_tracking_number,
+        )
+        regex_requested_data = align_invoice_requested_data_with_tracking_context(
+            regex_requested_data,
+            real_request_types,
+            extracted_tracking_number=extracted_tracking_number,
+            shipment_tracking_number=shipment_tracking_number,
+            return_tracking_number=return_tracking_number,
         )
 
         audit_notes: List[str] = []
@@ -847,9 +920,34 @@ class RegexEngine:
             force_human = True
 
         if not requested_data:
-            review_reasons.append(
-                "Regex candidates were removed by safety filters."
-            )
+            if set(real_request_types).issubset(
+                {"dichiarazione_di_libera_esportazione", "declaration_of_intent"}
+            ):
+                return self._as_output(
+                    matched=True,
+                    excluded=True,
+                    request_types=["exclude_from_processing"],
+                    requested_data=[],
+                    cleaned_request_text=cleaned_text,
+                    matched_spans=matched_spans,
+                    confidence=HIGH_CONFIDENCE,
+                    notes=(
+                        "Only dichiarazione_di_libera_esportazione was regex-detected; "
+                        "no automatic reply is required."
+                    ),
+                    regex_request_types=real_request_types,
+                    regex_requested_data=[],
+                    quoted_history_removed=quoted_history_removed,
+                    signature_removed=signature_removed,
+                )
+            if is_atr_certificate_mandate_request(cleaned_text) and "power_of_attorney" in real_request_types:
+                review_reasons.append(
+                    "ATR certificate mandate/form request is not a power_of_attorney automation case."
+                )
+            else:
+                review_reasons.append(
+                    "Regex candidates were removed by safety filters."
+                )
             force_human = True
 
         standard_reply_requested_data = []
