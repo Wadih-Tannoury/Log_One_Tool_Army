@@ -13,9 +13,9 @@ The system should classify requests into requested data elements, not a single i
 | `ups_account_number` | UPS account / abbonamento UPS |
 | `value_confirmation` | Declared value / value confirmation |
 | `returned_items_confirmation` | Which items are returning / partial or full return |
-| `dichiarazione_di_libera_esportazione` | Dichiarazione di libera esportazione / dichiarazione di intento / declaration of intent |
+| `dichiarazione_di_libera_esportazione` | Dichiarazione di libera esportazione / dichiarazione di intento / declaration of intent. This declaration is not answered automatically by itself and should not be converted into a commercial invoice. |
 | `eori_number` | EORI number |
-| `power_of_attorney` | POA / power of attorney / authorization delegate |
+| `power_of_attorney` | POA / power of attorney / authorization delegate. Do not use for ATR-certificate mandate/form requests. |
 | `address_translation` | Address translation request |
 | `exporter_ein` | Exporter EIN |
 | `customer_phone` | Customer phone / telephone number when requested as a standalone item |
@@ -41,7 +41,7 @@ Do not output these as standalone requested_data values:
 - `declaration_of_intent`
 
 Map tax/country/product fields to `commercial_invoice` or `return_proforma_invoice` depending on context. Map customs-description and importer-details fields to `return_proforma_invoice`.
-For request number `1`, map declaration wording to `commercial_invoice`; for later requests, map it to `dichiarazione_di_libera_esportazione`.
+Map declaration wording to `dichiarazione_di_libera_esportazione` for every request number. Do not convert it to `commercial_invoice`; response generation omits it when other request types are present and sends no public reply when it is the only detected request.
 
 ## Design Principle
 
