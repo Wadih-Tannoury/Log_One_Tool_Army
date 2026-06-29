@@ -992,11 +992,30 @@ def zendesk_public_comment_exists(
     return False
 
 
+
+_ZENDESK_FIELD_CACHE={}
+def _zendesk_ticket_field(field_id:int,auth,base_url):
+    if field_id in _ZENDESK_FIELD_CACHE:
+        return _ZENDESK_FIELD_CACHE[field_id]
+    r=requests.get(f"{base_url}/ticket_fields/{field_id}.json",auth=auth,timeout=60)
+    r.raise_for_status()
+    fld=r.json()["ticket_field"]
+    _ZENDESK_FIELD_CACHE[field_id]=fld
+    return fld
+
+def _zendesk_field_value(field_id:int,display_name:str,auth,base_url):
+    fld=_zendesk_ticket_field(field_id,auth,base_url)
+    for opt in fld.get("custom_field_options",[]):
+        if str(opt.get("name","")).strip().lower()==str(display_name).strip().lower():
+            return opt.get("value")
+    return fld.get("custom_field_options",[{}])[0].get("value")
 def submit_ticket_response(
     ticket_id: int,
     body: str,
     *,
     attachment_paths: Iterable[str] = (),
+    reason_of_contact: str = 'Altro',
+    order_note: str = '-',
     auth: HTTPBasicAuth | None = None,
     base_url: str | None = None,
 ) -> bool:
@@ -1033,6 +1052,13 @@ def submit_ticket_response(
     status_after_reply = zendesk_status_after_reply()
     if status_after_reply:
         ticket_update["status"] = status_after_reply
+    channel_value=_zendesk_field_value(360000381300,"online",auth,base_url)
+    reason_value=_zendesk_field_value(23910471,reason_of_contact,auth,base_url)
+    ticket_update["custom_fields"]=[
+        {"id":360000381300,"value":channel_value},
+        {"id":23910471,"value":reason_value},
+        {"id":36951465,"value":order_note or "-"},
+    ]
 
     response = requests.put(
         f"{base_url}/tickets/{int(ticket_id)}.json",
@@ -1150,6 +1176,8 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
                 ticket_id,
                 final_response,
                 attachment_paths=attachment_paths,
+                reason_of_contact=str(row.get('reason_of_contact') or row.get('contact_reason') or row.get('zendesk_reason_of_contact') or 'Altro'),
+                order_note=str(row.get('shipment_order_number') or row.get('order_number') or '-'),
                 auth=auth,
                 base_url=base_url,
             ):
