@@ -867,11 +867,18 @@ def zendesk_status_after_reply() -> str:
     if not status:
         return ""
 
-    valid_statuses = {"new", "open", "pending", "hold", "solved", "closed"}
+    if status == "closed":
+        print(
+            f"{ZENDESK_STATUS_AFTER_REPLY_ENV}=closed would make the ticket "
+            "non-editable/non-reopenable; using 'solved' instead."
+        )
+        status = "solved"
+
+    valid_statuses = {"new", "open", "pending", "hold", "solved"}
     if status not in valid_statuses:
         raise ValueError(
             f"Unsupported {ZENDESK_STATUS_AFTER_REPLY_ENV}={status!r}; "
-            "use one of: new, open, pending, hold, solved, closed"
+            "use one of: new, open, pending, hold, solved"
         )
     return status
 
