@@ -129,7 +129,7 @@ If a UPS Returns Customs Clearance request asks for the UPS account and the retu
 
 If a DHL Returns Customs Clearance request asks for documentation for reintroduzione in franchigia, return `return_proforma_invoice`.
 
-For request number `1`, if the request asks for `dichiarazione d'intento`, `dichiarazione di intento`, declaration-of-intent wording, or `dichiarazione_di_libera_esportazione`, treat it as covered by `commercial_invoice` and return `commercial_invoice`, not `dichiarazione_di_libera_esportazione`.
+For any request number, if the request asks for `dichiarazione d'intento`, `dichiarazione di intento`, declaration-of-intent wording, or `dichiarazione_di_libera_esportazione`, classify only that declaration wording as `dichiarazione_di_libera_esportazione`. Do not convert it to `commercial_invoice`; downstream response generation will omit it when other request types are present and will send no public reply when it is the only detected request.
 
 For request number `1`, ignore `eori_number` checklist wording. For later request numbers, return `eori_number` when it is explicitly requested so the response generator can route it to human intervention.
 
@@ -179,6 +179,8 @@ If the actionable line asks the receiver/destinatario to contact the local UPS o
 
 If the same template explicitly asks for a power of attorney, include `power_of_attorney` and `customer_phone`, but do not add `customer_email` unless it is separately requested.
 
+Do not classify Italian requests for `mandato per l'emissione dei certificati ATR`, `certificati ATR`, or a mandate/form needed to issue ATR certificates as `power_of_attorney`. That ATR-certificate mandate is a separate unsupported document flow; return `human_intervention_required` instead of generating a POA.
+
 ## Declaration Rule
 
 Use `dichiarazione_di_libera_esportazione` for requests that mention:
@@ -189,6 +191,8 @@ Use `dichiarazione_di_libera_esportazione` for requests that mention:
 - declaration of intent
 
 Do not return `declaration_of_intent`.
+
+Do not infer `commercial_invoice` from this declaration wording. If declaration wording appears alongside other requested data, the automatic response should answer only the other requested data. If it is the only detected request, no public automatic reply should be sent.
 
 ## Boilerplate / Quoted History Logic
 
