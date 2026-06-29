@@ -40,6 +40,7 @@ from customs_rules import (
     expand_first_returns_customs_clearance_bundle,
     detect_language_with_dictionary,
     is_no_action_carrier_notification,
+    is_missing_extracted_tracking_number,
     is_request_number_3_or_higher,
     normalize_requested_data,
     requested_data_already_answered_by_first_reply,
@@ -734,7 +735,15 @@ def main():
     rows_for_llm = []
 
     for _, row in unmatched_df.iterrows():
-        if is_tracking_lookup_not_found(row):
+        if is_missing_extracted_tracking_number(row.get("extracted_tracking_number")):
+            llm_results.append(
+                build_human_output_row(
+                    row,
+                    "The tracking number was not found in the ticket. The request was not analyzed.",
+                    engine="missing_tracking_number_guard",
+                )
+            )
+        elif is_tracking_lookup_not_found(row):
             # User requirement: when the extracted tracking number is missing from
             # shipping_platform_shipments, bypass regex/hard guards and let the
             # LLM summarize what it understood before routing to human review.
