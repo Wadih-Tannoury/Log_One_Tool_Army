@@ -53,6 +53,7 @@ from customs_rules import (
     is_informative_status_update_only,
     is_missing_invoice_request,
     is_no_action_carrier_notification,
+    is_missing_extracted_tracking_number,
     is_acknowledgement_only,
     is_platform_handoff_request,
     is_request_number_3_or_higher,
@@ -361,6 +362,28 @@ class RegexEngine:
         tracking_not_found = str(
             tracking_not_found_in_shipping_platform_shipments or ""
         ).strip().lower() in {"true", "1", "yes", "y"}
+
+        if is_missing_extracted_tracking_number(extracted_tracking_number):
+            return self._as_output(
+                matched=True,
+                excluded=False,
+                request_types=[HUMAN_INTERVENTION_REQUIRED],
+                requested_data=[HUMAN_INTERVENTION_REQUIRED],
+                cleaned_request_text=cleaned_text,
+                matched_spans=[],
+                confidence=0.0,
+                notes=(
+                    "The tracking number was not found in the ticket. "
+                    "Regex and LLM analysis were skipped; human review is required."
+                ),
+                needs_llm_confirmation=False,
+                force_human_intervention=True,
+                human_intervention_required=True,
+                regex_request_types=[],
+                regex_requested_data=[],
+                quoted_history_removed=quoted_history_removed,
+                signature_removed=signature_removed,
+            )
 
         if is_no_action_carrier_notification(cleaned_text):
             return self._as_output(
