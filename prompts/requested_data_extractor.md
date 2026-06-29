@@ -72,6 +72,10 @@ Use `unknown_request` with low confidence when you cannot identify the requested
 
 Do not guess between similar document types. For example, if the message could mean either `commercial_invoice` or `return_proforma_invoice`, return the best candidate only when the wording is explicit or when the ticket context clearly indicates a return customs clearance flow; otherwise return `unknown_request` with low confidence.
 
+## Missing Tracking Number Guard
+
+Rows with no `extracted_tracking_number` must not be sent to the LLM. The pipeline should create a human-intervention draft saying that the tracking number was not found and leave `final_response` empty.
+
 ## Tracking Not Found Handoff
 
 Some inputs include `tracking_not_found_in_shipping_platform_shipments: true`. This means the workflow extracted a tracking number from the Zendesk ticket, but that tracking number was not found in `tlg-business-intelligence-prd.bi.shipping_platform_shipments`.
