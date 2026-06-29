@@ -41,7 +41,7 @@ The LLM must classify what it understood in `requested_data` and produce `llm_hu
 
 When `request_number` is `1`, and upstream regex/LLM classification contains `invoice_correction`, `corrected_invoice`, or `value_confirmation`, treat those values as part of the `return_proforma_invoice` package for response data. Do not list corrected invoice or value confirmation as separate customer-facing lines in the draft. For later request numbers, require human intervention for those keys.
 
-When `request_number` is `1`, treat `dichiarazione_di_libera_esportazione` / declaration-of-intent wording as covered by `commercial_invoice`. For later request numbers, require human intervention.
+For every request number, do not treat `dichiarazione_di_libera_esportazione` / declaration-of-intent wording as `commercial_invoice`. Omit this declaration when other request types are present, and do not produce a public reply when it is the only detected request.
 
 When `request_number` is `1`, ignore `eori_number`. For later request numbers, require human intervention.
 
@@ -287,6 +287,11 @@ Route these cases to human intervention rather than sending a partial automatic 
 - UPS UK import-clearance instruction templates asking for customs procedure, commodity code/plain description, EORI, UPS credit account, DAN/deferment approval, or warning about extra charges.
 - Requests to accept/authorize costs, expenses, penalties, sanctions, abandonment recovery, storage/deferment fees, or other charge responsibility.
 - Invoice/value/MRN/import-export discrepancies, requests for corrected return invoices, or requests for an invoice/value that must match a specific export document amount.
+- ATR-certificate mandate/form requests such as `mandato per l'emissione dei certificati ATR`; these are not `power_of_attorney`/POA automation cases.
+
+When `regex_request_types` includes `dichiarazione_di_libera_esportazione` together with other request types, omit the declaration and answer only the other request types. When it is the only regex-detected type, do not produce a public reply.
+
+When a regex-detected invoice type conflicts with the role of `extracted_tracking_number`, use the tracking role: a return tracking number requires `return_proforma_invoice`, while a shipment/export tracking number requires `commercial_invoice`.
 
 When reading `requested_data` or `request_types`, flatten BigQuery repeated-field JSON export values such as `{"v":[{"v":"return_proforma_invoice"}]}` before deciding what to answer. Never render that raw JSON object in a draft.
 
