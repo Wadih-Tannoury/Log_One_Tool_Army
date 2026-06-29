@@ -58,6 +58,7 @@ from customs_rules import (
     has_libera_esportazione_regex_type,
     is_atr_certificate_mandate_request,
     is_customer_refused_return_request,
+    is_missing_extracted_tracking_number,
     is_no_action_carrier_notification,
     is_noreply_requester_email,
     is_returns_customs_clearance,
@@ -1160,6 +1161,17 @@ def format_reviewer_document_references(row, requested_data=None):
 def build_human_intervention_note(row, reason):
     ticket_id = row.get("zendesk_ticket_id", "")
     request_number = row.get("request_number", "")
+
+    if is_missing_extracted_tracking_number(row.get("extracted_tracking_number")):
+        return (
+            "HUMAN INTERVENTION REQUIRED\n\n"
+            "Do not send an automatic reply for this request.\n"
+            "Reason: the tracking number was not found in the ticket, so "
+            "the request was not analyzed by regex or LLM.\n"
+            f"Ticket: {ticket_id}\n"
+            f"Request number: {request_number}"
+        )
+
     draft = llm_human_intervention_draft(row) if is_tracking_lookup_not_found(row) else ""
     reviewer_document_references = format_reviewer_document_references(row)
     reviewer_document_section = (
@@ -1546,7 +1558,8 @@ def should_force_human_intervention(row, requested_data):
 
     missing_full_order_values = missing_required_full_order_values(row, requested_data)
     if missing_full_order_values:
-        api_error = str(row.get(FULL_ORDER_API_ERROR_COLUMN) or "").strip()
+        api_error_value = row.get(FULL_ORDER_API_ERROR_COLUMN)
+        api_error = "" if is_blank(api_error_value) else str(api_error_value).strip()
         reason = (
             "GET_FULL_ORDER API data is missing for: "
             + ", ".join(missing_full_order_values)
@@ -1554,7 +1567,8 @@ def should_force_human_intervention(row, requested_data):
         )
         if api_error:
             reason += f" API detail: {api_error}"
-        document_error = str(row.get(DOCUMENT_GENERATION_ERROR_COLUMN) or "").strip()
+        document_error_value = row.get(DOCUMENT_GENERATION_ERROR_COLUMN)
+        document_error = "" if is_blank(document_error_value) else str(document_error_value).strip()
         if document_error:
             reason += f" Document detail: {document_error}"
         return True, reason
@@ -1614,6 +1628,12 @@ def build_response(row):
     request_number = row.get("request_number", 1)
     request_text = row_request_text(row)
     requested_data = requested_data_for_response(row)
+
+    if is_missing_extracted_tracking_number(row.get("extracted_tracking_number")):
+        return build_human_intervention_note(
+            row,
+            "The tracking number was not found in the ticket. The request was not analyzed.",
+        )
 
     if is_noreply_requester_email(requester_email):
         return build_noreply_human_intervention_note(row, requested_data)
