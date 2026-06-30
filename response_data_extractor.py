@@ -960,7 +960,42 @@ def _invoice_documents_from_shipment(shipment: Mapping[str, Any] | None) -> list
     return [document for document in invoice_documents if isinstance(document, Mapping)]
 
 
-def _items_from_payload(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+def _items_from_payload(
+    payload: Mapping[str, Any],
+    shipment: Mapping[str, Any] | None = None,
+) -> list[Mapping[str, Any]]:
+    # GET_FULL_ORDER orders can contain several shipments (e.g. the original
+    # export shipment plus one or more return shipments). Returned-item data
+    # belongs to the specific shipment being responded to, so look there
+    # first under the field-name variants the API has used, including a
+    # recursive search scoped to just that shipment. Only fall back to
+    # order/payload-level "items" (which may belong to a different shipment
+    # entirely) when nothing shipment-specific is found.
+    if shipment is not None:
+        shipment_items = _get_any(
+            shipment,
+            (
+                "items",
+                "returnedItems",
+                "returned_items",
+                "returnItems",
+                "return_items",
+                "lineItems",
+                "line_items",
+                "orderItems",
+                "order_items",
+            ),
+        )
+        if not isinstance(shipment_items, list):
+            shipment_items = _find_first_key(shipment, "items")
+
+        if isinstance(shipment_items, list):
+            cleaned_shipment_items = [
+                item for item in shipment_items if isinstance(item, Mapping)
+            ]
+            if cleaned_shipment_items:
+                return cleaned_shipment_items
+
     items = payload.get("items")
     if items is None and isinstance(payload.get("order"), Mapping):
         items = payload["order"].get("items")
@@ -979,10 +1014,13 @@ def _clean_item_field(value: object) -> str:
     return str(value).strip()
 
 
-def extract_returned_items(payload: Mapping[str, Any]) -> list[dict[str, str]]:
+def extract_returned_items(
+    payload: Mapping[str, Any],
+    shipment: Mapping[str, Any] | None = None,
+) -> list[dict[str, str]]:
     returned_items: list[dict[str, str]] = []
 
-    for item in _items_from_payload(payload):
+    for item in _items_from_payload(payload, shipment):
         returned_item = {
             "sku": _clean_item_field(_get_any(item, ("sku", "SKU"))),
             "productName": _clean_item_field(
@@ -1155,7 +1193,7 @@ def extract_shipment_order_data(
             "INV",
         ),
         FULL_ORDER_RESPONSE_COLUMNS["returned_items_confirmation"]: format_returned_items(
-            extract_returned_items(payload)
+            extract_returned_items(payload, shipment)
         ),
         FULL_ORDER_RESPONSE_COLUMNS["customer_email"]: (
             None if is_blank(customer.get("email")) else str(customer.get("email")).strip()
