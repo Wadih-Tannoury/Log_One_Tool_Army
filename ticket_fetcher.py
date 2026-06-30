@@ -935,36 +935,52 @@ def _normalize_comment_body(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").replace("\r\n", "\n")).strip()
 
 
-def strip_links_from_public_response(value: Any) -> str:
-    """Defense-in-depth guard: public Zendesk replies must not contain links."""
+_IMAGE_LINK_LINE_RE = re.compile(r"\bimage\s*:", re.IGNORECASE)
 
-    sanitized = str(value or "")
-    sanitized = re.sub(
+
+def _strip_links_from_line(line: str) -> str:
+    line = re.sub(
         r":\s*\[[^\]\n]+\]\([^\)\n]+\)",
         "",
-        sanitized,
+        line,
         flags=re.IGNORECASE,
     )
-    sanitized = re.sub(
+    line = re.sub(
         r":\s*(?:https?://\S+|generated_documents/\S+|/[^\s:]+/generated_documents/\S+)",
         "",
-        sanitized,
+        line,
         flags=re.IGNORECASE,
     )
-    sanitized = re.sub(
+    line = re.sub(
         r"\[[^\]\n]+\]\([^\)\n]+\)",
         "",
-        sanitized,
+        line,
         flags=re.IGNORECASE,
     )
-    sanitized = re.sub(r"https?://\S+", "", sanitized, flags=re.IGNORECASE)
-    sanitized = re.sub(
+    line = re.sub(r"https?://\S+", "", line, flags=re.IGNORECASE)
+    line = re.sub(
         r"(?:generated_documents/\S+|/[^\s:]+/generated_documents/\S+)",
         "",
-        sanitized,
+        line,
         flags=re.IGNORECASE,
     )
-    lines = [re.sub(r"[ \t]+$", "", line) for line in sanitized.split("\n")]
+    return line
+
+
+def strip_links_from_public_response(value: Any) -> str:
+    """Defense-in-depth guard: public Zendesk replies must not contain links.
+
+    Returned-item image links (lines containing "Image:") are kept intact so
+    the customer-facing reply still shows what was confirmed as returned.
+    """
+
+    sanitized = str(value or "")
+    lines = sanitized.split("\n")
+    processed_lines = [
+        line if _IMAGE_LINK_LINE_RE.search(line) else _strip_links_from_line(line)
+        for line in lines
+    ]
+    lines = [re.sub(r"[ \t]+$", "", line) for line in processed_lines]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
