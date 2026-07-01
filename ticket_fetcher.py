@@ -2238,19 +2238,20 @@ def enrich_with_shipment_numbers(df: pd.DataFrame, client, bigquery) -> pd.DataF
     normalized_tracking = df["extracted_tracking_number"].map(
         lambda x: str(x).strip() if pd.notna(x) else ""
     )
+
     def enrich_tracking_field(value, field):
-    results = []
+        results = []
 
-    for tracking in re.split(r"[;,]", str(value or "")):
-        tracking = tracking.strip()
-        if not tracking:
-            continue
+        for tracking in re.split(r"[;,]", str(value or "")):
+            tracking = tracking.strip()
+            if not tracking:
+                continue
 
-        mapped = shipment_map.get(tracking, {}).get(field)
-        if mapped and mapped not in results:
-            results.append(mapped)
+            mapped = shipment_map.get(tracking, {}).get(field)
+            if mapped and mapped not in results:
+                results.append(mapped)
 
-    return ";".join(results) if results else None
+        return ";".join(results) if results else None
 
 
     df["shipment_order_number"] = df["extracted_tracking_number"].apply(
