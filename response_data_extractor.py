@@ -611,32 +611,75 @@ def enrich_dataframe_with_full_order_data(
             df.at[index, FULL_ORDER_RESPONSE_COLUMNS["api_error"]] = message
         return df
 
-    cache: dict[str, dict[str, Any]] = {}
+        cache: dict[str, dict[str, Any]] = {}
 
-    for index in lookup_indices:
-        shipment_order_number = df.at[index, "shipment_order_number"] if "shipment_order_number" in df.columns else None
-        if is_blank(shipment_order_number):
-            df.at[index, FULL_ORDER_RESPONSE_COLUMNS["api_error"]] = "Missing shipment_order_number for GET_FULL_ORDER lookup"
-            continue
+        for index in lookup_indices:
+  
+            shipment_orders = [
+                x.strip()
+                for x in str(
+                    df.at[index, "shipment_order_number"]
+                    if "shipment_order_number" in df.columns
+                    else ""
+                ).split(";")
+                if x.strip()
+            ]
 
-        cache_key = str(shipment_order_number).strip().upper()
-        if cache_key not in cache:
-            try:
-                cache[cache_key] = fetch_shipment_order_data(
-                    shipment_order_number,
-                    client=api_client,
+            if not shipment_orders:
+                df.at[index, FULL_ORDER_RESPONSE_COLUMNS["api_error"]] = (
+                    "Missing shipment_order_number for GET_FULL_ORDER lookup"
                 )
-            except Exception as exc:
-                print(
-                    "WARNING: GET_FULL_ORDER lookup failed for "
-                    f"shipment_order_number={shipment_order_number}: {exc}"
-                )
-                cache[cache_key] = {FULL_ORDER_RESPONSE_COLUMNS["api_error"]: str(exc)}
+                continue
 
-        for column, value in cache[cache_key].items():
-            if column not in df.columns:
-                df[column] = None
-            df.at[index, column] = value
+            combined = {}
+
+            for shipment_order_number in shipment_orders:
+  
+                cache_key = shipment_order_number.upper()
+  
+                if cache_key not in cache:
+                    try:
+                        cache[cache_key] = fetch_shipment_order_data(
+                            shipment_order_number,
+                            client=api_client,
+                        )
+                    except Exception as exc:
+                        print(
+                            "WARNING: GET_FULL_ORDER lookup failed for "
+                            f"shipment_order_number={shipment_order_number}: {exc}"
+                        )
+                        cache[cache_key] = {
+                            FULL_ORDER_RESPONSE_COLUMNS["api_error"]: str(exc)
+                        }
+
+                result = cache[cache_key]
+
+                for column, value in result.items():
+
+                    if column not in df.columns:
+                        df[column] = None
+
+                    if is_blank(value):
+                        continue
+
+                    existing = combined.get(column)
+
+                    if is_blank(existing):
+                        combined[column] = value
+                    else:
+                        values = [
+                            x.strip()
+                            for x in str(existing).split(";")
+                            if x.strip()
+                        ]
+
+                        if str(value) not in values:
+                            values.append(str(value))
+
+                        combined[column] = ";".join(values)
+
+            for column, value in combined.items():
+                df.at[index, column] = value
 
     print(f"GET_FULL_ORDER enrichment attempted for {len(lookup_indices)} row(s).")
     return df
@@ -681,11 +724,24 @@ def generate_documents_for_dataframe(df, *, force: bool = False):
 
             try:
                 row_data = df.loc[index].to_dict()
-                df.at[index, column] = download_invoice_pdf(
-                    source_link,
-                    invoice_key,
-                    row=row_data,
-                )
+                links = [
+                    x.strip()
+                    for x in str(source_link).split(";")
+                    if x.strip()
+                ]
+
+                generated_files = []
+
+                for link in links:
+                    generated_files.append(
+                        download_invoice_pdf(
+                            link,
+                            invoice_key,
+                            row=row_data,
+                        )
+                    )
+
+                df.at[index, column] = ";".join(generated_files)
                 generated += 1
             except Exception as exc:
                 message = f"{invoice_key}: {exc}"
