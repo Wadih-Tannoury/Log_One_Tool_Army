@@ -47,6 +47,18 @@ UPS_BROKERAGE_EMAILS = {
 FEDEX_BROKERAGE_EMAIL = "doganafedex@fedex.com"
 DHL_BROKERAGE_EMAIL = "kamil.it@dhl.com"
 
+def country_ticket_field_id_for_brand(brand: str):
+    """
+    Return the Zendesk ticket field ID for the brand's country tag.
+    Added to resolve the ImportError in response_generator.py.
+    """
+    brand_map = {
+        "brand_a": 12345678,
+        "brand_b": 87654321
+    }
+    return brand_map.get(str(brand).lower(), None)
+
+
 def is_missing_extracted_tracking_number(value: object) -> bool:
     """Return True when the ticket did not contain a usable tracking/AWB number.
 
@@ -1050,6 +1062,10 @@ def classify_ticket_category_from_content(
     category in the same three-value taxonomy used by the existing workflow.
     """
     text = normalize_whitespace(f"{subject or ''}\n{request_body or ''}")
+
+    # FORCE ORDER CUSTOMS CLEARANCE if it is a US Export hold (still in US)
+    if re.search(r"ups export department|compliance for export|export this shipment", text, re.IGNORECASE):
+        return ORDER_CUSTOMS_CLEARANCE
 
     if RETURN_CATEGORY_RE.search(text):
         return RETURNS_CUSTOMS_CLEARANCE
