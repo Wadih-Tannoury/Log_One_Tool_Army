@@ -244,134 +244,6 @@ DATA_LABELS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Zendesk "reason of contact" taxonomy
-#
-# This mirrors the live Zendesk ticket field options (custom_field 23910471),
-# exported as filtered_ticket_fields.csv: "EA::Corrieri::<CARRIER>::<...>".
-# response_generator.py only needs to compute *which* taxonomy value applies
-# to a given draft response; ticket_fetcher.submit_ticket_response resolves
-# that display name to the field's option id at submission time.
-# ---------------------------------------------------------------------------
-
-DEFAULT_REASON_OF_CONTACT = "Altro"
-
-CARRIER_REASON_PREFIX = {
-    "ups": "EA::Corrieri::UPS",
-    "dhl": "EA::Corrieri::DHL",
-    "fedex": "EA::Corrieri::FEDEX",
-}
-
-REASON_FATTURE_REQUESTED_DATA = {
-    "commercial_invoice",
-    "return_proforma_invoice",
-    "corrected_invoice",
-}
-REASON_GIACENZE_CONTACT_REQUESTED_DATA = {
-    "customer_phone",
-    "customer_email",
-    "customer_name",
-}
-REASON_GIACENZE_DELIVERY_ADDRESS_REQUESTED_DATA = {
-    "shipping_address",
-    "address_correction",
-    "address_translation",
-}
-REASON_GIACENZE_FREE_EXPORT_DECLARATION_REQUESTED_DATA = {
-    "dichiarazione_di_libera_esportazione",
-}
-REASON_GIACENZE_RETURNS_REQUESTED_DATA = {
-    "returned_items_confirmation",
-}
-REASON_SDOGANAMENTO_REQUESTED_DATA = {
-    "ups_account_number",
-    "export_tracking_number",
-    "power_of_attorney",
-    "authorization_letter",
-    "eori_number",
-}
-
-
-def carrier_reason_prefix(row):
-    requester_email = row.get("requester_email")
-    if is_ups_requester_email(requester_email):
-        return CARRIER_REASON_PREFIX["ups"]
-    if is_dhl_requester_email(requester_email):
-        return CARRIER_REASON_PREFIX["dhl"]
-    if is_fedex_requester_email(requester_email):
-        return CARRIER_REASON_PREFIX["fedex"]
-    return ""
-
-
-def reason_of_contact_for_response(row, requested_data):
-    """Return the Zendesk "reason of contact" taxonomy value for this row.
-
-    The mapping mirrors filtered_ticket_fields.csv: each carrier (UPS/DHL/
-    FedEx) has Fatture, Giacenze::* and Sdoganamento branches. When the
-    carrier cannot be determined from the requester email, or none of the
-    requested_data keys match a known branch, fall back to "Altro" (the
-    pre-existing default reason of contact).
-    """
-
-    requested_set = set(requested_data or [])
-    prefix = carrier_reason_prefix(row)
-    if not prefix:
-        return DEFAULT_REASON_OF_CONTACT
-
-    if requested_set & REASON_GIACENZE_FREE_EXPORT_DECLARATION_REQUESTED_DATA:
-        return f"{prefix}::Giacenze::Free Export Declaration"
-
-    if requested_set & REASON_SDOGANAMENTO_REQUESTED_DATA:
-        carrier_match = return_export_carriers_are_same(row)
-        if carrier_match is False:
-            return f"{prefix}::Sdoganamento - Definitiva"
-        return f"{prefix}::Sdoganamento"
-
-    if requested_set & REASON_GIACENZE_RETURNS_REQUESTED_DATA:
-        return f"{prefix}::Giacenze::Returns"
-
-    if requested_set & REASON_GIACENZE_CONTACT_REQUESTED_DATA:
-        return f"{prefix}::Giacenze::Contact Details"
-
-    if requested_set & REASON_GIACENZE_DELIVERY_ADDRESS_REQUESTED_DATA:
-        return f"{prefix}::Giacenze::Delivery Address"
-
-    if requested_set & REASON_FATTURE_REQUESTED_DATA:
-        return f"{prefix}::Fatture"
-
-    return DEFAULT_REASON_OF_CONTACT
-
-
-def zendesk_country_tag_for_row(row) -> str | None:
-    """Return the Zendesk country-field tag for this row, e.g. 'country_dj_us'.
-
-    The tag is constructed from:
-      - the brand prefix extracted from the shipment_order_number
-        (e.g. 'DG-USC11593083' -> brand 'DG')
-      - the ISO 3166-1 alpha-2 country code from the GET_FULL_ORDER
-        shippingAddress.country field (stored in full_order_country_code)
-
-    Returns None when either piece is missing, so callers can safely skip
-    setting the Zendesk field.
-    """
-    from customs_rules import country_ticket_field_id_for_brand
-    from response_data_extractor import brand_from_shipment_order_number, FULL_ORDER_RESPONSE_COLUMNS
-
-    country_code = row.get(FULL_ORDER_RESPONSE_COLUMNS["country_code"])
-    if is_blank(country_code):
-        return None
-
-    brand = brand_from_shipment_order_number(row.get("shipment_order_number"))
-    if is_blank(brand):
-        return None
-
-    # Only produce a tag when this brand actually has a country field in Zendesk
-    if country_ticket_field_id_for_brand(brand) is None:
-        return None
-
-    return f"country_{brand.lower()}_{str(country_code).strip().lower()}"
-
-
 def is_blank(value):
     if value is None:
         return True
@@ -1090,15 +962,6 @@ def row_needs_full_order_lookup(row, requested_data=None):
     requested_set = set(requested_data)
 
     if requested_set & FULL_ORDER_LOOKUP_KEYS:
-        return True
-
-    # Always attempt the lookup for any row with a shipment_order_number that
-    # is still eligible for an automated reply, even when requested_data does
-    # not otherwise need GET_FULL_ORDER data. This is required so the
-    # per-brand "Country <BRAND>" Zendesk ticket field can be populated on
-    # every automated response (Zendesk requires it when present on the
-    # ticket, even when not flagged mandatory).
-    if not is_blank(row.get("shipment_order_number")) and requested_data:
         return True
 
     # The standard UPS-account response promises an LOA, and the LOA export date
@@ -1909,66 +1772,49 @@ def strip_internal_draft_metadata_from_public_response(text):
     return normalize_text(sanitized)
 
 
-# Lines carrying a returned-item image link (built by
-# response_data_extractor.format_returned_items) must keep their URL in the
-# public response. Every other link in the draft is a document reference
-# (invoice/RPI/LOA/POA) that is uploaded as a Zendesk attachment instead, so
-# those links must still be stripped.
-_IMAGE_LINK_LINE_RE = re.compile(r"\bimage\s*:", re.IGNORECASE)
+def _strip_public_links_from_final_response(text):
+    """Remove markdown/raw links from public final_response text.
 
+    Internal draft_response may contain document references. Public Zendesk
+    comments must not expose invoice/RPI/LOA/POA/document URLs; the documents
+    are provided through Zendesk attachment uploads instead.
+    """
 
-def _strip_public_links_from_line(line):
+    sanitized = str(text or "")
+
     # Remove links that directly follow a label separator, including the
     # separator, so `RPI: [file](url)` becomes `RPI`.
-    line = re.sub(
+    sanitized = re.sub(
         r":\s*\[[^\]\n]+\]\([^\)\n]+\)",
         "",
-        line,
+        sanitized,
         flags=re.IGNORECASE,
     )
-    line = re.sub(
+    sanitized = re.sub(
         r":\s*(?:https?://\S+|generated_documents/\S+|/[^\s:]+/generated_documents/\S+)",
         "",
-        line,
+        sanitized,
         flags=re.IGNORECASE,
     )
 
     # Defense-in-depth: remove any remaining markdown links or raw URLs from a
     # public response body. This is intentionally broader than PDFs only because
     # final_response should not contain public document links of any kind.
-    line = re.sub(
+    sanitized = re.sub(
         r"\[[^\]\n]+\]\([^\)\n]+\)",
         "",
-        line,
+        sanitized,
         flags=re.IGNORECASE,
     )
-    line = re.sub(r"https?://\S+", "", line, flags=re.IGNORECASE)
-    line = re.sub(
+    sanitized = re.sub(r"https?://\S+", "", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(
         r"(?:generated_documents/\S+|/[^\s:]+/generated_documents/\S+)",
         "",
-        line,
+        sanitized,
         flags=re.IGNORECASE,
     )
-    return line
 
-
-def _strip_public_links_from_final_response(text):
-    """Remove markdown/raw links from public final_response text.
-
-    Internal draft_response may contain document references. Public Zendesk
-    comments must not expose invoice/RPI/LOA/POA/document URLs; the documents
-    are provided through Zendesk attachment uploads instead. Returned-item
-    image links are the one exception: they must stay in the public response
-    so the customer can see what was confirmed as returned.
-    """
-
-    sanitized = str(text or "")
-    lines = sanitized.split("\n")
-    processed_lines = [
-        line if _IMAGE_LINK_LINE_RE.search(line) else _strip_public_links_from_line(line)
-        for line in lines
-    ]
-    return "\n".join(processed_lines)
+    return sanitized
 
 
 def _remove_document_values_from_response(response_text, document_values):
@@ -2063,14 +1909,6 @@ def main():
         ),
         axis=1,
     )
-    df["reason_of_contact"] = df.apply(
-        lambda row: reason_of_contact_for_response(
-            row,
-            requested_data_for_response(row),
-        ),
-        axis=1,
-    )
-    df["zendesk_country_tag"] = df.apply(zendesk_country_tag_for_row, axis=1)
 
     zendesk_submission_enabled = zendesk_response_submission_enabled()
     print(f"Zendesk final-response submission enabled: {zendesk_submission_enabled}")
