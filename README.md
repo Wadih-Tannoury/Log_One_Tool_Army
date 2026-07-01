@@ -183,6 +183,18 @@ Repository persistence is controlled separately by `persist_generated_documents`
 
 The submission decision is independent from BigQuery history de-duplication. This means a dry run with `submit_zendesk_responses=false` can be followed by another run with `submit_zendesk_responses=true`; the agent will still evaluate the current non-human `final_response` values for Zendesk submission. The duplicate-comment guard skips a ticket when the exact same public response body is already present.
 
+### Per-brand "Country" ticket field
+
+Some brands have a Zendesk custom ticket field named `Country <BRAND>` (e.g. `Country DJ`) that Zendesk requires to be set before a ticket can be moved to `solved`. When the GET_FULL_ORDER `shippingAddress.country` value and the brand prefix from `shipment_order_number` (e.g. `DJ` from `DJ-USC11593083`) are both available, `response_generator.py` builds a `country_{brand}_{iso2}` tag and `submit_ticket_response()` in `ticket_fetcher.py` sends it as that field's value.
+
+The brand → field-id mapping lives in `customs_rules.country_ticket_field_id_for_brand()`. It currently only knows about `DJ` (field id `360012198399`). Add more brands there as their field IDs are confirmed in Zendesk, or set them at runtime without a code change via:
+
+```bash
+ZENDESK_COUNTRY_FIELD_IDS_JSON='{"DJ": 360012198399, "DG": 123456789}'
+```
+
+If the brand's country value can't be resolved (unmapped brand, missing shipping country, etc.) but Zendesk still requires the field to solve the ticket, `submit_ticket_response()` detects the resulting `"... is required when solving a ticket"` 422 error and automatically retries the same update without the status change. The customer-facing reply is still posted, but the ticket is left in its current status (not `solved`) so it can be solved manually once the field is filled in.
+
 Additional response guardrails:
 
 - If the tracking number is not found in the ticket, the request is not analyzed by regex or LLM. The row receives an internal human-intervention `draft_response` saying that the tracking number was not found, and no public `final_response` is generated.
