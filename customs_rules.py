@@ -47,16 +47,57 @@ UPS_BROKERAGE_EMAILS = {
 FEDEX_BROKERAGE_EMAIL = "doganafedex@fedex.com"
 DHL_BROKERAGE_EMAIL = "kamil.it@dhl.com"
 
+import json
+import os
+
+# Known Zendesk "Country <BRAND>" custom ticket field IDs, keyed by the
+# 2-letter brand prefix used in shipment_order_number (e.g. "DJ-USC...").
+# NOTE: this table previously only contained placeholder "brand_a"/"brand_b"
+# entries, which meant no real brand ever resolved to a field ID -- the
+# country tag was silently dropped for every ticket, and Zendesk then
+# rejected the "solve" transition with "Country <BRAND>: is required when
+# solving a ticket" (see ticket 4841554, field_id 360012198399 = Country DJ).
+#
+# Add additional brand -> field_id mappings here as they're confirmed in
+# Zendesk (Admin Center > Ticket Fields), or supply them at runtime via the
+# ZENDESK_COUNTRY_FIELD_IDS_JSON environment variable, e.g.:
+#   ZENDESK_COUNTRY_FIELD_IDS_JSON='{"DJ": 360012198399, "DG": 123456789}'
+_COUNTRY_TICKET_FIELD_IDS = {
+    "DJ": 360012198399,  # Country DJ
+}
+
+
+def _country_field_id_overrides() -> Dict[str, int]:
+    raw = os.environ.get("ZENDESK_COUNTRY_FIELD_IDS_JSON", "")
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    result: Dict[str, int] = {}
+    for brand, field_id in parsed.items():
+        try:
+            result[str(brand).strip().upper()] = int(field_id)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
 def country_ticket_field_id_for_brand(brand: str):
     """
-    Return the Zendesk ticket field ID for the brand's country tag.
-    Added to resolve the ImportError in response_generator.py.
+    Return the Zendesk ticket field ID for the brand's "Country <BRAND>"
+    custom field, or None when the brand has no such field (or is unknown).
     """
-    brand_map = {
-        "brand_a": 12345678,
-        "brand_b": 87654321
-    }
-    return brand_map.get(str(brand).lower(), None)
+    brand_key = str(brand or "").strip().upper()
+    if not brand_key:
+        return None
+    overrides = _country_field_id_overrides()
+    if brand_key in overrides:
+        return overrides[brand_key]
+    return _COUNTRY_TICKET_FIELD_IDS.get(brand_key)
 
 
 def is_missing_extracted_tracking_number(value: object) -> bool:
