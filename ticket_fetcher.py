@@ -1025,6 +1025,16 @@ def _zendesk_field_value(field_id:int,display_name:str,auth,base_url):
         if str(opt.get("name","")).strip().lower()==str(display_name).strip().lower():
             return opt.get("value")
     return fld.get("custom_field_options",[{}])[0].get("value")
+def _brand_from_country_tag(tag: str) -> str:
+    """Extract the brand code from a country tag like 'country_dj_us' -> 'DJ'."""
+    # Tags are always: country_{brand}_{iso2}
+    parts = str(tag or "").split("_")
+    # parts[0] = "country", parts[1] = brand, parts[2] = iso2
+    if len(parts) >= 3:
+        return parts[1].upper()
+    return ""
+
+
 def submit_ticket_response(
     ticket_id: int,
     body: str,
@@ -1032,6 +1042,7 @@ def submit_ticket_response(
     attachment_paths: Iterable[str] = (),
     reason_of_contact: str = 'Altro',
     order_note: str = '-',
+    country_tag: str | None = None,
     auth: HTTPBasicAuth | None = None,
     base_url: str | None = None,
 ) -> bool:
@@ -1070,11 +1081,24 @@ def submit_ticket_response(
         ticket_update["status"] = status_after_reply
     channel_value=_zendesk_field_value(360000381300,"online",auth,base_url)
     reason_value=_zendesk_field_value(23910471,reason_of_contact,auth,base_url)
-    ticket_update["custom_fields"]=[
-        {"id":360000381300,"value":channel_value},
-        {"id":23910471,"value":reason_value},
-        {"id":36951465,"value":order_note or "-"},
+    custom_fields: list[dict[str, Any]] = [
+        {"id": 360000381300, "value": channel_value},
+        {"id": 23910471, "value": reason_value},
+        {"id": 36951465, "value": order_note or "-"},
     ]
+
+    # Populate the per-brand "Country <BRAND>" field when the country tag was
+    # resolved from the GET_FULL_ORDER shippingAddress (e.g. "country_dj_us").
+    # The tag encodes both the brand and the ISO country code so we can derive
+    # the Zendesk field id from the brand prefix without an extra API call.
+    if country_tag:
+        brand_code = _brand_from_country_tag(country_tag)
+        from customs_rules import country_ticket_field_id_for_brand
+        field_id = country_ticket_field_id_for_brand(brand_code)
+        if field_id:
+            custom_fields.append({"id": field_id, "value": country_tag})
+
+    ticket_update["custom_fields"] = custom_fields
 
     response = requests.put(
         f"{base_url}/tickets/{int(ticket_id)}.json",
@@ -1194,6 +1218,7 @@ def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> 
                 attachment_paths=attachment_paths,
                 reason_of_contact=str(row.get('reason_of_contact') or row.get('contact_reason') or row.get('zendesk_reason_of_contact') or 'Altro'),
                 order_note=str(row.get('shipment_order_number') or row.get('order_number') or '-'),
+                country_tag=row.get('zendesk_country_tag') or None,
                 auth=auth,
                 base_url=base_url,
             ):
