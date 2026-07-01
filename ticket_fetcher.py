@@ -2248,8 +2248,11 @@ def enrich_with_shipment_numbers(df: pd.DataFrame, client, bigquery) -> pd.DataF
                 continue
 
             mapped = shipment_map.get(tracking, {}).get(field)
-            if mapped and mapped not in results:
-                results.append(mapped)
+
+            if pd.notna(mapped):
+                mapped = str(mapped)
+                if mapped not in results:
+                    results.append(mapped)
 
         return ";".join(results) if results else None
 
