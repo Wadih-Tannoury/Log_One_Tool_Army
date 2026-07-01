@@ -1123,6 +1123,43 @@ def submit_ticket_response(
                 f"via the API. Skipping this ticket. Zendesk said: {error_detail}"
             ) from exc
 
+        # Some brands require a "Country <BRAND>" custom field to be set
+        # before a ticket can be moved to "solved". If we don't have (or
+        # couldn't resolve) that value, retry once WITHOUT the status change
+        # so the customer-facing comment is still delivered instead of the
+        # whole batch aborting. The ticket is left in its current status for
+        # manual solving.
+        if (
+            response.status_code == 422
+            and "status" in ticket_update
+            and _is_zendesk_required_field_for_solve_error(error_detail)
+        ):
+            print(
+                f"Zendesk ticket {ticket_id}: cannot set status to "
+                f"'{ticket_update['status']}' because a required field is "
+                f"missing ({error_detail}). Retrying without the status "
+                "change so the reply is still posted; ticket needs manual "
+                "solving."
+            )
+            retry_update = {k: v for k, v in ticket_update.items() if k != "status"}
+            retry_response = requests.put(
+                f"{base_url}/tickets/{int(ticket_id)}.json",
+                auth=auth,
+                json={"ticket": retry_update},
+                timeout=60,
+            )
+            try:
+                retry_response.raise_for_status()
+            except requests.HTTPError as retry_exc:
+                retry_error_detail = _zendesk_error_detail(retry_response)
+                raise requests.HTTPError(
+                    f"{retry_exc} | Zendesk ticket {ticket_id} update failed "
+                    f"(even after retrying without status change). Zendesk "
+                    f"error detail: {retry_error_detail}",
+                    response=retry_response,
+                ) from retry_exc
+            return True
+
         raise requests.HTTPError(
             f"{exc} | Zendesk ticket {ticket_id} update failed. "
             f"Zendesk error detail: {error_detail}",
@@ -1154,6 +1191,18 @@ def _is_zendesk_closed_ticket_error(error_detail: str) -> bool:
         or "prevents ticket update" in lowered
         or "not valid for ticket update" in lowered
     )
+
+
+def _is_zendesk_required_field_for_solve_error(error_detail: str) -> bool:
+    """Detect Zendesk's "<field>: is required when solving a ticket" error.
+
+    This happens when a brand-specific conditional field (e.g. "Country DJ")
+    is configured in Zendesk as required-on-solve, but we didn't have a
+    value to send for it (unmapped brand, missing shipping country, etc.).
+    """
+
+    lowered = error_detail.lower()
+    return "is required when solving a ticket" in lowered
 
 
 def submit_final_responses(rows: Iterable[Mapping[str, Any]] | pd.DataFrame) -> int:
