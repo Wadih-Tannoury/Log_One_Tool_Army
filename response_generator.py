@@ -544,6 +544,27 @@ def data_value(row, data_key):
         return ups_code or PLACEHOLDER
 
     if data_key in FULL_ORDER_DATA_KEYS:
+
+        # Commercial invoice may contain multiple generated documents.
+        if data_key == "commercial_invoice":
+            values = []
+
+            generated = row.get("generated_commercial_invoice")
+            if generated:
+                for item in str(generated).split(";"):
+                    item = item.strip()
+                    if item and item not in values:
+                        values.append(item)
+
+            source = full_order_data_value(row, data_key)
+            if source:
+                for item in str(source).split(";"):
+                    item = item.strip()
+                    if item and item not in values:
+                        values.append(item)
+
+            return "\n".join(values)
+
         return full_order_data_value(row, data_key)
 
     if data_key in {"authorization_letter", "power_of_attorney"}:
@@ -1769,6 +1790,17 @@ def build_response(row):
     request_text = row_request_text(row)
     requested_data = requested_data_for_response(row)
 
+    # UPS account numbers should only be sent to UPS.
+    if (
+        "ups_account_number" in requested_data
+        and not is_ups_requester_email(requester_email)
+    ):
+        requested_data = [
+            item
+            for item in requested_data
+            if item != "ups_account_number"
+        ]
+
     if is_missing_extracted_tracking_number(row.get("extracted_tracking_number")):
         return build_human_intervention_note(
             row,
@@ -1779,6 +1811,16 @@ def build_response(row):
         return build_noreply_human_intervention_note(row, requested_data)
 
     if is_excluded_from_processing(row):
+    return build_exclude_from_processing_draft(row)
+
+    # Carrier acknowledgement only (e.g. "Thank you, invoice has been uploaded")
+    # Sometimes the parser extracts "customer_phone" from the sender signature.
+    # Those emails should never receive an automatic response.
+    if (
+        "thank you" in request_text.lower()
+        and "uploaded" in request_text.lower()
+        and requested_data == ["customer_phone"]
+    ):
         return build_exclude_from_processing_draft(row)
 
     force_human, reason = should_force_human_intervention(row, requested_data)
