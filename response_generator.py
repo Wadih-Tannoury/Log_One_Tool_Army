@@ -357,7 +357,10 @@ def zendesk_country_tag_for_row(row) -> str | None:
     from customs_rules import country_ticket_field_id_for_brand
     from response_data_extractor import brand_from_shipment_order_number, FULL_ORDER_RESPONSE_COLUMNS
 
-    country_code = row.get(FULL_ORDER_RESPONSE_COLUMNS["country_code"])
+    # Safely get the country code column name, defaulting to "full_order_country_code"
+    country_col = FULL_ORDER_RESPONSE_COLUMNS.get("country_code", "full_order_country_code")
+    country_code = row.get(country_col)
+    
     if is_blank(country_code):
         return None
 
