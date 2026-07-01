@@ -1811,7 +1811,7 @@ def build_response(row):
         return build_noreply_human_intervention_note(row, requested_data)
 
     if is_excluded_from_processing(row):
-    return build_exclude_from_processing_draft(row)
+        return build_exclude_from_processing_draft(row)
 
     # Carrier acknowledgement only (e.g. "Thank you, invoice has been uploaded")
     # Sometimes the parser extracts "customer_phone" from the sender signature.
