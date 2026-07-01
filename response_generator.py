@@ -342,6 +342,36 @@ def reason_of_contact_for_response(row, requested_data):
     return DEFAULT_REASON_OF_CONTACT
 
 
+def zendesk_country_tag_for_row(row) -> str | None:
+    """Return the Zendesk country-field tag for this row, e.g. 'country_dj_us'.
+
+    The tag is constructed from:
+      - the brand prefix extracted from the shipment_order_number
+        (e.g. 'DG-USC11593083' -> brand 'DG')
+      - the ISO 3166-1 alpha-2 country code from the GET_FULL_ORDER
+        shippingAddress.country field (stored in full_order_country_code)
+
+    Returns None when either piece is missing, so callers can safely skip
+    setting the Zendesk field.
+    """
+    from customs_rules import country_ticket_field_id_for_brand
+    from response_data_extractor import brand_from_shipment_order_number, FULL_ORDER_RESPONSE_COLUMNS
+
+    country_code = row.get(FULL_ORDER_RESPONSE_COLUMNS["country_code"])
+    if is_blank(country_code):
+        return None
+
+    brand = brand_from_shipment_order_number(row.get("shipment_order_number"))
+    if is_blank(brand):
+        return None
+
+    # Only produce a tag when this brand actually has a country field in Zendesk
+    if country_ticket_field_id_for_brand(brand) is None:
+        return None
+
+    return f"country_{brand.lower()}_{str(country_code).strip().lower()}"
+
+
 def is_blank(value):
     if value is None:
         return True
@@ -1060,6 +1090,15 @@ def row_needs_full_order_lookup(row, requested_data=None):
     requested_set = set(requested_data)
 
     if requested_set & FULL_ORDER_LOOKUP_KEYS:
+        return True
+
+    # Always attempt the lookup for any row with a shipment_order_number that
+    # is still eligible for an automated reply, even when requested_data does
+    # not otherwise need GET_FULL_ORDER data. This is required so the
+    # per-brand "Country <BRAND>" Zendesk ticket field can be populated on
+    # every automated response (Zendesk requires it when present on the
+    # ticket, even when not flagged mandatory).
+    if not is_blank(row.get("shipment_order_number")) and requested_data:
         return True
 
     # The standard UPS-account response promises an LOA, and the LOA export date
@@ -2031,6 +2070,7 @@ def main():
         ),
         axis=1,
     )
+    df["zendesk_country_tag"] = df.apply(zendesk_country_tag_for_row, axis=1)
 
     zendesk_submission_enabled = zendesk_response_submission_enabled()
     print(f"Zendesk final-response submission enabled: {zendesk_submission_enabled}")
